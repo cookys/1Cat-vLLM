@@ -444,6 +444,7 @@ if TYPE_CHECKING:
     VLLM_SM70_TP_LOCAL_TOPK20_SAMPLER: bool = False
     VLLM_SM70_TOPK_TOPP_8_WARPS: bool = False
     VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS: bool = True
+    VLLM_SM70_TOPK_TOPP_BRANCHFREE: int = 0
     VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH: int = 0
     VLLM_SM70_ASYNC_STAGED_INPUT_PREP: bool = False
     VLLM_SM70_ASYNC_CPU_TRACE: bool = False
@@ -6151,6 +6152,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="configuration",
         declared_default="True",
         effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+    ),
+    # Remove the host-side `.any()` fence from the SM70 compact top-k/top-p
+    # sampler: 0 keeps today's branch, 1 selects the reference per row on the
+    # device, 2 runs the reference for every row.
+    "VLLM_SM70_TOPK_TOPP_BRANCHFREE": env_var(
+        lambda: int(
+            env_with_choices("VLLM_SM70_TOPK_TOPP_BRANCHFREE", "0", ["0", "1", "2"])()
+        ),
+        description=(
+            "SM70 compact top-k/top-p sampler host-sync policy. 0 (default) "
+            "keeps the compact shortlist plus a host-side `.any()` check that "
+            "re-runs only the ambiguous rows through the full-vocabulary "
+            "reference, which costs a device-to-host sync. 1 keeps the "
+            "shortlist but evaluates the reference for the whole batch and "
+            "selects it per ambiguous row with `torch.where`, so no "
+            "`.any()`/`nonzero()` fence remains; the output is the same "
+            "except where the reference's own shape-dependent reductions "
+            "differ in the last ulp of a top-p boundary. 2 skips the "
+            "shortlist and always runs the full-vocabulary reference, the "
+            "same path CUDA graph capture already takes; it has no host sync "
+            "at all. 1 and 2 remove the fence at the cost of extra device "
+            "work. Any other value is rejected."
+        ),
+        category="configuration",
+        declared_default="0",
+        effective_default="0",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
     ),

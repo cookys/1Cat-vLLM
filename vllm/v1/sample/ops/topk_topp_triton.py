@@ -1127,7 +1127,21 @@ def _apply_top_k_top_p_compact(
     whether every row satisfies ``0 < k < COMPACT_CAPACITY`` (see
     ``compact_k_in_range``) skip the device-side check, which otherwise costs a
     device-to-host synchronization. ``None`` keeps the device check.
+
+    ``VLLM_SM70_TOPK_TOPP_BRANCHFREE`` removes the host-side ``.any()`` fence on
+    the reference fallback: 0 keeps the host branch; 1 evaluates the reference
+    for the whole batch and selects it per row on the device; 2 skips the
+    shortlist and returns the full reference (the path graph capture takes).
     """
+    branchfree = envs.VLLM_SM70_TOPK_TOPP_BRANCHFREE
+    if branchfree == 2:
+        from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
+
+        reference_logits = apply_top_k_top_p_pytorch(logits, k, p)
+        if mask_value != float("-inf"):
+            reference_logits.masked_fill_(torch.isneginf(reference_logits), mask_value)
+        return reference_logits
+
     capacity = COMPACT_CAPACITY
     if k_in_compact_range is None:
         k_in_compact_range = bool(((k > 0) & (k < capacity)).all())
@@ -1155,7 +1169,15 @@ def _apply_top_k_top_p_compact(
     result = torch.full_like(logits, -float("inf"))
     result.scatter_(1, indices, values)
 
-    if reference_rows.any():
+    if branchfree == 1:
+        from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
+
+        # The reference writes into its input, so give it a copy. Every row is
+        # evaluated and the ambiguous ones are selected on the device, which
+        # replaces the host-side `.any()`/`nonzero()` fence below.
+        reference = apply_top_k_top_p_pytorch(logits.clone(), k, p)
+        result = torch.where(reference_rows.unsqueeze(1), reference, result)
+    elif reference_rows.any():
         from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
 
         rows = reference_rows.nonzero(as_tuple=True)[0]
