@@ -568,6 +568,43 @@ def _should_use_pinned_host_ple(config: Qwen4ExpTextConfig) -> bool:
     return capability is not None and capability.major < 8
 
 
+# Registered host tables must outlive every UVA view; they live for the process.
+_PLE_REGISTERED_HOST_TABLES: list[torch.Tensor] = []
+
+
+def _ple_pinned_host_empty(shape: tuple[int, int], dtype: torch.dtype) -> torch.Tensor:
+    """Page-locked CPU tensor of exactly ``shape``.
+
+    ``torch.empty(..., pin_memory=True)`` goes through the caching host
+    allocator, which rounds every block up to a power of two: an 11.92 GiB
+    per-rank table pins 16 GiB, i.e. 16.3 GiB of locked host memory wasted
+    across four TP ranks. Registering an ordinary allocation pins only the
+    table. ``is_pinned()`` and ``cudaHostGetDevicePointer`` (the UVA view)
+    accept registered memory. ``VLLM_QWEN4EXP_PLE_EXACT_PIN=0`` restores the
+    caching-allocator path.
+    """
+    if shape[0] == 0:
+        return torch.empty(shape, dtype=dtype, device="cpu")
+    if os.getenv("VLLM_QWEN4EXP_PLE_EXACT_PIN", "1") == "0":
+        return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+    tensor = torch.empty(shape, dtype=dtype, device="cpu")
+    # cudaHostRegisterPortable | cudaHostRegisterMapped
+    err = torch.cuda.cudart().cudaHostRegister(tensor.data_ptr(), tensor.nbytes, 3)
+    if int(err) != 0 or not tensor.is_pinned():
+        logger.warning(
+            "Qwen4Exp PLE exact host registration failed (%s); falling back to "
+            "the power-of-two caching pinned allocator",
+            err,
+        )
+        return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+    _PLE_REGISTERED_HOST_TABLES.append(tensor)
+    logger.info(
+        "Qwen4Exp PLE host table pinned by registration: %s (exact size)",
+        format_gib(tensor.nbytes),
+    )
+    return tensor
+
+
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     """TP-sharded FP8 PLE table split between device memory and pinned host.
 
@@ -800,11 +837,8 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             dtype=self._meta_weight_dtype,
             device=device,
         )
-        host_storage = torch.empty(
-            (placement.host_rows, self.embedding_dim),
-            dtype=self._meta_weight_dtype,
-            device="cpu",
-            pin_memory=placement.host_rows > 0,
+        host_storage = _ple_pinned_host_empty(
+            (placement.host_rows, self.embedding_dim), self._meta_weight_dtype
         )
         # Publish only a complete allocation so a host allocation failure
         # cannot leave the idempotent path pointing at a half-built table.
