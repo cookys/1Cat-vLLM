@@ -432,6 +432,9 @@ if TYPE_CHECKING:
     VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1: bool = True
     VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES: bool = True
     VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES: bool = False
+    # Opt-in (phase 2, PR #664): allow the Qwen4Exp QSA E4M3 main KV cache
+    # together with MTP speculative decoding.
+    VLLM_QWEN4EXP_QSA_E4M3_MTP: bool = False
     VLLM_SM70_CUSTOM_AR_LIBRARY: str | None = None
     VLLM_SM70_TOP1_CUSTOM_AR: bool = False
     VLLM_SM70_GREEDY_TOKEN_FASTPATH: bool = True
@@ -6049,6 +6052,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Refuse to start when a checkpoint carries no calibrated QSA E4M3 K/V
     # scales. Off by default: an uncalibrated checkpoint runs on the module's
     # 1.0 defaults with a warning instead of failing to serve.
+    "VLLM_QWEN4EXP_QSA_E4M3_MTP": env_var(
+        lambda: bool(int(os.getenv("VLLM_QWEN4EXP_QSA_E4M3_MTP", "0"))),
+        description=(
+            "Allow the Qwen4Exp QSA E4M3 main KV cache together with MTP "
+            "speculative decoding (PR #664). Off keeps the MTP0-only gate."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("QSA sparse attention/indexer",),
+    ),
     "VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES": env_var(
         lambda: bool(int(os.getenv("VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES", "0"))),
         description=(
