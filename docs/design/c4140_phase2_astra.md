@@ -213,6 +213,28 @@ its support); changing proposal generation while storing old logits is wrong.
 No quality-neutral claim follows from increasing measured acceptance alone.
 Finite-precision residual computation and model batch invariance still matter.
 
+### V2 proposal/rejection wiring audit
+
+Fable independently checked the base revision on 2026-10-03. The source
+wiring satisfies the E2 prerequisites above; no code change was needed.
+
+| Contract | Source evidence at the base revision |
+| --- | --- |
+| Store the distribution actually sampled | `sample/gumbel.py:124` applies temperature once, stores FP32 logits before noise, then samples the same values with `APPLY_TEMPERATURE=False`. Vocabulary and valid-request masks agree. |
+| Keep request/step alignment | `eagle/speculator.py` writes `[req_state_idx, current_draft_step, :]`; prefill initializes step 0 and the decode loop sets steps 1..K-1. Rejection block statistics use expanded request/local-position indices; acceptance step i checks the draft at input position i+1. The bonus column does not read q. |
+| Use the same q in acceptance and residual | `spec_decode/rejection_sampler_utils.py` enables `HAS_DRAFT_LOGITS` when the buffer exists, computes its full-vocabulary logsumexp, and retains the rejected step's value. Resampling reads that same row and computes `log(max(p-q,0))`; bonus sampling uses p directly. Temperature-zero requests follow the greedy branch. |
+| Preserve buffer lifetime | Current rejection reads and subsequent proposal writes are ordered on the main stream. Async host scheduling does not write this buffer. Moving either operation to another stream would require an explicit dependency before reuse. |
+| Share the Gumbel precision setting | Astra additionally checked `eagle/speculator.py:92` and `model_runner.py:286`: both take `model_config.use_fp64_gumbel`. The runner passes that sampler to `RejectionSampler`, whose call at `rejection_sampler.py:135` forwards the same setting. |
+
+Paths in the table are relative to `vllm/v1/worker/gpu/`. This closes the
+source-level setting/alignment questions, not GPU numerical validation.
+Proposal and target may use different filters without invalidating rejection;
+adding draft truncation can help or hurt acceptance depending on the resulting
+q. Any such change must affect both stored logits and sampled logits.
+Finite PRNG resolution, Gumbel transforms, FP32 normalization and residual
+rounding remain outside the ideal-distribution proof. Sharing the FP64 flag
+does not turn an E2 experiment into bit-exact E1 output.
+
 Ready E2 experiment:
 
 ```text
