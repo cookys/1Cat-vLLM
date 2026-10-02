@@ -5,6 +5,7 @@ import torch
 
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
+from vllm.v1.sample.ops.topk_topp_triton import compact_k_in_range
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
 from vllm.v1.worker.gpu.sample.gumbel import apply_temperature
 from vllm.v1.worker.gpu.sample.min_p import apply_min_p
@@ -101,7 +102,13 @@ class SamplingStates:
 
         top_k = self.top_k.gpu[expanded_idx_mapping] if do_top_k else None
         top_p = self.top_p.gpu[expanded_idx_mapping] if do_top_p else None
-        return apply_top_k_top_p(logits, top_k, top_p)
+        k_in_range = None
+        if do_top_k and do_top_p:
+            # The SM70 compact top-k/top-p path gates on every row's k being in
+            # its shortlist range. top_k.gpu is the UVA mirror of top_k.np, so
+            # decide it from host memory instead of a device-to-host sync.
+            k_in_range = compact_k_in_range(self.top_k.np[idx_mapping_np])
+        return apply_top_k_top_p(logits, top_k, top_p, k_in_compact_range=k_in_range)
 
     def max_num_logprobs(self, idx_mapping_np: np.ndarray) -> int:
         return int(np.max(self.num_logprobs[idx_mapping_np]))

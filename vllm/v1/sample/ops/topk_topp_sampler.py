@@ -321,14 +321,25 @@ def compiled_random_sample(logits: torch.Tensor) -> torch.Tensor:
 
 
 def apply_top_k_top_p(
-    logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
+    logits: torch.Tensor,
+    k: torch.Tensor | None,
+    p: torch.Tensor | None,
+    *,
+    k_in_compact_range: bool | None = None,
 ) -> torch.Tensor:
+    """Apply top-k/top-p masks to the logits.
+
+    ``k_in_compact_range`` is only consumed by the Triton path (see
+    ``topk_topp_triton.compact_k_in_range``); None keeps the device-side check.
+    """
     if p is None and k is None:
         return logits
 
     if current_platform.is_cpu():
         if HAS_TRITON:
-            return apply_top_k_top_p_triton(logits, k, p)
+            return apply_top_k_top_p_triton(
+                logits, k, p, k_in_compact_range=k_in_compact_range
+            )
         return apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=True)
 
     if (
@@ -338,10 +349,14 @@ def apply_top_k_top_p(
         and logits.shape[0] >= 2
         and logits.shape[1] >= 32768
     ):
-        return apply_top_k_top_p_triton(logits, k, p)
+        return apply_top_k_top_p_triton(
+            logits, k, p, k_in_compact_range=k_in_compact_range
+        )
 
     if HAS_TRITON and logits.shape[0] >= 8:
-        return apply_top_k_top_p_triton(logits, k, p)
+        return apply_top_k_top_p_triton(
+            logits, k, p, k_in_compact_range=k_in_compact_range
+        )
 
     # Use pytorch sort implementation for small batch sizes.
     return apply_top_k_top_p_pytorch(logits, k, p)
