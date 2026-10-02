@@ -9,6 +9,7 @@ using Pivot-based Truncation and Selection" By Park et al.
 
 """
 
+import numpy as np
 import torch
 
 from vllm import envs
@@ -19,6 +20,21 @@ from vllm.utils.platform_utils import num_compute_units
 
 _TRITON_TABLE_CACHE: dict[tuple[torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
 _TRITON_BUFFER_CACHE: dict[tuple[torch.device, torch.dtype, int], torch.Tensor] = {}
+
+# Shortlist size of the compact top-k/top-p path. It only admits rows whose
+# top-k satisfies 0 < k < COMPACT_CAPACITY.
+COMPACT_CAPACITY = 128
+
+
+def compact_k_in_range(top_k_np: np.ndarray) -> bool:
+    """Host-side twin of the compact path's device k-range gate.
+
+    Equals ``((k > 0) & (k < COMPACT_CAPACITY)).all()`` evaluated on the
+    device, but reads host memory only, so the caller can decide without a
+    device-to-host fence. ``top_k_np`` must hold the same per-row values the
+    device sees.
+    """
+    return bool(np.all((top_k_np > 0) & (top_k_np < COMPACT_CAPACITY)))
 
 
 def _use_sm70_topk_topp_8_warps(
@@ -1095,6 +1111,8 @@ def _apply_top_k_top_p_compact(
     k: torch.Tensor,
     p: torch.Tensor,
     mask_value: float,
+    *,
+    k_in_compact_range: bool | None = None,
 ) -> torch.Tensor | None:
     """Filter a bounded shortlist; retain reference handling at boundaries.
 
@@ -1104,9 +1122,16 @@ def _apply_top_k_top_p_compact(
     vocabulary order. Restore that order before sorting the shortlist so that
     top-p also splits ties at the same token. Numerically close cumulative
     probabilities still use the full reference reduction.
+
+    ``k_in_compact_range`` lets a caller that already knows, from host memory,
+    whether every row satisfies ``0 < k < COMPACT_CAPACITY`` (see
+    ``compact_k_in_range``) skip the device-side check, which otherwise costs a
+    device-to-host synchronization. ``None`` keeps the device check.
     """
-    capacity = 128
-    if not ((k > 0) & (k < capacity)).all():
+    capacity = COMPACT_CAPACITY
+    if k_in_compact_range is None:
+        k_in_compact_range = bool(((k > 0) & (k < capacity)).all())
+    if not k_in_compact_range:
         return None
 
     values, indices = logits.topk(capacity, dim=-1, sorted=False)
@@ -1150,6 +1175,8 @@ def apply_top_k_top_p_triton(
     k: torch.Tensor | None,
     p: torch.Tensor | None,
     mask_value: float = float("-inf"),
+    *,
+    k_in_compact_range: bool | None = None,
 ) -> torch.Tensor:
     """
     Apply combined top-k and top-p masking using Triton.
@@ -1165,6 +1192,9 @@ def apply_top_k_top_p_triton(
         p: [batch_size] float32 tensor of top-p values per row (0 to 1),
             or None to disable top-p
         mask_value: Value for masked positions (default: -inf)
+        k_in_compact_range: Optional host-computed answer to "is every row's
+            top-k in (0, COMPACT_CAPACITY)", forwarded to the SM70 compact
+            path to avoid its device-to-host check. None keeps that check.
 
     Returns:
         The masked logits tensor. It may or may not be modified in-place.
@@ -1214,7 +1244,13 @@ def apply_top_k_top_p_triton(
         and current_platform.is_cuda()
         and current_platform.is_device_capability((7, 0))
     ):
-        compact = _apply_top_k_top_p_compact(logits, k_ptr, p_ptr, mask_value)
+        compact = _apply_top_k_top_p_compact(
+            logits,
+            k_ptr,
+            p_ptr,
+            mask_value,
+            k_in_compact_range=k_in_compact_range,
+        )
         if compact is not None:
             return compact
 
