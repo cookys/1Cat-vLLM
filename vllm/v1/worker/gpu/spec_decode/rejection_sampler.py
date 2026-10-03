@@ -99,6 +99,43 @@ class RejectionSampler:
             max_per_req_token_ids=max_per_req_token_ids,
         )
 
+    def rejection_sample_processed(
+        self,
+        processed_logits: torch.Tensor,
+        draft_logits: torch.Tensor | None,
+        draft_sampled: torch.Tensor,
+        pos: torch.Tensor,
+        cu_num_logits: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        expanded_idx_mapping: torch.Tensor,
+        expanded_local_pos: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Verify the draft tokens against already processed target logits.
+
+        This is the part of ``__call__`` that follows ``apply_sampling_params``.
+        It takes every tensor as an argument so the SM70 sampling CUDA graph
+        can run exactly this call on its own static buffers. The draws are
+        counter-based on (seed, position, token), so no generator state is
+        involved.
+        """
+        return rejection_sample(
+            processed_logits,
+            draft_logits,
+            draft_sampled,
+            cu_num_logits,
+            pos,
+            idx_mapping,
+            expanded_idx_mapping,
+            expanded_local_pos,
+            temperature,
+            seeds,
+            self.num_speculative_steps,
+            self.synthetic_conditional_rates,
+            use_fp64=self.sampler.use_fp64_gumbel,
+        )
+
     def __call__(
         self,
         logits: torch.Tensor,
@@ -119,20 +156,17 @@ class RejectionSampler:
             draft_sampled,
             input_batch.expanded_local_pos,
         )
-        sampled, num_sampled = rejection_sample(
+        sampled, num_sampled = self.rejection_sample_processed(
             processed_logits,
             draft_logits,
             draft_sampled,
-            input_batch.cu_num_logits,
             pos,
+            input_batch.cu_num_logits,
             input_batch.idx_mapping,
             input_batch.expanded_idx_mapping,
             input_batch.expanded_local_pos,
             self.sampler.sampling_states.temperature.gpu,
             self.sampler.sampling_states.seeds.gpu,
-            self.num_speculative_steps,
-            self.synthetic_conditional_rates,
-            use_fp64=self.sampler.use_fp64_gumbel,
         )
         logprobs_tensors = self._get_logprobs_tensors(
             input_batch,
