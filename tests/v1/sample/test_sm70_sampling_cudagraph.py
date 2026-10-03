@@ -105,6 +105,9 @@ def make_sampler(vocab: int = VOCAB, max_num_reqs: int = MAX_NUM_REQS):
         penalties_state=SimpleNamespace(
             use_penalty=np.zeros(max_num_reqs, dtype=bool),
             apply_penalties=lambda *a, **k: None,
+            output_bin_counts=torch.arange(
+                max_num_reqs * vocab, dtype=torch.int32
+            ).view(max_num_reqs, vocab),
         ),
         bad_words_state=SimpleNamespace(
             num_bad_words=SimpleNamespace(np=np.zeros(max_num_reqs, dtype=np.int32)),
@@ -200,6 +203,10 @@ class CpuManager(cg.SamplingCudaGraphManager):
 
     def _synchronize(self):
         self.events.append("sync")
+
+    def _restore_regions(self, regions, saved):
+        self.events.append("restore")
+        super()._restore_regions(regions, saved)
 
     def _free_bytes(self):
         return 0
@@ -302,6 +309,7 @@ def make_env(
     vocab: int = VOCAB,
     signatures: tuple = cg.DEFAULT_CAPTURE_SIGNATURES,
     branchfree: str = "2",
+    scribble: bool = False,
 ) -> Env:
     # Mode 2 is the eager path whose numerics the graph reproduces; any other
     # mode makes capture() warn, which several tests count warnings around.
@@ -314,23 +322,53 @@ def make_env(
     rejection = FakeRejection(recorder.calls)
     post_update_calls: list[tuple] = []
     model_state_calls: list[tuple] = []
+    # Distinct non-zero values: a slot may hold live state that must survive.
     req_states = SimpleNamespace(
         prefill_len=FakeUva(np.arange(MAX_NUM_REQS) + 50, np.int32),
         num_computed_tokens=SimpleNamespace(
-            gpu=torch.zeros(MAX_NUM_REQS, dtype=torch.int32)
+            gpu=torch.arange(MAX_NUM_REQS, dtype=torch.int32) + 100
+        ),
+        total_len=SimpleNamespace(
+            gpu=torch.arange(MAX_NUM_REQS, dtype=torch.int32) + 200
+        ),
+        last_sampled_tokens=torch.arange(MAX_NUM_REQS, dtype=torch.int64).view(-1, 1)
+        + 300,
+        all_token_ids=SimpleNamespace(
+            gpu=torch.arange(MAX_NUM_REQS * 32, dtype=torch.int32).view(
+                MAX_NUM_REQS, 32
+            )
         ),
     )
     input_buffers = InputBuffers(MAX_NUM_REQS, MAX_NUM_TOKENS, CPU)
     if model_state is None:
         model_state = StaticModelState()
+
+    def post_update_fn(*args):
+        post_update_calls.append(args)
+        if scribble:
+            # What post_update does to the dummy slots during the warmup.
+            idx = args[0].long()
+            bins = sampler.penalties_state.output_bin_counts
+            bins[idx, 3] += 1
+            req_states.num_computed_tokens.gpu[idx] += 5
+            req_states.total_len.gpu[idx] += 5
+            req_states.last_sampled_tokens[idx] = 9
+            req_states.all_token_ids.gpu[idx, :5] = 4
+
+    def postprocess_state_fn(*args):
+        model_state_calls.append(args)
+        accepted = getattr(model_state, "num_accepted_tokens_gpu", None)
+        if scribble and accepted is not None:
+            accepted[args[0].long()] = 5
+
     manager = CpuManager(
         sampler=sampler,
         rejection_sampler=rejection,
         req_states=req_states,
         input_buffers=input_buffers,
         model_state=model_state,
-        post_update_fn=lambda *a: post_update_calls.append(a),
-        postprocess_state_fn=lambda *a: model_state_calls.append(a),
+        post_update_fn=post_update_fn,
+        postprocess_state_fn=postprocess_state_fn,
         device=CPU,
         max_num_reqs=MAX_NUM_REQS,
         num_speculative_steps=K,
@@ -797,13 +835,19 @@ def test_capture_warms_up_then_captures_each_key_in_one_shared_pool(monkeypatch)
     assert manager.events[0] == "outer-scope"
     # Per key: eager warmup, sync, capture.
     body_markers = [e for e in manager.events if e not in ("outer-scope", "probe")]
+    # Per key: warmup, sync, capture, then the restore of the warmup's writes
+    # (which synchronizes the capture side stream).
     assert body_markers == [
         "sync",
         "capture-begin",
         "capture-end",
+        "restore",
+        "sync",
         "sync",
         "capture-begin",
         "capture-end",
+        "restore",
+        "sync",
     ]
     rejections = [c for c in env.recorder.calls if c[0] == "rejection"]
     assert len(rejections) == 2 * len(manager.keys)  # warmup + capture per key
@@ -833,19 +877,131 @@ def test_capture_logs_the_measured_pool_bytes_once_at_info(monkeypatch):
     assert "static input buffers" in messages[0]
 
 
+def _full_state(env: Env, model_state) -> dict[str, torch.Tensor]:
+    state = {
+        "output_bin_counts": env.sampler.penalties_state.output_bin_counts,
+        "num_computed_tokens": env.req_states.num_computed_tokens.gpu,
+        "total_len": env.req_states.total_len.gpu,
+        "last_sampled_tokens": env.req_states.last_sampled_tokens,
+        "all_token_ids": env.req_states.all_token_ids.gpu,
+    }
+    if hasattr(model_state, "num_accepted_tokens_gpu"):
+        state["num_accepted_tokens_gpu"] = model_state.num_accepted_tokens_gpu
+    return {name: tensor.clone() for name, tensor in state.items()}
+
+
+@pytest.mark.parametrize("max_graph_reqs", [1, 3])
+@pytest.mark.parametrize("align", [False, True], ids=["in-graph", "eager-tail"])
+def test_capture_restores_the_persistent_state_the_warmup_wrote(
+    monkeypatch, max_graph_reqs, align
+):
+    """Regression: the warmup's post_update left a count in output_bin_counts.
+
+    PenaltiesState.add_request only rewrites the row for requests that use
+    penalties, so the residue stayed forever and the eager rig, which never ran
+    a warmup, differed from the graph rig in the GPU replay check.
+    """
+    model_state = HybridLikeModelState(align=align)
+    env = make_env(
+        monkeypatch,
+        max_graph_reqs=max_graph_reqs,
+        model_state=model_state,
+        capture=False,
+        scribble=True,
+    )
+    before = _full_state(env, model_state)
+    env.manager.capture()
+    after = _full_state(env, model_state)
+
+    assert env.manager.model_state_in_graph is (not align)
+    # The warmup really ran post_update (and the model-state postprocess when it
+    # is in the graph), once per key for the warmup and once during the capture.
+    assert len(env.post_update_calls) == 2 * len(env.manager.keys)
+    assert len(env.model_state_calls) == (0 if align else 2 * len(env.manager.keys))
+    for name, want in before.items():
+        assert torch.equal(after[name], want), name
+
+
+def test_without_the_restore_the_scribbled_state_would_remain(monkeypatch):
+    """Negative control: the test above is only meaningful if scribbling shows."""
+    model_state = HybridLikeModelState()
+    env = make_env(monkeypatch, model_state=model_state, capture=False, scribble=True)
+    monkeypatch.setattr(env.manager, "_restore_regions", lambda regions, saved: None)
+    before = _full_state(env, model_state)
+    env.manager.capture()
+    after = _full_state(env, model_state)
+    for name in before:
+        assert not torch.equal(after[name], before[name]), name
+
+
+def test_the_restored_list_covers_every_region_post_update_writes(monkeypatch):
+    model_state = HybridLikeModelState()
+    env = make_env(monkeypatch, model_state=model_state, capture=False)
+    env.manager.model_state_in_graph = True
+    regions = env.manager._persistent_regions(2)
+    got = {tensor.data_ptr(): rows for tensor, rows in regions}
+    want = {
+        "output_bin_counts": env.sampler.penalties_state.output_bin_counts,
+        "num_computed_tokens": env.req_states.num_computed_tokens.gpu,
+        "total_len": env.req_states.total_len.gpu,
+        "last_sampled_tokens": env.req_states.last_sampled_tokens,
+        "all_token_ids": env.req_states.all_token_ids.gpu,
+        "num_accepted_tokens_gpu": model_state.num_accepted_tokens_gpu,
+    }
+    assert len(regions) == len(want)
+    for name, tensor in want.items():
+        assert got[tensor.data_ptr()] == slice(0, 2), name
+    # The model-state buffer is left out when its postprocess is not in the graph.
+    env.manager.model_state_in_graph = False
+    tail_regions = env.manager._persistent_regions(2)
+    assert len(tail_regions) == len(want) - 1
+    assert model_state.num_accepted_tokens_gpu.data_ptr() not in {
+        tensor.data_ptr() for tensor, _ in tail_regions
+    }
+
+
+def test_output_bin_counts_is_restored_for_the_dummy_slots(monkeypatch):
+    """The exact field the GPU replay check flagged, one dummy slot."""
+    env = make_env(monkeypatch, capture=False, scribble=True)
+    bins = env.sampler.penalties_state.output_bin_counts
+    before = bins.clone()
+    env.manager.capture()
+    assert torch.equal(bins, before)
+    assert env.manager._persistent_regions(1)[0][0] is bins
+
+
+def test_model_state_regions_follow_the_postprocess_writes():
+    scratch = torch.zeros(MAX_NUM_REQS, dtype=torch.int32)
+    accepted = torch.ones(MAX_NUM_REQS, dtype=torch.int32)
+    ready = HybridLikeModelState(align=True, ctx=_Ctx(True))
+    ready.num_accepted_tokens_gpu = accepted
+    ready._mamba_ctx.num_accepted_tokens_out = scratch
+    regions = cg.model_state_persistent_regions(ready, 2)
+    assert [(t.data_ptr(), r) for t, r in regions] == [
+        (accepted.data_ptr(), slice(0, 2)),
+        (scratch.data_ptr(), slice(None)),
+    ]
+    # No context yet (align mode before the first forward): only the counts.
+    ready._mamba_ctx = None
+    assert len(cg.model_state_persistent_regions(ready, 2)) == 1
+    assert cg.model_state_persistent_regions(StaticModelState(), 2) == []
+
+
 def test_pool_memory_is_probed_inside_the_graph_scope(monkeypatch):
     """torch.cuda.graph.__enter__ runs empty_cache(), which would be subtracted
     from the pool's growth if the probe ran before entering the scope."""
     env = make_env(monkeypatch, max_graph_reqs=2, capture=False)
     env.manager.capture()
     marked = [e for e in env.manager.events if e != "outer-scope"]
-    for start in range(0, len(marked), 5):
-        assert marked[start : start + 5] == [
+    for start in range(0, len(marked), 7):
+        assert marked[start : start + 7] == [
             "sync",
             "capture-begin",
             "probe",
             "probe",
             "capture-end",
+            "restore",
+            "sync",
         ]
     assert marked.count("probe") == 2 * len(env.manager.keys)
 
@@ -940,6 +1096,14 @@ class AlignLikeModelState:
 
     def postprocess_state(self, *args):  # an override, not the interface no-op
         pass
+
+
+class HybridLikeModelState(AlignLikeModelState):
+    """Adds the buffer MambaHybridModelState.postprocess_state writes."""
+
+    def __init__(self, align: bool = False, ctx: Any = None):
+        super().__init__(align, ctx)
+        self.num_accepted_tokens_gpu = torch.arange(MAX_NUM_REQS, dtype=torch.int32) + 7
 
 
 class UnknownModelState:
