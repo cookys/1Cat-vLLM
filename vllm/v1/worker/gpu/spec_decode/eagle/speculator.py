@@ -36,6 +36,10 @@ from vllm.v1.worker.gpu.spec_decode.eagle.cudagraph import (
     DecodeEagleCudaGraphManager,
     PrefillEagleCudaGraphManager,
 )
+from vllm.v1.worker.gpu.spec_decode.eagle.draft_nvfp4_lm_head import (
+    DraftNvfp4LMHead,
+    build_draft_nvfp4_lm_head,
+)
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 
 logger = init_logger(__name__)
@@ -146,6 +150,10 @@ class EagleSpeculator:
                 device=device,
             )
 
+        # Draft-only NVFP4 lm_head (VLLM_SM70_MTP_DRAFT_NVFP4_LM_HEAD); built
+        # in load_model once the draft's lm_head is final.
+        self._draft_nvfp4_head: DraftNvfp4LMHead | None = None
+
         self.prefill_cudagraph_manager: PrefillEagleCudaGraphManager | None = None
         self.decode_cudagraph_manager: DecodeEagleCudaGraphManager | None = None
 
@@ -187,6 +195,20 @@ class EagleSpeculator:
 
         self.model = load_eagle_model(target_model, self.vllm_config)
         self._validate_local_argmax_reduction()
+        # The lm_head is final only here: load_eagle_model has just shared the
+        # target's head into the draft (or kept the draft's own) and the
+        # target weights are fully loaded and post-processed, so the FP16 shard
+        # that is quantized (and kept for the exact rerank) is the one the
+        # draft really uses. The builder checks draft_sample_method == "greedy"
+        # and the rest of the gate, and logs the reason when it falls back.
+        if envs.VLLM_SM70_MTP_DRAFT_NVFP4_LM_HEAD:
+            self._draft_nvfp4_head = build_draft_nvfp4_lm_head(
+                self.model,
+                self.speculative_config,
+                self.device,
+                self.dtype,
+                envs.VLLM_SM70_MTP_DRAFT_NVFP4_RERANK_K,
+            )
 
         draft_hf_config = self.draft_model_config.hf_config
         self.share_mtp_topk_indices = (
@@ -361,6 +383,12 @@ class EagleSpeculator:
         draft_step: torch.Tensor,
         draft_logits: torch.Tensor | None,
     ) -> torch.Tensor:
+        if (
+            draft_logits is None
+            and self._draft_nvfp4_head is not None
+            and 0 < hidden_states.shape[0] <= 64
+        ):
+            return self._draft_nvfp4_head.top_tokens(hidden_states)
         if draft_logits is not None:
             logits = self.model.compute_logits(hidden_states)
             # This drafter's position contract keys the proposed token at pos + 1.

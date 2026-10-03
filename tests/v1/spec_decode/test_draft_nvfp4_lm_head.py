@@ -14,6 +14,7 @@ import pytest
 import regex as re
 import torch
 
+from vllm import envs
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
     break_fp4_bytes,
     cast_to_fp4,
@@ -606,3 +607,78 @@ def test_builder_joins_the_collective_even_when_ineligible(monkeypatch):
     monkeypatch.setattr(mod, "tensor_model_parallel_all_reduce", all_reduce)
     assert _build(SimpleNamespace(lm_head=None)) is None
     assert seen == [[0]]
+
+
+# --------------------------------------------------------------------------
+# env registration and speculator routing
+# --------------------------------------------------------------------------
+def test_env_defaults_and_validation(monkeypatch):
+    envs.disable_envs_cache()
+    monkeypatch.delenv("VLLM_SM70_MTP_DRAFT_NVFP4_LM_HEAD", raising=False)
+    monkeypatch.delenv("VLLM_SM70_MTP_DRAFT_NVFP4_RERANK_K", raising=False)
+    assert envs.VLLM_SM70_MTP_DRAFT_NVFP4_LM_HEAD is False
+    assert envs.VLLM_SM70_MTP_DRAFT_NVFP4_RERANK_K == 64
+    monkeypatch.setenv("VLLM_SM70_MTP_DRAFT_NVFP4_LM_HEAD", "1")
+    assert envs.VLLM_SM70_MTP_DRAFT_NVFP4_LM_HEAD is True
+    for choice in (0, 8, 16, 32, 64, 128):
+        monkeypatch.setenv("VLLM_SM70_MTP_DRAFT_NVFP4_RERANK_K", str(choice))
+        assert choice == envs.VLLM_SM70_MTP_DRAFT_NVFP4_RERANK_K
+        assert choice in mod.RERANK_K_CHOICES
+    monkeypatch.setenv("VLLM_SM70_MTP_DRAFT_NVFP4_RERANK_K", "7")
+    with pytest.raises(ValueError):
+        _ = envs.VLLM_SM70_MTP_DRAFT_NVFP4_RERANK_K
+
+
+def _speculator_stub(head):
+    sentinel = {
+        "local": torch.tensor([1]),
+        "full": torch.tensor([2]),
+        "argmax": torch.tensor([3]),
+    }
+    model = SimpleNamespace(
+        get_top_tokens=lambda h: sentinel["local"],
+        compute_logits=lambda h: torch.tensor([[0.0, 1.0, 0.0]]),
+    )
+    return sentinel, SimpleNamespace(
+        _draft_nvfp4_head=head,
+        use_local_argmax_reduction=False,
+        model=model,
+        temperature=None,
+        seeds=None,
+        use_fp64_gumbel=False,
+    )
+
+
+def test_speculator_routes_through_the_draft_head(monkeypatch):
+    from vllm.v1.worker.gpu.spec_decode.eagle import speculator as spec
+
+    taken = []
+    head = SimpleNamespace(
+        top_tokens=lambda h: taken.append(h.shape[0]) or torch.tensor([42])
+    )
+    _, stub = _speculator_stub(head)
+    sample = spec.EagleSpeculator._sample_draft
+
+    hidden = torch.zeros(4, 8)
+    assert sample(stub, hidden, None, None, None, None).tolist() == [42]
+    assert sample(stub, torch.zeros(64, 8), None, None, None, None).tolist() == [42]
+    assert taken == [4, 64]
+
+    # an empty batch never reaches the kernel (M must be in [1, 64])
+    assert sample(stub, torch.zeros(0, 8), None, None, None, None).tolist() == [1]
+    assert taken == [4, 64]
+    # more than 64 rows -> existing path (argmax of compute_logits)
+    assert sample(stub, torch.zeros(65, 8), None, None, None, None).tolist() == [1]
+    # ... or the local-argmax reduction when configured
+    stub.use_local_argmax_reduction = True
+    assert sample(stub, torch.zeros(65, 8), None, None, None, None).tolist() == [1]
+    # probabilistic drafts (draft_logits is not None) never use the head
+    monkeypatch.setattr(spec, "gumbel_sample", lambda *a, **k: torch.tensor([7]))
+    assert sample(
+        stub, hidden, None, torch.zeros(1), None, torch.zeros(1)
+    ).tolist() == [7]
+    assert taken == [4, 64]
+    # no head -> untouched behaviour
+    stub._draft_nvfp4_head = None
+    stub.use_local_argmax_reduction = False
+    assert sample(stub, hidden, None, None, None, None).tolist() == [1]
