@@ -24,6 +24,20 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 
+def _async_ple_request_indices(
+    indices_cpu: torch.Tensor, device: torch.device
+) -> torch.Tensor:
+    """Stage CPU request indices without waiting for prior device work."""
+    if indices_cpu.device == device:
+        return indices_cpu
+    # Use the pinned staging helper rather than a blocking Tensor.to(). The
+    # copy and its consumers run on the current stream; PyTorch tracks the
+    # pinned allocation until the asynchronous copy has completed.
+    return async_tensor_h2d(
+        indices_cpu.tolist(), dtype=indices_cpu.dtype, device=device
+    )
+
+
 class ShortConvAttentionBackend(AttentionBackend):
     @staticmethod
     def get_name() -> str:
@@ -332,9 +346,9 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
         decode_req_idx_cpu = decode_mask_cpu.nonzero(as_tuple=True)[0]
         prefill_req_idx_cpu = prefill_mask_cpu.nonzero(as_tuple=True)[0]
         non_spec_req_idx_cpu = torch.cat((decode_req_idx_cpu, prefill_req_idx_cpu))
-        spec_req_idx = spec_req_idx_cpu.to(query_start_loc.device)
-        non_spec_req_idx = non_spec_req_idx_cpu.to(query_start_loc.device)
-
+        spec_req_idx = _async_ple_request_indices(
+            spec_req_idx_cpu, query_start_loc.device
+        )
         if num_decodes == 0 and num_prefills == 0:
             # Pure speculative-decode batch: all real tokens are spec tokens.
             spec_token_indx = torch.arange(
@@ -351,6 +365,9 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
             non_spec_query_start_loc = None
             non_spec_query_start_loc_cpu = None
         else:
+            non_spec_req_idx = _async_ple_request_indices(
+                non_spec_req_idx_cpu, query_start_loc.device
+            )
             # Mixed batch: build a per-token group key consistent with the
             # request grouping above (spec=0 | decode=1 | prefill=2) and a
             # stable sort, so tokens of each request stay contiguous and in
@@ -362,9 +379,16 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
                 dtype=torch.int64,
                 device=query_start_loc.device,
             )
-            req_group[spec_req_idx] = 0
-            req_group[decode_req_idx_cpu.to(query_start_loc.device)] = 1
-            token_group = torch.repeat_interleave(req_group, query_lens)
+            req_group.index_fill_(0, spec_req_idx, 0)
+            decode_req_idx = _async_ple_request_indices(
+                decode_req_idx_cpu, query_start_loc.device
+            )
+            req_group.index_fill_(0, decode_req_idx, 1)
+            # The CPU metadata already owns the exact output length. Supplying
+            # it avoids a device-to-host length query for tensor repeats.
+            token_group = torch.repeat_interleave(
+                req_group, query_lens, output_size=int(query_lens_cpu.sum())
+            )
             token_perm = torch.argsort(token_group, stable=True)
             spec_token_indx = token_perm[:num_spec_decode_tokens]
             non_spec_token_indx = token_perm[num_spec_decode_tokens:]
@@ -399,9 +423,12 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
         assert num_accepted_tokens is not None
         # Accepted-token counts must follow the same request order as the
         # speculative state indices.
-        num_accepted_tokens = num_accepted_tokens[
-            spec_req_idx_cpu.to(num_accepted_tokens.device)
-        ]
+        accepted_req_idx = spec_req_idx
+        if num_accepted_tokens.device != accepted_req_idx.device:
+            accepted_req_idx = _async_ple_request_indices(
+                spec_req_idx_cpu, num_accepted_tokens.device
+            )
+        num_accepted_tokens = num_accepted_tokens[accepted_req_idx]
 
         # Compute the conv-state slots for the non-spec decode/prefill split,
         # plus the initial-state masks and Triton causal_conv1d metadata.
@@ -419,7 +446,10 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
         if num_decodes > 0 or num_prefills > 0:
             num_computed_tokens = m.compute_num_computed_tokens()
             if non_spec_req_idx_cpu is not None:
-                non_spec_req_idx = non_spec_req_idx_cpu.to(num_computed_tokens.device)
+                if non_spec_req_idx.device != num_computed_tokens.device:
+                    non_spec_req_idx = _async_ple_request_indices(
+                        non_spec_req_idx_cpu, num_computed_tokens.device
+                    )
                 num_computed_tokens = num_computed_tokens[non_spec_req_idx]
 
             state_indices_tensor_d = state_indices_tensor[:num_decodes]
