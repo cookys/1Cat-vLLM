@@ -6641,7 +6641,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             env_with_choices("VLLM_SM70_MTP_COMMITTED_PREFIX_CACHE", "0", ["0", "1"])()
             == "1"
         ),
-        help=(
+        description=(
             "Experimental Qwen4Exp V2 MTP4 immutable prefill-prefix reuse. "
             "Retain one closer align checkpoint; bypass the EAGLE page drop "
             "only for completed text requests with an all-group certificate "
@@ -6649,7 +6649,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "Default off; changes prefill "
             "chunk shapes, so state/token parity must be validated."
         ),
+        category="experimental",
+        declared_default="False",
         effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP committed-prefix checkpoint reuse",),
     ),
     "VLLM_SM70_MTP_COMMITTED_PREFIX_CACHE_LOG": env_var(
         lambda: (
@@ -6658,8 +6662,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
             )()
             == "1"
         ),
-        help="Log prefix publication, lookup/pool counters and scheduled prefill.",
+        description=(
+            "Log prefix publication, lookup/pool counters and scheduled prefill. "
+            "Effective only when VLLM_SM70_MTP_COMMITTED_PREFIX_CACHE is enabled."
+        ),
+        category="debug",
+        declared_default="False",
         effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP committed-prefix diagnostic telemetry",),
     ),
     # Remove the host-side `.any()` fence from the SM70 compact top-k/top-p
     # sampler: 0 keeps today's branch, 1 selects the reference per row on the
