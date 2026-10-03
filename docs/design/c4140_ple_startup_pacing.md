@@ -99,11 +99,12 @@ cd /data/src/1cat-wt-astra
 OMP_NUM_THREADS=1 .venv/bin/python tests/models/qwen4_exp/test_ple_host_startup_cpu.py
 ```
 
-Thirteen tests passed, including three-process nonoverlap, timeout, exception
+Fourteen tests passed, including three-process nonoverlap, timeout, exception
 and terminated-owner cleanup, symlink rejection, exact PLE header ranges,
 page-aligned advice, malformed-header fallback, real COW-byte preservation,
 anonymous-memory exclusion, advice/allocation/registration order under the
-lock, registration failure handling and 12 shard-copy
+lock, registration failure handling, materialization without an ambient model
+config, and 12 shard-copy
 parity cases (two ranks, three host/device splits, advice on/off).
 
 Read-only parsing of the real local E4M3 overlay found 128 PLE tensors in

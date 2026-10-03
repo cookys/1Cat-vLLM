@@ -707,9 +707,11 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         # compiled graph, because a reloaded AOT artifact would carry the
         # address of a buffer that no longer exists in the new process.
         self.layer_name = prefix
-        static_forward_context = (
-            get_current_vllm_config().compilation_config.static_forward_context
+        vllm_config = get_current_vllm_config()
+        self._pin_checkpoint_model_path = getattr(
+            vllm_config.model_config, "model", None
         )
+        static_forward_context = vllm_config.compilation_config.static_forward_context
         if prefix in static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         static_forward_context[prefix] = self
@@ -850,7 +852,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         host_storage = _ple_pinned_host_empty(
             (placement.host_rows, self.embedding_dim),
             self._meta_weight_dtype,
-            model_path=get_current_vllm_config().model_config.model,
+            model_path=self._pin_checkpoint_model_path,
         )
         # Publish only a complete allocation so a host allocation failure
         # cannot leave the idempotent path pointing at a half-built table.

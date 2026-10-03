@@ -48,6 +48,9 @@ def _source_functions():
         n for n in tree.body if getattr(n, "name", "") == "Qwen4ExpPinnedHostEmbedding"
     )
     load = next(n for n in cls.body if getattr(n, "name", "") == "load_shard")
+    materialize = next(
+        n for n in cls.body if getattr(n, "name", "") == "materialize_tables"
+    )
     common = ast.parse((ROOT / "vllm/models/qwen4_exp/common/ple.py").read_text())
     nodes = [
         n
@@ -58,6 +61,8 @@ def _source_functions():
             "compute_ple_shard_overlap",
             "copy_ple_embedding_shard_",
             "copy_ple_embedding_shard_split_",
+            "PLEPlacement",
+            "plan_ple_placement",
         }
     ]
     ns = {
@@ -79,7 +84,7 @@ def _source_functions():
             )
         ]
         + nodes
-        + [alloc, load],
+        + [alloc, load, materialize],
         type_ignores=[],
     )
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), ns)
@@ -291,6 +296,39 @@ class StartupTests(unittest.TestCase):
         self.assertIs(result, tensor)
         self.assertEqual(events, ["advice", "allocate", "register"])
         self.assertEqual(ns["_PLE_REGISTERED_HOST_TABLES"], [tensor])
+
+    def test_materialization_does_not_require_ambient_model_config(self):
+        ns = _source_functions()
+        ns["available_host_bytes"] = lambda: None
+        ns["get_current_vllm_config"] = Mock(
+            side_effect=AssertionError("no ambient model configuration")
+        )
+        ns["torch"] = SimpleNamespace(
+            device=lambda *args: torch.device("cpu"),
+            accelerator=SimpleNamespace(current_device_index=lambda: 0),
+            empty=torch.empty,
+        )
+        ns["_ple_pinned_host_empty"] = Mock(
+            side_effect=lambda shape, dtype, **kwargs: torch.empty(shape, dtype=dtype)
+        )
+        owner = SimpleNamespace(
+            ple_device_table=None,
+            _meta_weight_shape=(8, 4),
+            embedding_dim=4,
+            _meta_weight_dtype=torch.uint8,
+            _resolve_host_budget=lambda _: 12,
+            _pin_checkpoint_model_path=None,
+        )
+        ns["materialize_tables"](owner)
+        self.assertEqual(owner.ple_device_table.shape, (5, 4))
+        self.assertEqual(owner.ple_host_storage.shape, (3, 4))
+        ns["_ple_pinned_host_empty"].assert_called_once_with(
+            (3, 4), torch.uint8, model_path=None
+        )
+        pointer = owner.ple_host_storage.data_ptr()
+        ns["materialize_tables"](owner)
+        self.assertEqual(owner.ple_host_storage.data_ptr(), pointer)
+        ns["get_current_vllm_config"].assert_not_called()
 
     def test_paced_registration_failure_does_not_allocate_larger_fallback(self):
         ns = _source_functions()
