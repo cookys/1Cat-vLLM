@@ -149,11 +149,12 @@ class ToolTests(unittest.TestCase):
                         ),
                         (
                             "MTP_COMMITTED_PREFIX admit request=r baseline_tokens=0 "
-                            "warm_producer=False"
+                            "warm_producer=False cut_reason=cold"
                         ),
                         (
                             "MTP_COMMITTED_PREFIX admit request=warm "
-                            "baseline_tokens=16 warm_producer=True"
+                            "baseline_tokens=16 warm_producer=True "
+                            "cut_reason=near_boundary"
                         ),
                         (
                             "MTP_COMMITTED_PREFIX scheduled request=warm "
@@ -171,6 +172,9 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(result["admissions"], 2)
         self.assertEqual(result["warm_producer_admissions"], 1)
         self.assertEqual(result["non_warm_admissions"], 1)
+        self.assertEqual(
+            result["admission_cut_reasons"], {"cold": 1, "near_boundary": 1}
+        )
 
     def test_streamed_numeric_ids_and_first_token(self):
         events = [

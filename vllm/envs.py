@@ -6207,9 +6207,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         description=(
             "Experimental Qwen4Exp V2 MTP4 immutable prefill-prefix reuse. "
-            "Warm-producer policy: retain one closer align checkpoint only "
-            "after an ordinary usable prefix hit at first successful scheduling. "
-            "Cold producers keep ordinary chunk boundaries. Bypass the EAGLE page drop "
+            "Chain-warm policy: retain one closer align checkpoint B only after "
+            "a candidate certificate hit or a positive ordinary usable prefix hit "
+            "at least B minus one align page, at first successful scheduling. "
+            "Cold and distant-prefix producers keep ordinary chunk boundaries. "
+            "Bypass the EAGLE page drop "
             "only for completed text requests with an all-group certificate "
             "and matching MTP lookahead token. Requires synchronous scheduling. "
             "Default off; warm prefill chunk shapes change, so state/token parity "
@@ -6229,8 +6231,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
             == "1"
         ),
         description=(
-            "Log prefix publication, lookup/pool counters, warm admission and "
-            "scheduled prefill. "
+            "Log prefix publication, lookup/pool counters, warm admission/cut reason "
+            "and scheduled prefill. "
             "Effective only when VLLM_SM70_MTP_COMMITTED_PREFIX_CACHE is enabled."
         ),
         category="debug",

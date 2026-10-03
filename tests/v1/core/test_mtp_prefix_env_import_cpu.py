@@ -72,7 +72,7 @@ class EnvImportTests(unittest.TestCase):
             assert e.environment_variables[names[0]].metadata.category == "experimental"
             assert e.environment_variables[names[1]].metadata.category == "debug"
             description = e.environment_variables[names[0]].metadata.description
-            assert "Warm-producer policy" in description
+            assert "Chain-warm policy" in description
             # The integration base must keep both production features available.
             for name in (
                 "VLLM_SM70_SAMPLING_CUDAGRAPH",
