@@ -446,6 +446,8 @@ if TYPE_CHECKING:
     VLLM_SM70_TOPK_TOPP_8_WARPS: bool = False
     VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS: bool = True
     VLLM_SM70_TOPK_TOPP_BRANCHFREE: int = 0
+    VLLM_SM70_MTP_COMMITTED_PREFIX_CACHE: bool = False
+    VLLM_SM70_MTP_COMMITTED_PREFIX_CACHE_LOG: bool = False
     VLLM_SM70_SAMPLING_CUDAGRAPH: int = 0
     VLLM_SM70_SAMPLING_CUDAGRAPH_MAX_REQS: int = 1
     VLLM_SM70_MTP_DRAFT_NVFP4_LM_HEAD: bool = False
@@ -6197,6 +6199,42 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+    ),
+    "VLLM_SM70_MTP_COMMITTED_PREFIX_CACHE": env_var(
+        lambda: (
+            env_with_choices("VLLM_SM70_MTP_COMMITTED_PREFIX_CACHE", "0", ["0", "1"])()
+            == "1"
+        ),
+        description=(
+            "Experimental Qwen4Exp V2 MTP4 immutable prefill-prefix reuse. "
+            "Retain one closer align checkpoint; bypass the EAGLE page drop "
+            "only for completed text requests with an all-group certificate "
+            "and matching MTP lookahead token. Requires synchronous scheduling. "
+            "Default off; changes prefill "
+            "chunk shapes, so state/token parity must be validated."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP committed-prefix checkpoint reuse",),
+    ),
+    "VLLM_SM70_MTP_COMMITTED_PREFIX_CACHE_LOG": env_var(
+        lambda: (
+            env_with_choices(
+                "VLLM_SM70_MTP_COMMITTED_PREFIX_CACHE_LOG", "0", ["0", "1"]
+            )()
+            == "1"
+        ),
+        description=(
+            "Log prefix publication, lookup/pool counters and scheduled prefill. "
+            "Effective only when VLLM_SM70_MTP_COMMITTED_PREFIX_CACHE is enabled."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP committed-prefix diagnostic telemetry",),
     ),
     # Remove the host-side `.any()` fence from the SM70 compact top-k/top-p
     # sampler: 0 keeps today's branch, 1 selects the reference per row on the

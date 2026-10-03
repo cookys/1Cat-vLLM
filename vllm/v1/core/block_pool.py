@@ -59,16 +59,35 @@ class BlockHashToBlockMap:
             BlockHashWithGroupId, KVCacheBlock | dict[int, KVCacheBlock]
         ] = {}
 
-    def get_one_block(self, key: BlockHashWithGroupId) -> KVCacheBlock | None:
+    def get_one_block(
+        self, key: BlockHashWithGroupId, *, allow_mtp_prefix: bool = False
+    ) -> KVCacheBlock | None:
         """
         Gets any block with the given block hash key.
         """
         blocks = self._cache.get(key)
         if blocks is not None:
             if isinstance(blocks, KVCacheBlock):
-                return blocks
+                return (
+                    blocks if allow_mtp_prefix or not blocks.mtp_prefix_only else None
+                )
             if isinstance(blocks, dict):
-                return next(iter(blocks.values()))
+                if allow_mtp_prefix:
+                    # A pending/uncertified duplicate must not hide a completed
+                    # checkpoint. Cross-group identity and lookahead validation
+                    # still happen in MTPPrefixSnapshots.accepts().
+                    for block in blocks.values():
+                        cert = block.mtp_prefix_certificate
+                        if cert is not None and cert.committed:
+                            return block
+                return next(
+                    (
+                        b
+                        for b in blocks.values()
+                        if allow_mtp_prefix or not b.mtp_prefix_only
+                    ),
+                    None,
+                )
             self._unexpected_blocks_type(blocks)
         return None
 
@@ -180,9 +199,14 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+        self.mtp_prefix_evictions = 0
 
     def get_cached_block(
-        self, block_hash: BlockHash, kv_cache_group_ids: list[int]
+        self,
+        block_hash: BlockHash,
+        kv_cache_group_ids: list[int],
+        *,
+        allow_mtp_prefix: bool = False,
     ) -> list[KVCacheBlock] | None:
         """Get the cached block by the block hash for each group in
         `kv_cache_group_ids`, or None if cache miss for any group.
@@ -201,7 +225,7 @@ class BlockPool:
                 block_hash, group_id
             )
             block = self.cached_block_hash_to_block.get_one_block(
-                block_hash_with_group_id
+                block_hash_with_group_id, allow_mtp_prefix=allow_mtp_prefix
             )
             if not block:
                 return None
@@ -386,6 +410,8 @@ class BlockPool:
             # eviction is not needed
             return False
 
+        if block.mtp_prefix_only:
+            self.mtp_prefix_evictions += 1
         block.reset_hash()
 
         if self.enable_kv_cache_events:

@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -316,6 +317,24 @@ class Scheduler(SchedulerInterface):
             == self.mamba_state_block_size
             else None
         )
+        if envs.VLLM_SM70_MTP_COMMITTED_PREFIX_CACHE:
+            from vllm.v1.core.mtp_prefix_snapshot import configure_mtp_prefix_snapshots
+
+            snapshots = configure_mtp_prefix_snapshots(
+                vllm_config,
+                coordinator,
+                has_connector=self.connector is not None
+                or self.ec_connector is not None,
+            )
+            snapshots.telemetry = envs.VLLM_SM70_MTP_COMMITTED_PREFIX_CACHE_LOG
+            coordinator.mtp_prefix_snapshots = snapshots
+            logger.info(
+                "MTP_COMMITTED_PREFIX enabled: sync scheduling, "
+                "completed true-prefill only; "
+                "alignment=%d, MTP next-token guard, all-group certificates; "
+                "state-vs-recompute bit equality requires GPU validation",
+                snapshots.alignment,
+            )
         # Full-chunk recurrent states need dense boundaries under contention
         # to preserve concurrent decode throughput. A lone request still uses
         # sparse replay boundaries: forcing dense admission there changes its
@@ -1272,6 +1291,20 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
+            snapshots = self.kv_cache_manager.coordinator.mtp_prefix_snapshots
+            if snapshots is not None and snapshots.telemetry:
+                start = request.num_computed_tokens
+                prompt_end = min(start + num_scheduled_token, request.num_prompt_tokens)
+                if start < prompt_end:
+                    logger.info(
+                        "MTP_COMMITTED_PREFIX scheduled request=%s "
+                        "prompt_tokens=%d start=%d end=%d prefill_tokens=%d",
+                        req_id,
+                        request.num_prompt_tokens,
+                        start,
+                        prompt_end,
+                        prompt_end - start,
+                    )
             request.num_computed_tokens += num_scheduled_token
             request.num_in_flight_tokens += num_scheduled_token
             request.is_prefill_chunk = request.num_computed_tokens < (
