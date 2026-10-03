@@ -203,7 +203,9 @@ def _tp_consensus(state: int) -> list[int]:
     tp_size = get_tensor_model_parallel_world_size()
     if tp_size == 1:
         return [state]
-    table = torch.zeros(tp_size, dtype=torch.int32)
+    # Explicit device: an outer default-device context (cuda, meta) must not
+    # move this vector, the gloo collective needs it on the CPU.
+    table = torch.zeros(tp_size, dtype=torch.int32, device="cpu")
     table[get_tensor_model_parallel_rank()] = state
     return [int(v) for v in _tp_cpu_all_reduce(table).tolist()]
 
