@@ -442,10 +442,13 @@ class SamplingCudaGraphManager:
         self._run_body(key)
         self._synchronize()
         graph = self._new_graph()
-        reserved_before, allocated_before = self._memory_probe()
+        # torch.cuda.graph.__enter__ calls empty_cache(), which releases the
+        # blocks the eager warmup cached. Probe inside the scope so that release
+        # is not subtracted from the pool's own growth.
         with self._graph_scope(graph):
+            reserved_before, allocated_before = self._memory_probe()
             outputs = self._run_body(key)
-        reserved_after, allocated_after = self._memory_probe()
+            reserved_after, allocated_after = self._memory_probe()
         self.graphs[key] = _CapturedGraph(
             graph=graph,
             outputs=outputs,

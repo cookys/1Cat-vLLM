@@ -6684,7 +6684,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "batches without logprobs, penalties, logit bias, bad words, "
             "structured output, NaN counting or probabilistic draft logits "
             "are admitted; every other batch runs eagerly and the reason is "
-            "logged once. Any value other than 0 or 1 is rejected."
+            "logged once. Captured only on SM70 devices with speculative "
+            "decoding on, without pipeline parallelism and without the "
+            "DFlash2 sparse verification path; otherwise capture is skipped "
+            "with a warning that names the blocker. Any value other than 0 "
+            "or 1 is rejected."
         ),
         category="experimental",
         declared_default="0",

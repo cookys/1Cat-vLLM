@@ -997,6 +997,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             blockers.append("pipeline parallelism is on")
         if self.device.type != "cuda":
             blockers.append("the device is not CUDA")
+        elif not current_platform.is_device_capability(70):
+            # Eager top-k/top-p reaches the reference path (what the graph
+            # captures) only through the SM70 compact route; elsewhere it runs
+            # the Triton kernel and the numerics would differ.
+            blockers.append("the device is not SM70")
         if self.sampler is not None and self.sampler.compute_nans:
             blockers.append("VLLM_COMPUTE_NANS_IN_LOGITS is enabled")
         if getattr(self.speculator, "draft_logits", None) is not None:
@@ -2145,8 +2150,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         memory is reclaimable when running in the same process."""
         torch.accelerator.synchronize()
         # CUDA graph managers own graph pools, captured outputs, and persistent
-        # attention metadata. Drop both target and draft managers first.
+        # attention metadata. Drop both target and draft managers first, and
+        # the sampling graph, whose manager also holds the sampler and model
+        # state references.
         self.cudagraph_manager = None
+        self.sampling_graph = None
         if self._ple_offload_connector is not None:
             self._ple_offload_connector.close()
             self._ple_offload_connector = None
