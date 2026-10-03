@@ -349,10 +349,6 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
         spec_req_idx = _async_ple_request_indices(
             spec_req_idx_cpu, query_start_loc.device
         )
-        non_spec_req_idx = _async_ple_request_indices(
-            non_spec_req_idx_cpu, query_start_loc.device
-        )
-
         if num_decodes == 0 and num_prefills == 0:
             # Pure speculative-decode batch: all real tokens are spec tokens.
             spec_token_indx = torch.arange(
@@ -369,6 +365,9 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
             non_spec_query_start_loc = None
             non_spec_query_start_loc_cpu = None
         else:
+            non_spec_req_idx = _async_ple_request_indices(
+                non_spec_req_idx_cpu, query_start_loc.device
+            )
             # Mixed batch: build a per-token group key consistent with the
             # request grouping above (spec=0 | decode=1 | prefill=2) and a
             # stable sort, so tokens of each request stay contiguous and in
@@ -385,7 +384,11 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
                 decode_req_idx_cpu, query_start_loc.device
             )
             req_group.index_fill_(0, decode_req_idx, 1)
-            token_group = torch.repeat_interleave(req_group, query_lens)
+            # The CPU metadata already owns the exact output length. Supplying
+            # it avoids a device-to-host length query for tensor repeats.
+            token_group = torch.repeat_interleave(
+                req_group, query_lens, output_size=int(query_lens_cpu.sum())
+            )
             token_perm = torch.argsort(token_group, stable=True)
             spec_token_indx = token_perm[:num_spec_decode_tokens]
             non_spec_token_indx = token_perm[num_spec_decode_tokens:]

@@ -14,7 +14,7 @@ import ast
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -138,14 +138,23 @@ class PleMetadataTests(unittest.TestCase):
             return indices(tensor, device)
 
         self.ns["_async_ple_request_indices"] = record
+        repeat_interleave = torch.repeat_interleave
+
+        def bounded_repeat(input, repeats, *, output_size=None):
+            # Model the CUDA contract: an omitted length would need a D2H
+            # query. Compare against CPU metadata, including padded rows.
+            self.assertEqual(output_size, sum(lengths))
+            return repeat_interleave(input, repeats, output_size=output_size)
+
         try:
-            result = self.ns["build"](
-                builder,
-                0,
-                batch,
-                num_accepted_tokens=accepted,
-                num_decode_draft_tokens_cpu=torch.tensor(drafts, dtype=torch.int32),
-            )
+            with patch.object(torch, "repeat_interleave", bounded_repeat):
+                result = self.ns["build"](
+                    builder,
+                    0,
+                    batch,
+                    num_accepted_tokens=accepted,
+                    num_decode_draft_tokens_cpu=torch.tensor(drafts, dtype=torch.int32),
+                )
         finally:
             self.ns["_async_ple_request_indices"] = indices
 
@@ -183,8 +192,10 @@ class PleMetadataTests(unittest.TestCase):
         )
         # One device-index request per group; accepted counts and computed
         # lengths reuse these tensors instead of initiating another transfer.
-        self.assertEqual([x[0] for x in calls[:2]], [spec, non_spec])
-        self.assertEqual(len(calls), 3 if non_spec else 2)
+        self.assertEqual(
+            [x[0] for x in calls[:2]], [spec, non_spec] if non_spec else [spec]
+        )
+        self.assertEqual(len(calls), 3 if non_spec else 1)
         self.ns["async_tensor_h2d"].assert_not_called()
         if full_graph and not non_spec:
             self.assertEqual(

@@ -172,39 +172,6 @@ def drop_ple_checkpoint_cache(model_path: str | None) -> int:
         return 0
 
 
-def advise_loaded_shard(address: int, nbytes: int) -> int:
-    """Advise only a copied contiguous file-backed tensor, without madvise."""
-    if nbytes <= 0:
-        return 0
-    try:
-        with open("/proc/self/maps") as mappings:
-            for line in mappings:
-                fields = line.rstrip().split(maxsplit=5)
-                start, end = (int(x, 16) for x in fields[0].split("-"))
-                if not start <= address < end:
-                    continue
-                if (
-                    address + nbytes > end
-                    or len(fields) != 6
-                    or not fields[5].startswith("/")
-                    or fields[5].endswith(" (deleted)")
-                    or fields[5].startswith("/dev/")
-                ):
-                    return 0
-                path = fields[5]
-                info = os.stat(path)
-                major, minor = (int(x, 16) for x in fields[3].split(":"))
-                if info.st_ino != int(fields[4]) or info.st_dev != os.makedev(
-                    major, minor
-                ):
-                    return 0
-                offset = int(fields[2], 16) + address - start
-                return advise_file_ranges(path, [(offset, nbytes)])
-    except (OSError, ValueError) as error:
-        logger.warning("PLE_PIN copied-shard cache advice unavailable: %s", error)
-    return 0
-
-
 @contextmanager
 def pin_startup_guard(options: PinStartupOptions, model_path: str | None):
     """Hold the local lock through allocation, registration and optional pacing."""
@@ -223,12 +190,13 @@ def pin_startup_guard(options: PinStartupOptions, model_path: str | None):
         pin_started = time.monotonic()
         logger.info(
             "PLE_PIN begin pid=%d serialized=%s wait_s=%.6f advice_s=%.6f "
-            "advised_bytes=%d",
+            "advised_bytes=%d lock_path=%r",
             os.getpid(),
             options.serialize,
             waited,
             advice_s,
             advised,
+            options.lock_path,
         )
         succeeded = False
         try:

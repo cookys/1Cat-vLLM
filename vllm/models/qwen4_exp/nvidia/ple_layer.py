@@ -101,7 +101,6 @@ from ..common.ple import (
 )
 from ..common.ple_host_startup import (
     PinStartupOptions,
-    advise_loaded_shard,
     pin_startup_guard,
 )
 
@@ -682,6 +681,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         # address of a buffer that no longer exists in the new process.
         self.layer_name = prefix
         vllm_config = get_current_vllm_config()
+        self._ple_vllm_config = vllm_config
         self._pin_checkpoint_model_path = getattr(
             vllm_config.model_config, "model", None
         )
@@ -732,7 +732,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
 
     def _device_spill_bytes(self, device: torch.device, table_bytes: int) -> int:
         """Bytes of the table that do not fit beside the weights and the KV cache."""
-        vllm_config = get_current_vllm_config()
+        vllm_config = self._ple_vllm_config
         free_bytes, total_bytes = torch.cuda.mem_get_info(device)
         kv_bytes = kv_cache_bytes_for_max_model_len(vllm_config)
         reserve_bytes = ple_vram_reserve_bytes(total_bytes)
@@ -772,7 +772,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             return budget
         # The table lives on the first pipeline stage only, so its
         # tensor-parallel ranks are the ones sharing this host's memory.
-        parallel = get_current_vllm_config().parallel_config
+        parallel = self._ple_vllm_config.parallel_config
         ranks = min(parallel.tensor_parallel_size, parallel.local_world_size) * (
             parallel.data_parallel_size_local
         )
@@ -916,23 +916,6 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             tp_start=tp_start,
             tp_end=tp_end,
         )
-        if (
-            os.getenv("VLLM_QWEN4EXP_PLE_PIN_DROP_CACHE", "0") == "1"
-            and copied
-            and loaded_weight.device.type == "cpu"
-            and loaded_weight.is_contiguous()
-        ):
-            # The existing copy is synchronous. This only advises the source
-            # file cache; it never discards the tensor's private/COW pages.
-            advised = advise_loaded_shard(
-                loaded_weight.data_ptr(), loaded_weight.nbytes
-            )
-            logger.info(
-                "PLE_PIN copied_shard pid=%d checkpoint_start=%d advised_bytes=%d",
-                os.getpid(),
-                checkpoint_start,
-                advised,
-            )
         self._checkpoint_shard_loaded = True
         return copied
 

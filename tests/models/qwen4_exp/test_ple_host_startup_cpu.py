@@ -3,7 +3,6 @@
 """Standalone CPU tests; run this file with the worktree's .venv/bin/python."""
 
 import ast
-import ctypes
 import importlib.util
 import json
 import logging
@@ -51,6 +50,9 @@ def _source_functions():
     materialize = next(
         n for n in cls.body if getattr(n, "name", "") == "materialize_tables"
     )
+    budget = next(
+        n for n in cls.body if getattr(n, "name", "") == "_resolve_host_budget"
+    )
     common = ast.parse((ROOT / "vllm/models/qwen4_exp/common/ple.py").read_text())
     nodes = [
         n
@@ -75,7 +77,6 @@ def _source_functions():
         "logger": logging.getLogger("ple-test"),
         "format_gib": str,
         "_PLE_REGISTERED_HOST_TABLES": [],
-        "advise_loaded_shard": Mock(return_value=4096),
     }
     module = ast.Module(
         body=[
@@ -84,7 +85,7 @@ def _source_functions():
             )
         ]
         + nodes
-        + [alloc, load, materialize],
+        + [alloc, load, materialize, budget],
         type_ignores=[],
     )
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), ns)
@@ -173,21 +174,13 @@ class StartupTests(unittest.TestCase):
         try:
             mapped[8192:8200] = b"modified"
             expected = mapped[:]
-            address = ctypes.addressof(ctypes.c_char.from_buffer(mapped))
             self.assertEqual(
-                startup.advise_loaded_shard(address, len(mapped)), len(mapped)
+                startup.advise_file_ranges(str(path), [(0, len(mapped))]), len(mapped)
             )
             self.assertEqual(mapped[:], expected)
             self.assertEqual(path.read_bytes(), original)
         finally:
             mapped.close()
-
-    def test_anonymous_mapping_is_not_advised(self):
-        with mmap.mmap(-1, 8192) as mapped:
-            address = ctypes.addressof(ctypes.c_char.from_buffer(mapped))
-            with patch.object(os, "posix_fadvise") as advice:
-                self.assertEqual(startup.advise_loaded_shard(address, 8192), 0)
-            advice.assert_not_called()
 
     def test_lock_timeout_exception_release_and_symlink(self):
         path = str(self.root / "pin.lock")
@@ -289,6 +282,7 @@ class StartupTests(unittest.TestCase):
                 "drop_ple_checkpoint_cache",
                 side_effect=lambda _: events.append("advice") or 4096,
             ),
+            self.assertLogs(startup.logger, level="INFO") as logs,
         ):
             result = ns["_ple_pinned_host_empty"](
                 (64, 128), torch.uint8, model_path="test-checkpoint"
@@ -296,6 +290,43 @@ class StartupTests(unittest.TestCase):
         self.assertIs(result, tensor)
         self.assertEqual(events, ["advice", "allocate", "register"])
         self.assertEqual(ns["_PLE_REGISTERED_HOST_TABLES"], [tensor])
+        self.assertIn(f"lock_path={path!r}", logs.output[0])
+
+    def test_auto_host_budget_uses_retained_config(self):
+        ns = _source_functions()
+        ns["get_current_vllm_config"] = Mock(
+            side_effect=AssertionError("no ambient model configuration")
+        )
+        ns["_ple_host_budget_bytes"] = lambda: None
+        ns["available_host_bytes"] = lambda: None
+        ns["total_host_bytes"] = lambda: None
+        ns["_ple_vram_reserve_bytes"] = lambda _: 7
+        ns["kv_cache_bytes_for_max_model_len"] = Mock(return_value=16)
+        ns["auto_ple_host_budget_bytes"] = Mock(return_value=20)
+        ns["torch"] = SimpleNamespace(
+            cuda=SimpleNamespace(mem_get_info=lambda _: (48, 64))
+        )
+        config = SimpleNamespace(
+            cache_config=SimpleNamespace(gpu_memory_utilization=0.9),
+            model_config=SimpleNamespace(max_model_len=128),
+        )
+        owner = SimpleNamespace(
+            _meta_weight_shape=(8, 4), embedding_dim=4, _ple_vllm_config=config
+        )
+        for hybrid, expected in ((True, 32), (False, 20)):
+            with self.subTest(hybrid=hybrid):
+                ns["envs"] = SimpleNamespace(VLLM_SM70_QWEN38_HYBRID_PLE=hybrid)
+                self.assertEqual(ns["_resolve_host_budget"](owner, "cpu"), expected)
+        ns["kv_cache_bytes_for_max_model_len"].assert_called_once_with(config)
+        ns["auto_ple_host_budget_bytes"].assert_called_once_with(
+            table_bytes=32,
+            device_total_bytes=64,
+            device_allocated_bytes=16,
+            gpu_memory_utilization=0.9,
+            kv_cache_bytes=16,
+            reserve_bytes=7,
+        )
+        ns["get_current_vllm_config"].assert_not_called()
 
     def test_materialization_does_not_require_ambient_model_config(self):
         ns = _source_functions()
@@ -375,7 +406,7 @@ class StartupTests(unittest.TestCase):
         runtime.cudaHostUnregister.assert_called_once_with(1234)
         self.assertEqual(ns["_PLE_REGISTERED_HOST_TABLES"], [])
 
-    def test_copy_parity_with_cache_advice_and_mixed_placement(self):
+    def test_copy_parity_without_post_copy_advice(self):
         ns = _source_functions()
         source = torch.arange(96, dtype=torch.uint8).reshape(24, 4)
         for enabled in ("0", "1"):
@@ -384,6 +415,7 @@ class StartupTests(unittest.TestCase):
                     with (
                         self.subTest(enabled=enabled, split=split, rank=rank),
                         patch.dict(os.environ, {PREFIX + "DROP_CACHE": enabled}),
+                        patch.object(os, "posix_fadvise") as advice,
                     ):
                         owner = SimpleNamespace(
                             materialize_tables=lambda: None,
@@ -407,6 +439,7 @@ class StartupTests(unittest.TestCase):
                             torch.equal(actual, source[rank * 12 : (rank + 1) * 12])
                         )
                         self.assertTrue(owner._checkpoint_shard_loaded)
+                        advice.assert_not_called()
 
 
 if __name__ == "__main__":
