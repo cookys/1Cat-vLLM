@@ -443,6 +443,8 @@ if TYPE_CHECKING:
     VLLM_SM70_TOPK_TOPP_8_WARPS: bool = False
     VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS: bool = True
     VLLM_SM70_TOPK_TOPP_BRANCHFREE: int = 0
+    VLLM_SM70_MTP_DRAFT_NVFP4_LM_HEAD: bool = False
+    VLLM_SM70_MTP_DRAFT_NVFP4_RERANK_K: int = 64
     VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH: int = 0
     VLLM_SM70_ASYNC_STAGED_INPUT_PREP: bool = False
     VLLM_SM70_ASYNC_CPU_TRACE: bool = False
@@ -6634,6 +6636,58 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="configuration",
         declared_default="0",
         effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+    ),
+    # Draft-only NVFP4 copy of the lm_head for the SM70 MTP speculator: the
+    # draft's greedy argmax screens the vocabulary with a 4-bit copy (~89 MB
+    # per rank at TP4) and re-ranks the top-R candidates exactly in FP16.
+    "VLLM_SM70_MTP_DRAFT_NVFP4_LM_HEAD": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_DRAFT_NVFP4_LM_HEAD", "0"))),
+        description=(
+            "SM70 MTP/EAGLE speculator: use a draft-only NVFP4 copy of the "
+            "lm_head for the greedy draft argmax. The FP16 shard is quantized "
+            "at load into an extra ~89.4 MB per rank (TP4 shard of 62080 rows "
+            "x 2560) plus a 7.9 MB FP16 output buffer; the QPN2 NVFP4 GEMM "
+            "screens the vocabulary and the top VLLM_SM70_MTP_DRAFT_NVFP4_"
+            "RERANK_K candidates are re-ranked exactly with FP32 products "
+            "against the FP16 rows, then reduced across TP ranks like "
+            "get_top_tokens. Draft only: the target lm_head and its verify "
+            "path are unchanged, so the target distribution is unchanged. The "
+            "draft token can differ from the FP16 argmax only when that "
+            "argmax is outside the NVFP4 top-R (still a valid greedy "
+            "proposal; only the acceptance rate can move). Needs an SM70 "
+            "device, the QPN2 native ops, an FP16 lm_head with K % 128 == 0, "
+            "N % 32 == 0 and no vocab padding, and draft_sample_method="
+            "greedy; otherwise it logs why and keeps the FP16 path. "
+            "Registering a new env var changes the compile-factor hash once."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+    ),
+    "VLLM_SM70_MTP_DRAFT_NVFP4_RERANK_K": env_var(
+        lambda: int(
+            env_with_choices(
+                "VLLM_SM70_MTP_DRAFT_NVFP4_RERANK_K",
+                "64",
+                ["0", "8", "16", "32", "64", "128"],
+            )()
+        ),
+        description=(
+            "Candidates per row that VLLM_SM70_MTP_DRAFT_NVFP4_LM_HEAD "
+            "re-ranks exactly in FP16 after the NVFP4 screen. Allowed values "
+            "are 0, 8, 16, 32, 64 (default) and 128; any other value is "
+            "rejected. 0 skips the rerank and returns the raw NVFP4 argmax, "
+            "a diagnostic tier that can flip near-ties. Larger values make "
+            "the draft token equal the FP16 argmax more often at the cost of "
+            "a slightly larger gather (R x 2560 x 2 bytes per row)."
+        ),
+        category="experimental",
+        declared_default="64",
+        effective_default="64",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
     ),
