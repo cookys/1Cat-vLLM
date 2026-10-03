@@ -194,6 +194,7 @@ class CpuManager(cg.SamplingCudaGraphManager):
     def _memory_probe(self):
         # Each capture probes twice; the graph pool grows by pool_growth.
         self.probe_calls += 1
+        self.events.append("probe")
         base = 100 * MIB
         return (base + (self.probe_calls % 2 == 0) * self.pool_growth, 0)
 
@@ -795,7 +796,7 @@ def test_capture_warms_up_then_captures_each_key_in_one_shared_pool(monkeypatch)
 
     assert manager.events[0] == "outer-scope"
     # Per key: eager warmup, sync, capture.
-    body_markers = [e for e in manager.events if e != "outer-scope"]
+    body_markers = [e for e in manager.events if e not in ("outer-scope", "probe")]
     assert body_markers == [
         "sync",
         "capture-begin",
@@ -830,6 +831,23 @@ def test_capture_logs_the_measured_pool_bytes_once_at_info(monkeypatch):
     assert len(messages) == 1
     assert "Graph pool reserved 25.00 MiB" in messages[0]
     assert "static input buffers" in messages[0]
+
+
+def test_pool_memory_is_probed_inside_the_graph_scope(monkeypatch):
+    """torch.cuda.graph.__enter__ runs empty_cache(), which would be subtracted
+    from the pool's growth if the probe ran before entering the scope."""
+    env = make_env(monkeypatch, max_graph_reqs=2, capture=False)
+    env.manager.capture()
+    marked = [e for e in env.manager.events if e != "outer-scope"]
+    for start in range(0, len(marked), 5):
+        assert marked[start : start + 5] == [
+            "sync",
+            "capture-begin",
+            "probe",
+            "probe",
+            "capture-end",
+        ]
+    assert marked.count("probe") == 2 * len(env.manager.keys)
 
 
 @pytest.mark.parametrize("mode", ["0", "1"])
@@ -1191,6 +1209,9 @@ def test_capture_builds_and_captures_the_manager_from_the_env(monkeypatch):
             self.captured = True
 
     monkeypatch.setattr(model_runner_module, "SamplingCudaGraphManager", FakeManager)
+    monkeypatch.setattr(
+        model_runner_module.current_platform, "is_device_capability", lambda c: True
+    )
     # A CUDA-typed device name without touching CUDA.
     device = SimpleNamespace(type="cuda")
     sampler = SimpleNamespace(compute_nans=False)
@@ -1222,6 +1243,9 @@ def test_capture_skips_probabilistic_drafting(monkeypatch):
     monkeypatch.setenv("VLLM_SM70_SAMPLING_CUDAGRAPH", "1")
     fake_logger = FakeLogger()
     monkeypatch.setattr(model_runner_module, "logger", fake_logger)
+    monkeypatch.setattr(
+        model_runner_module.current_platform, "is_device_capability", lambda c: True
+    )
     runner = _bare_runner(
         sampler=SimpleNamespace(compute_nans=False),
         rejection_sampler=object(),
@@ -1233,6 +1257,41 @@ def test_capture_skips_probabilistic_drafting(monkeypatch):
     runner._capture_sampling_graph()
     assert runner.sampling_graph is None
     assert "probabilistic drafting" in fake_logger.warnings[0]
+
+
+def test_capture_is_limited_to_sm70(monkeypatch):
+    """Off SM70 eager top-k/top-p is not the reference path the graph captures."""
+    monkeypatch.setenv("VLLM_SM70_SAMPLING_CUDAGRAPH", "1")
+    fake_logger = FakeLogger()
+    monkeypatch.setattr(model_runner_module, "logger", fake_logger)
+    monkeypatch.setattr(
+        model_runner_module,
+        "SamplingCudaGraphManager",
+        lambda **kw: pytest.fail("must not be built off SM70"),
+    )
+    capabilities = []
+
+    def is_device_capability(capability):
+        capabilities.append(capability)
+        return False
+
+    monkeypatch.setattr(
+        model_runner_module.current_platform,
+        "is_device_capability",
+        is_device_capability,
+    )
+    runner = _bare_runner(
+        sampler=SimpleNamespace(compute_nans=False),
+        rejection_sampler=object(),
+        speculator=SimpleNamespace(draft_logits=None),
+        num_speculative_steps=K,
+        use_pp=False,
+        device=SimpleNamespace(type="cuda"),
+    )
+    runner._capture_sampling_graph()
+    assert runner.sampling_graph is None
+    assert capabilities == [70]
+    assert "not SM70" in fake_logger.warnings[0]
 
 
 class _SampleHarness:

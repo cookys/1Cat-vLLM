@@ -709,7 +709,11 @@ def main() -> int:
         f"eager VLLM_SM70_TOPK_TOPP_BRANCHFREE={envs.VLLM_SM70_TOPK_TOPP_BRANCHFREE}"
     )
     if capability != (7, 0):
-        print("note: not an SM70 device; the check still applies but is untuned")
+        print(
+            "note: not an SM70 device. Eager top-k/top-p runs the Triton kernel "
+            "there, not the reference path the graph captures, so mismatches are "
+            "expected; the runner does not capture the graph on such devices."
+        )
 
     variants = {"in-graph": [False], "tail": [True], "both": [False, True]}[
         args.model_state
