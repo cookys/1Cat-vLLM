@@ -324,10 +324,104 @@ def test_dtype_and_width_are_checked(cpu_ops):
 
 
 def test_resident_bytes_and_buffers(cpu_ops):
-    weight, head = _random_head(n=512, k=256)
-    assert head.resident_bytes() == 512 * 128 + 512 * 16 + 64 * 512 * 2
+    weight, head = _random_head(n=512, k=256, rerank_k=64)
+    codes, scales = 512 * 128, 512 * 16
+    logits = 64 * 512 * 2  # FP16 [64, N]
+    candidates = 64 * 64 * (2 + 8 + 4)  # topk values f16, ids i64, exact f32
+    pair = 64 * 2 * 4
+    assert head.resident_bytes() == codes + scales + logits + candidates + pair
     assert head.out.shape == (64, 512) and head.out.dtype == torch.float16
     assert head.weight.data_ptr() == weight.data_ptr()  # shares the FP16 shard
+    head.rerank_k = 0
+    assert head.resident_bytes() == codes + scales + logits + pair
+
+
+def test_per_call_buffers_are_preallocated_and_stable(cpu_ops):
+    _, head = _random_head(n=512, rerank_k=32)
+    names = ("out", "_pair", "_topk_values", "_topk_ids", "_exact")
+    before = {n: getattr(head, n).data_ptr() for n in names}
+    for m in (1, 2, 4, 17, 64):
+        head.top_tokens(_hidden(m))
+    assert {n: getattr(head, n).data_ptr() for n in names} == before
+    # contiguous [64, R] rows, so topk(out=) and the Triton kernel can use slices
+    for n in ("_topk_values", "_topk_ids", "_exact"):
+        assert getattr(head, n).shape == (64, 32) and getattr(head, n).is_contiguous()
+    assert head._topk_ids.dtype == torch.int64 and head._exact.dtype == torch.float32
+    assert head._topk_values.dtype == torch.float16
+
+
+def test_result_does_not_alias_the_static_buffers(cpu_ops):
+    _, head = _random_head(n=512, rerank_k=32)
+    first = head.top_tokens(_hidden(4, seed=1))
+    snapshot = first.clone()
+    head.top_tokens(_hidden(4, seed=2))
+    assert torch.equal(first, snapshot)
+
+
+def test_rerank_k_setter_reallocates_and_validates(cpu_ops):
+    weight, head = _random_head(n=512, rerank_k=64)
+    hidden = _hidden(4)
+    head.rerank_k = 8
+    assert head.rerank_k == 8 and head._topk_ids.shape == (64, 8)
+    tokens8 = head.top_tokens(hidden)
+    head.rerank_k = 0
+    assert head._topk_ids is None and head._exact is None
+    raw = head.top_tokens(hidden)
+    assert torch.equal(raw, head.out[:4].float().argmax(-1))
+    head.rerank_k = 128
+    assert head._exact.shape == (64, 128)
+    assert head.top_tokens(hidden).shape == tokens8.shape
+    for bad in (7, 129, -1):
+        with pytest.raises(ValueError):
+            head.rerank_k = bad
+    assert head.rerank_k == 128
+
+
+def test_activation_log_reports_cost_and_kernel_config(cpu_ops, caplog):
+    with caplog.at_level("INFO"):
+        _, head = _random_head(n=512, k=256, rerank_k=64)
+    line = next(r.getMessage() for r in caplog.records if "active" in r.getMessage())
+    assert caplog.text.count("draft NVFP4 lm_head active") == 1
+    for fragment in (
+        "rows=512",
+        "K=256",
+        "rerank_k=64",
+        f"split_k={head.split_k}",
+        f"chains={head.accumulator_chains}",
+        "quantize=",
+        "peak_extra=",
+        "resident=",
+    ):
+        assert fragment in line, (fragment, line)
+    assert head.quantize_seconds > 0
+    assert head.peak_extra_bytes == 0  # no peak accounting off-CUDA
+
+
+def test_exact_rerank_uses_indexed_fp32_logits_on_cuda(cpu_ops, monkeypatch):
+    """The CUDA branch calls the Triton kernel with exactly its input contract."""
+    import vllm.model_executor.layers.sm70_fp32_lm_head as kernel
+
+    seen = []
+
+    def fake_kernel(x, weight, ids, out):
+        m, r = ids.shape
+        assert x.dtype == torch.float16 and x.is_contiguous() and x.dim() == 2
+        assert weight.dtype == torch.float16 and weight.is_contiguous()
+        assert weight.shape[1] == x.shape[1]
+        assert ids.dtype == torch.int64 and ids.is_contiguous()
+        assert out.dtype == torch.float32 and out.is_contiguous()
+        assert out.shape == (m, r) and x.shape[0] == m
+        rows = weight[ids.reshape(-1)].view(m, r, -1).float()
+        out.copy_(torch.einsum("mk,mrk->mr", x.float(), rows))
+        seen.append((m, r))
+
+    weight, head = _random_head(n=512, rerank_k=32)
+    hidden = _hidden(5)
+    expected = head.top_tokens(hidden)  # torch fallback
+    monkeypatch.setattr(kernel, "indexed_fp32_logits", fake_kernel)
+    monkeypatch.setattr(mod, "_use_triton_rerank", lambda x: True)
+    assert torch.equal(head.top_tokens(hidden), expected)
+    assert seen == [(5, 32)]
 
 
 def test_constructor_validates_arguments(cpu_ops):
@@ -494,6 +588,10 @@ def test_gate_device_and_ops(monkeypatch):
         (_meta_head(n=62081), "multiple of 32"),
         (_meta_head(n=96), "at least"),
         (_meta_head(pad=3), "padding"),
+        (
+            _lm_head(torch.empty(2560, 62080, dtype=torch.float16, device="meta").t()),
+            "contiguous",
+        ),
         (_meta_head(bias=torch.zeros(1)), "bias"),
         (_meta_head(org_vocab_size=1 << 24), "fp32"),
         (SimpleNamespace(weight=torch.empty(8, device="meta")), "2-D"),
@@ -641,6 +739,7 @@ def _speculator_stub(head):
     )
     return sentinel, SimpleNamespace(
         _draft_nvfp4_head=head,
+        _draft_hidden_dump=None,
         use_local_argmax_reduction=False,
         model=model,
         temperature=None,
