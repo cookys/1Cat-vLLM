@@ -32,24 +32,34 @@ sampled rows must not all be equal (``frozen_rng`` false).
 The captured request slots (``0..num_reqs-1``) are the slots the live requests
 use, so the run also covers the claim that the capture-time warmup does not
 disturb a request that later takes the same slot (the eager rig had no
-warmup).
+warmup). Right after the capture the graph rig's persistent state (penalty bin
+counts, ``num_computed_tokens``, ``total_len``, ``last_sampled_tokens``,
+``all_token_ids`` and the model-state accepted-token counts) is compared in
+full against a snapshot taken before it; the warmup writes those regions for
+the dummy slots and the manager must put them back. A difference is reported
+with its field and first indices and ends the run with exit status 3, before
+any round is compared.
 
 The default run covers both ways the model-state postprocess can run: inside
 the graph, and as the eager tail the runner uses when the Mamba align context
 did not exist at capture time (``--model-state both``).
 
-It also reports the graph pool bytes (the capture-time reserved delta against
-the design's ~30 MB estimate for the (1, 5) shape), the static input buffer
-bytes, and host-enqueue and GPU time per round for eager and replay.
+It also reports the graph pool bytes against the accepted budget of 58 MiB for
+the (1, 5) key (measured on V100 on 2026-10-03; the design estimate was about
+30 MiB), the static input buffer bytes, and host-enqueue and GPU time per round
+for eager and replay. The pool check fails only when the pool exceeds the
+budget by more than 10 percent, and only for ``--num-reqs 1``, the key the
+budget was measured for.
 
 The eager rig runs with ``VLLM_SM70_TOPK_TOPP_BRANCHFREE=2`` (the reference
 path the graph reproduces); ``--eager-branchfree 0`` compares against today's
 compact path instead, where a last-ulp difference in a top-p margin row is a
 legitimate finding, not a harness bug.
 
-Exit status: 0 all checks passed; 1 a mismatch or a failed check; 2 the
-environment cannot run it (no CUDA device). One JSON line is printed and
-written to ``--out``.
+Exit status: 0 all checks passed; 1 a round mismatch or another failed check
+(frozen RNG, fallback, wrong model-state placement, pool over budget); 2 the
+environment cannot run it (no CUDA device) or bad arguments; 3 the capture left
+persistent state changed. One JSON line is printed and written to ``--out``.
 
     # From the worktree, inside the serving venv (the installed wheel carries
     # the overlay files); use one idle SM70 GPU, about a minute:
@@ -110,6 +120,9 @@ PER_REQ = NUM_SPEC + 1
 MAX_NUM_REQS = 8
 MAX_NUM_TOKENS = 64
 DESIGN_POOL_ESTIMATE_MIB = 30.0  # design doc, (1, 5) shape at 248320 vocab
+POOL_ACCEPTED_MIB = 58.0  # measured 2026-10-03 on V100, accepted by the orchestrator
+POOL_FAIL_FACTOR = 1.10  # fail only above the accepted pool by more than 10 percent
+EXIT_STATE_RESIDUE = 3
 MIB = float(1 << 20)
 WARM_ROUNDS = 3  # excluded from the timing medians
 
@@ -175,7 +188,8 @@ class _StubModelState:
     """
 
     def __init__(self, num_accepted: torch.Tensor, tail: bool):
-        self.num_accepted = num_accepted
+        # MambaHybridModelState's name, which the manager's restore list uses.
+        self.num_accepted_tokens_gpu = num_accepted
         self._align_mode = tail
         self._mamba_ctx = None
 
@@ -190,7 +204,7 @@ class _StubModelState:
         )
 
         _scatter_num_accepted_kernel[(idx_mapping.shape[0],)](
-            idx_mapping, num_sampled, self.num_accepted
+            idx_mapping, num_sampled, self.num_accepted_tokens_gpu
         )
 
 
@@ -297,6 +311,8 @@ class Rig:
 
         self.manager: HarnessManager | None = None
         self.capture_info: dict[str, Any] = {}
+        # None, or the first persistent field the capture changed.
+        self.capture_state_residue: dict[str, Any] | None = None
         if use_graph:
             signature = cg.SamplingSignature(
                 top_k=args.top_k != vocab,
@@ -329,9 +345,13 @@ class Rig:
         torch.cuda.synchronize(self.device)
         reserved_before = torch.cuda.memory_reserved(self.device)
         free_before = torch.cuda.mem_get_info(self.device)[0]
+        state_before = self.persistent_state()
         start = time.perf_counter()
         self.manager.capture()
         torch.cuda.synchronize(self.device)
+        self.capture_state_residue = first_state_difference(
+            state_before, self.persistent_state()
+        )
         self.capture_info = {
             "capture_seconds": round(time.perf_counter() - start, 3),
             "reserved_delta_mib": round(
@@ -511,6 +531,18 @@ class Rig:
             gpu_us=start_event.elapsed_time(end_event) * 1e3,
         )
 
+    def persistent_state(self) -> dict[str, torch.Tensor]:
+        """Full copies of the persistent tensors the capture warmup may write."""
+        states = self.req_states
+        return {
+            "output_bin_counts": self.sampler.penalties_state.output_bin_counts.clone(),
+            "num_computed_tokens": states.num_computed_tokens.gpu.clone(),
+            "total_len": states.total_len.gpu.clone(),
+            "last_sampled_tokens": states.last_sampled_tokens.clone(),
+            "all_token_ids": states.all_token_ids.gpu.clone(),
+            "num_accepted_tokens_gpu": self.num_accepted.clone(),
+        }
+
     def state_tensors(self) -> dict[str, torch.Tensor]:
         slots = self.slots_t
         states = self.req_states
@@ -554,16 +586,50 @@ def compare_round(
     pairs.update({k: (eager_state[k], graph_state[k]) for k in eager_state})
     for name, (want, got) in pairs.items():
         if not torch.equal(want, got):
-            flat_want, flat_got = want.flatten(), got.flatten()
-            differing = (flat_want != flat_got).nonzero().flatten()[:4].tolist()
             return {
                 "round": rnd,
                 "field": name,
-                "first_differing_flat_indices": differing,
-                "eager": flat_want[differing].tolist() if differing else None,
-                "graph": flat_got[differing].tolist() if differing else None,
+                **describe_difference(want, got, "eager", "graph"),
             }
     return None
+
+
+def describe_difference(
+    want: torch.Tensor, got: torch.Tensor, want_name: str, got_name: str
+) -> dict[str, Any]:
+    """First few flat indices where two same-shaped tensors differ, with values."""
+    flat_want, flat_got = want.flatten(), got.flatten()
+    differing = (flat_want != flat_got).nonzero().flatten()[:4].tolist()
+    return {
+        "first_differing_flat_indices": differing,
+        want_name: flat_want[differing].tolist() if differing else None,
+        got_name: flat_got[differing].tolist() if differing else None,
+    }
+
+
+def first_state_difference(
+    before: dict[str, torch.Tensor], after: dict[str, torch.Tensor]
+) -> dict[str, Any] | None:
+    """First field whose full tensor changed, or None when all are bit-equal."""
+    for name, want in before.items():
+        if not torch.equal(want, after[name]):
+            return {
+                "field": name,
+                **describe_difference(want, after[name], "before_capture", "after"),
+            }
+    return None
+
+
+def pool_within_budget(pool_mib: float, num_reqs: int) -> bool:
+    """The accepted budget covers the (1, 5) key; other shapes are only reported."""
+    return num_reqs != 1 or pool_mib <= POOL_ACCEPTED_MIB * POOL_FAIL_FACTOR
+
+
+def compute_exit_code(results: list[dict[str, Any]]) -> int:
+    """3 capture residue, 1 any failed check, 0 all passed."""
+    if any(r["capture_state_residue"] is not None for r in results):
+        return EXIT_STATE_RESIDUE
+    return 0 if all(r["pass"] for r in results) else 1
 
 
 def make_round_inputs(
@@ -613,6 +679,17 @@ def run_variant(
     torch.manual_seed(args.seed)
     eager = Rig(args, device, use_graph=False, tail=tail, outer_scope=outer_scope)
     graph = Rig(args, device, use_graph=True, tail=tail, outer_scope=outer_scope)
+    assert graph.manager is not None
+    if graph.capture_state_residue is not None:
+        # The rounds below would only report the same residue as noise.
+        return {
+            "model_state": "eager-tail" if tail else "in-graph",
+            "signature": str(graph.signature),
+            "capture": graph.capture_info,
+            "capture_state_residue": graph.capture_state_residue,
+            "rounds_compared": 0,
+            "pass": False,
+        }
     generator = torch.Generator(device=device)
     generator.manual_seed(args.seed)
     host_rng = np.random.default_rng(args.seed)
@@ -654,11 +731,12 @@ def run_variant(
 
     timed_e = eager_outs[WARM_ROUNDS : args.rounds]
     timed_g = graph_outs[WARM_ROUNDS : args.rounds]
-    assert graph.manager is not None
+    pool_mib = graph.capture_info["pool_reserved_mib"]
     result = {
         "model_state": "eager-tail" if tail else "in-graph",
         "signature": str(graph.signature),
         "signature_is_default": graph.signature in cg.DEFAULT_CAPTURE_SIGNATURES,
+        "capture_state_residue": None,
         "rounds_compared": len(eager_outs),
         "mismatches": len(mismatches),
         "first_mismatch": mismatches[0] if mismatches else None,
@@ -669,10 +747,10 @@ def run_variant(
         "graph_replays": graph.manager.num_replays,
         "graph_fallbacks": graph.manager.num_fallbacks,
         "capture": graph.capture_info,
-        "pool_reserved_mib_vs_design_estimate": [
-            graph.capture_info["pool_reserved_mib"],
-            DESIGN_POOL_ESTIMATE_MIB,
-        ],
+        "pool_reserved_mib": pool_mib,
+        "pool_accepted_mib": POOL_ACCEPTED_MIB,
+        "pool_design_estimate_mib": DESIGN_POOL_ESTIMATE_MIB,
+        "pool_within_budget": pool_within_budget(pool_mib, args.num_reqs),
         "host_enqueue_us_median": {
             "eager": _median([o.host_us for o in timed_e]),
             "replay": _median([o.host_us for o in timed_g]),
@@ -685,6 +763,7 @@ def run_variant(
     result["pass"] = (
         not mismatches
         and not result["frozen_rng"]
+        and result["pool_within_budget"]
         and result["graph_fallbacks"] == 0
         and result["graph_replays"] == len(graph_outs)
         and graph.manager.model_state_in_graph == (not tail)
@@ -745,14 +824,22 @@ def main() -> int:
             f.write(line + "\n")
     for r in results:
         verdict = "PASS" if r["pass"] else "FAIL"
+        if r["capture_state_residue"] is not None:
+            print(
+                f"[{verdict}] model_state={r['model_state']}: the capture left "
+                f"persistent state changed: {r['capture_state_residue']}"
+            )
+            continue
         print(
             f"[{verdict}] model_state={r['model_state']}: "
             f"{r['rounds_compared']} rounds, {r['mismatches']} mismatches, "
             f"frozen_rng={r['frozen_rng']} "
             f"(distinct={r['distinct_outputs_with_fixed_logits']}/"
-            f"{r['position_rounds']}), pool "
-            f"{r['capture']['pool_reserved_mib']} MiB reserved "
-            f"(design ~{DESIGN_POOL_ESTIMATE_MIB:.0f}; whole capture "
+            f"{r['position_rounds']}), "
+            f"pool {r['pool_reserved_mib']} MiB vs accepted "
+            f"{POOL_ACCEPTED_MIB:.0f} MiB (design estimate "
+            f"{DESIGN_POOL_ESTIMATE_MIB:.0f} MiB"
+            f"{'' if r['pool_within_budget'] else '; OVER BUDGET'}; whole capture "
             f"{r['capture']['reserved_delta_mib']} MiB incl. warmup cache, "
             f"static inputs {r['capture']['static_input_mib']} MiB), host enqueue "
             f"{r['host_enqueue_us_median']['eager']} -> "
@@ -761,7 +848,7 @@ def main() -> int:
         )
         if r["first_mismatch"] is not None:
             print(f"  first mismatch: {r['first_mismatch']}")
-    return 0 if summary["pass"] else 1
+    return compute_exit_code(results)
 
 
 if __name__ == "__main__":
