@@ -87,8 +87,10 @@ def cases(vocab, alignment, seed):
 
 def compare(a, b):
     left, right = json.loads(a.read_text()), json.loads(b.read_text())
-    if left["alignment"] != right["alignment"] or left["seed"] != right["seed"]:
-        raise ValueError("alignment and seed must match")
+    if not left.get("complete") or not right.get("complete"):
+        raise ValueError("both recordings must have completed all cases")
+    if any(left[key] != right[key] for key in ("alignment", "seed", "max_tokens")):
+        raise ValueError("alignment, seed and max_tokens must match")
     if left["cases"].keys() != right["cases"].keys():
         raise ValueError("case names differ")
     failed = False
@@ -137,6 +139,8 @@ def main():
         "label": args.label,
         "alignment": args.alignment,
         "seed": args.seed,
+        "max_tokens": args.max_tokens,
+        "complete": False,
         "cases": {},
     }
     run_salt = f"committed-prefix-{args.label}-{time.time_ns()}"
@@ -166,6 +170,8 @@ def main():
             result["cases"][name] = row
             args.out.write_text(json.dumps(result, indent=2) + "\n")
             print(name, f"TTFT={row['ttft_s']:.3f}s", row["usage"], flush=True)
+    result["complete"] = True
+    args.out.write_text(json.dumps(result, indent=2) + "\n")
     return 0
 
 
