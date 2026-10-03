@@ -282,7 +282,9 @@ def prefill(c, r, *, finish="stop", budget=64):
     # producer. Admission integration tests use run_request instead; those call
     # the real public lookup and allocator and never inject a warm decision.
     if c.mtp_prefix_snapshots is not None:
-        c.mtp_prefix_snapshots.observe_lookup(r, 16)
+        policy = c.mtp_prefix_snapshots
+        boundary = (r.num_prompt_tokens - 1) // policy.alignment * policy.alignment
+        policy.observe_lookup(r, max(policy.alignment, boundary - policy.alignment))
         c.mtp_prefix_snapshots.admit(r)
     scheduler = types.SimpleNamespace(
         use_eagle=True,
@@ -411,14 +413,78 @@ class WarmAdmissionTests(unittest.TestCase):
         self.assertEqual(c.mtp_prefix_snapshots.lookup_saved_tokens, 16)
         self.assertEqual(c.mtp_prefix_snapshots.admissions, {})
 
-    def test_warm_append_can_exceed_one_page(self):
+    def test_admission_logs_distinguish_cold_near_boundary_and_candidate(self):
         c = coordinator()
-        run_request(c, Request("cold", list(range(43))))
-        warm = Request("warm-long-append", list(range(101)))
-        hit, ends = run_request(c, warm)
+        c.mtp_prefix_snapshots.telemetry = True
+        lines = []
+        old_logger = NS["logger"]
+        NS["logger"] = types.SimpleNamespace(
+            info=lambda fmt, *args: lines.append(fmt % args), debug=lambda *args: None
+        )
+        try:
+            for name in ("cold", "warm", "hit"):
+                run_request(c, Request(name, list(range(43))))
+        finally:
+            NS["logger"] = old_logger
+        admissions = [line for line in lines if "MTP_COMMITTED_PREFIX admit " in line]
+        self.assertEqual(len(admissions), 3)  # Once per request, not per chunk.
+        for line, reason in zip(admissions, ("cold", "near_boundary", "candidate")):
+            self.assertIn(f"cut_reason={reason}", line)
+        self.assertIn("warm_producer=False", admissions[0])
+        self.assertIn("candidate_tokens=32", admissions[-1])
+
+    def test_shared_system_prefix_keeps_off_chunking(self):
+        c = coordinator()
+        off = coordinator(False)
+        for state in (c, off):
+            run_request(state, Request("system-prefix-seed", list(range(43))))
+        request = Request("new-conversation", list(range(101)))
+        hit, ends = run_request(c, request, finish=None)
+        control = run_request(
+            off, Request("new-conversation", list(range(101))), finish=None
+        )
+        self.assertEqual((hit, ends), control)
         self.assertEqual(hit, 16)
-        self.assertIn(96, ends)
-        self.assertEqual(lookup(c, Request("next", list(range(105))))[1][1], 96)
+        self.assertNotIn(96, ends)
+        self.assertEqual(
+            c.mtp_prefix_snapshots.cut_reason(request), "prefix_below_threshold"
+        )
+        self.assertFalse(c.mtp_prefix_snapshots.is_warm_producer(request))
+        self.assertNotIn(request.request_id, c.mtp_prefix_snapshots.pending)
+        self.assertFalse(any(b.mtp_prefix_certificate for b in c.block_pool.blocks))
+        self.assertEqual(
+            [(b.block_id, b.block_hash, b.ref_cnt) for b in c.block_pool.blocks],
+            [(b.block_id, b.block_hash, b.ref_cnt) for b in off.block_pool.blocks],
+        )
+        request.status = "stop"
+        cache_manager(c).free_request(request)
+        # This also represents a real long append. V2b knowingly gives up the
+        # B=96 certificate that v2 would let the next request use.
+        self.assertEqual(lookup(c, Request("next", list(range(105))))[1][1], 80)
+
+    def test_chain_warm_reasons_and_zero_threshold(self):
+        policy = POLICY.MTPPrefixSnapshots(16)
+        r = Request("r", list(range(101)))  # B=96, B-A=80.
+        for baseline, candidate, reason, warm in (
+            (0, 0, "cold", False),
+            (16, 0, "prefix_below_threshold", False),
+            (64, 0, "prefix_below_threshold", False),
+            (80, 0, "near_boundary", True),
+            (0, 32, "candidate", True),
+            (16, 32, "candidate", True),
+        ):
+            with self.subTest(baseline=baseline, candidate=candidate):
+                policy.observe_lookup(r, baseline, candidate)
+                self.assertEqual(policy.cut_reason(r), reason)
+                self.assertEqual(policy.is_warm_producer(r), warm)
+        short = Request("short", list(range(17)))  # B-A=0 must not admit a miss.
+        policy.observe_lookup(short, 0)
+        self.assertEqual(policy.cut_reason(short), "cold")
+        self.assertEqual(policy.extra_boundaries(short), ())
+        policy.observe_lookup(r, 80)
+        policy.admit(r)
+        policy.observe_lookup(r, 0)
+        self.assertEqual(policy.cut_reason(r), "near_boundary")
 
     def test_failed_admission_then_eviction_reclassifies_cold(self):
         for reserve_full in (False, True):
@@ -496,7 +562,7 @@ class WarmAdmissionTests(unittest.TestCase):
         self.assertEqual(run_request(c, r), run_request(off, control))
         self.assertFalse(any(b.mtp_prefix_certificate for b in c.block_pool.blocks))
 
-    def test_skip_read_and_candidate_only_are_not_warm_producers(self):
+    def test_skip_read_is_cold_but_candidate_only_can_be_chain_warm(self):
         c = coordinator()
         for name in ("seed", "warm"):
             run_request(c, Request(name, list(range(43))))
@@ -504,7 +570,8 @@ class WarmAdmissionTests(unittest.TestCase):
         r.skip_reading_prefix_cache = True
         self.assertEqual(run_request(c, r), (0, [16, 43]))
         # A certificate can remain when an older legacy state is evicted.
-        # Candidate lookup remains valid, but does not bootstrap producer status.
+        # V2b can use the certificate as its chain-warm signal even when the
+        # ordinary lookup hits zero; it may then create a later boundary.
         c = coordinator()
         for name in ("seed", "warm"):
             run_request(c, Request(name, list(range(43))))
@@ -523,8 +590,9 @@ class WarmAdmissionTests(unittest.TestCase):
         self.assertEqual(
             c.mtp_prefix_snapshots.admissions[r.request_id].baseline_tokens, 0
         )
-        self.assertFalse(c.mtp_prefix_snapshots.is_warm_producer(r))
-        self.assertEqual(run_request(c, r), (32, [61]))
+        self.assertTrue(c.mtp_prefix_snapshots.is_warm_producer(r))
+        self.assertEqual(c.mtp_prefix_snapshots.cut_reason(r), "candidate")
+        self.assertEqual(run_request(c, r), (32, [48, 61]))
 
     def test_cold_production_geometry_ignores_later_progress(self):
         for length in (1615, 1616, 3249, 16177, 65553):

@@ -4,7 +4,7 @@
 
 No device allocation/copy or sampling operation belongs here. The align
 allocator already preserves a boundary state when the next chunk moves to a
-new block. For warm producers we retain one additional boundary and certify
+new block. For chain-warm producers we retain one additional boundary and certify
 the existing blocks. Cold producers keep the ordinary scheduler's chunking.
 Certificates are deliberately unavailable until the producer finishes normally.
 """
@@ -33,6 +33,8 @@ class MTPPrefixCertificate:
 @dataclass(slots=True)
 class MTPPrefixAdmission:
     baseline_tokens: int
+    candidate_tokens: int = 0
+    cut_reason: str = "unobserved"
     scheduled: bool = False
 
 
@@ -64,19 +66,39 @@ class MTPPrefixSnapshots:
         self.lookup_hits = 0
         self.lookup_saved_tokens = 0
 
-    def observe_lookup(self, request: Request, baseline_tokens: int) -> None:
-        """Track ordinary usable hits, before the candidate no-drop lookup.
+    def observe_lookup(
+        self, request: Request, baseline_tokens: int, candidate_tokens: int = 0
+    ) -> None:
+        """Allow a certificate hit or an ordinary hit within one page of B.
 
         A waiting request can fail allocation and retry after cache eviction.
         Replace its provisional decision on each lookup until it is scheduled.
         A cold request never becomes warm merely by completing its first chunk.
+
+        This predicts reuse; it does not identify dialogue membership. A distant
+        shared system prefix cannot add a cut, but long genuine chain appends
+        can also fail this conservative threshold. The positive-baseline guard
+        keeps cold requests cold even when B - alignment is zero.
         """
         current = self.admissions.get(request.request_id)
         if current is None or not current.scheduled:
+            boundary = (
+                (request.num_prompt_tokens - 1) // self.alignment * self.alignment
+            )
+            if not eligible_request(request) or request.skip_reading_prefix_cache:
+                reason = "ineligible"
+            elif boundary <= 0:
+                reason = "short_prompt"
+            elif candidate_tokens > 0:
+                reason = "candidate"
+            elif baseline_tokens > 0 and baseline_tokens >= boundary - self.alignment:
+                reason = "near_boundary"
+            elif baseline_tokens > 0:
+                reason = "prefix_below_threshold"
+            else:
+                reason = "cold"
             self.admissions[request.request_id] = MTPPrefixAdmission(
-                baseline_tokens
-                if eligible_request(request) and not request.skip_reading_prefix_cache
-                else 0
+                baseline_tokens, candidate_tokens, reason
             )
 
     def admit(self, request: Request) -> bool:
@@ -91,13 +113,13 @@ class MTPPrefixSnapshots:
         return True
 
     def is_warm_producer(self, request: Request) -> bool:
+        return self.cut_reason(request) in ("candidate", "near_boundary")
+
+    def cut_reason(self, request: Request) -> str:
+        if not eligible_request(request) or request.skip_reading_prefix_cache:
+            return "ineligible"
         admission = self.admissions.get(request.request_id)
-        return bool(
-            admission is not None
-            and admission.baseline_tokens > 0
-            and eligible_request(request)
-            and not request.skip_reading_prefix_cache
-        )
+        return admission.cut_reason if admission is not None else "unobserved"
 
     def pool_stats(self, pool) -> tuple[int, int, int]:
         """Diagnostic only: ordinary eviction owns these blocks, no private pin."""

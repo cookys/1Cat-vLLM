@@ -238,9 +238,11 @@ class KVCacheManager:
         snapshots = self.coordinator.mtp_prefix_snapshots
         if snapshots is not None:
             baseline_tokens = num_new_computed_tokens
-            snapshots.observe_lookup(request, baseline_tokens)
             candidate = self.coordinator.find_committed_prefix_hit(
                 request, baseline_tokens
+            )
+            snapshots.observe_lookup(
+                request, baseline_tokens, candidate[1] if candidate is not None else 0
             )
             if candidate is not None:
                 computed_blocks, num_new_computed_tokens = candidate
@@ -254,7 +256,8 @@ class KVCacheManager:
                     "MTP_COMMITTED_PREFIX lookup request=%s prompt_tokens=%d "
                     "baseline_tokens=%d hit_tokens=%d saved_tokens=%d "
                     "exclusive_blocks=%d evicted_blocks=%d free_blocks=%d "
-                    "lookup_hits=%d total_saved_tokens=%d warm_producer=%s",
+                    "lookup_hits=%d total_saved_tokens=%d warm_producer=%s "
+                    "cut_reason=%s",
                     request.request_id,
                     request.num_prompt_tokens,
                     baseline_tokens,
@@ -266,6 +269,7 @@ class KVCacheManager:
                     snapshots.lookup_hits,
                     snapshots.lookup_saved_tokens,
                     snapshots.is_warm_producer(request),
+                    snapshots.cut_reason(request),
                 )
 
         # Keep the existing two-value lookup API used by 1Cat connectors. The
@@ -466,10 +470,12 @@ class KVCacheManager:
         if snapshots is not None and snapshots.admit(request) and snapshots.telemetry:
             logger.info(
                 "MTP_COMMITTED_PREFIX admit request=%s baseline_tokens=%d "
-                "warm_producer=%s",
+                "warm_producer=%s cut_reason=%s candidate_tokens=%d",
                 request.request_id,
                 snapshots.admissions[request.request_id].baseline_tokens,
                 snapshots.is_warm_producer(request),
+                snapshots.cut_reason(request),
+                snapshots.admissions[request.request_id].candidate_tokens,
             )
 
         # P/D: delay caching blocks if we have to recv from

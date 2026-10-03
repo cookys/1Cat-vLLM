@@ -111,6 +111,11 @@ def log_accounting(paths):
         "non_warm_admissions": sum(
             row["warm_producer"] == "False" for row in admissions
         ),
+        "admission_cut_reasons": dict(
+            collections.Counter(
+                row.get("cut_reason", "legacy_unspecified") for row in admissions
+            )
+        ),
         "unique_requests": len(rows),
         "last_lookup_hit_requests": hits,
         "last_lookup_hit_fraction": hits / len(rows) if rows else None,
@@ -143,9 +148,11 @@ def log_accounting(paths):
             "forward executed. Scheduled counters cover actual scheduler outputs; "
             "the normal-finished subset excludes aborts (but includes recomputation "
             "after any preemption). Logs must cover each entire request. "
-            "Warm means an ordinary usable prefix hit at first successful "
-            "allocation, including a shared system prompt. Admission counters "
-            "require warm_v2 logs (absent in v1 logs); resumed admissions count again. "
+            "Warm is admission eligibility, not proof an extra cut was taken. "
+            "chain_warm_v2b requires a candidate certificate or a positive "
+            "ordinary hit within one page of B. Older warm_v2 used any positive "
+            "ordinary hit. Admission counters are absent in v1 logs; resumed "
+            "admissions count again. "
             "Exclusive blocks count extra Mamba blocks, not all certificate blocks."
         ),
     }
