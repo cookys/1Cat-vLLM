@@ -23,18 +23,48 @@ Production mitigation is per-request prefill threshold 1616 and GPU utilization
 and three of six 16K text parity cases diverge late. Utilization 0.92 alone
 still OOMs at c=3. This patch attempts to recover the original chunk schedule.
 
+## Chain13 and conservative revision
+
+The first version, `401f950bd`, survived c=1..4 at 16K, c=4 at 30K and mixed
+2x30K+2x4K at utilization 0.92, threshold 0, p3 on. Lead reports 5157/4896
+tok/s single-request 16K/64K prefill, recovering the threshold's throughput
+loss. Sampled peak memory.used was 32372 MiB/rank (500 ms sampling, not the
+allocator's true peak). However, seven of twelve text-parity cases differ from
+`c11-P3-nolp`, including three 1K cases. Same-server replay is identical. The
+first version therefore failed the E1 gate despite CPU byte equality.
+
+The final output stride alone is not an established explanation: advanced
+indexing produces a contiguous tensor and the caller stacks/copies it into an
+existing opaque-op output. The inner short-conv runs inside the registered
+custom op, so the outer compiled stack frame is not evidence of Inductor
+fusing the internal SiLU. The revision nevertheless restores these contracts
+to eliminate unnecessary differences.
+
+Another hypothesis is library convolution selection. The first version freed
+packed_tokens and omitted the output allocation **before** F.conv1d, increasing
+workspace headroom. The serving interpreter is PyTorch 2.10.0+cu128, git
+449b1768410104d3ed79d3bcfe4ba1d65c7f22c0. Its [cuDNN plan selection source](https://github.com/pytorch/pytorch/blob/449b1768410104d3ed79d3bcfe4ba1d65c7f22c0/aten/src/ATen/native/cudnn/Conv_v8.cpp)
+tries configurations and continues after workspace allocation failures. This
+supports a possible mechanism, not a measured algorithm change in chain13.
+Fresh CPU-only interpreter defaults are benchmark=False/deterministic=False;
+these are not a readback of the running workers. GPU operator/plan diagnosis
+is still needed. deterministic=True alone would not force the old baseline's
+algorithm or prove identical outputs across workspace conditions.
+
 ## Changes and exactness boundary
 
 Only the opted-in batched-prefill method changes:
 
-1. Release the packing tensor once concatenated history owns its values.
+1. Preserve the legacy output allocation and keep packed_tokens and history
+   alive through the convolution call. Do not change its local live set.
 2. After the **same convolution**, gather a copy of the small state tail and
-   release history. Keep state writeback at its original place, after output.
-3. Apply the same ATen SiLU in place to the freshly allocated convolution result.
-   The result has no reader requiring its pre-activation values.
-4. Keep transpose as a view. Masking and advanced indexing read the same elements;
-   indexing creates the contiguous unpadded output directly. Remove its previous
-   empty allocation/copy and release the padded convolution result after indexing.
+   release history and packed_tokens. Keep state writeback after output.
+3. Apply the legacy **out-of-place** SiLU, then make the transposed result
+   contiguous in a separate statement. This releases the original convolution
+   result before creating the transpose copy, avoiding three live padded slabs.
+4. Preserve the legacy masking, advanced indexing and copy into empty_like(x_p),
+   including dense non-contiguous output strides. Release the last padded slab
+   after copying the selected output.
 
 Convolution inputs, strides, dtype, weights, groups, dilation, padding width and
 batch shape are unchanged. The state-tail gather is a copy, not an alias that
@@ -45,19 +75,23 @@ reads or additional synchronization. PyTorch manages storage reuse on that
 stream, including during graph capture. No new persistent buffers are added.
 
 Expected major storage peak changes from approximately `5*P*L*C*2 + S*C*2`
-to `2*P*L*C*2 + small_state`, excluding caller-owned inputs, convolution-library
-workspaces and unrelated activations. The exact crash shape therefore saves
-roughly 1.08 GiB of those logical temporaries. Four uneven prefills can save
-more. This is a storage-liveness model, **not a measured CUDA peak**.
+to `3*P*L*C*2 + S*C*2 + small_state`, excluding caller-owned inputs,
+convolution-library workspaces and unrelated activations. The [8080,107] crash
+shape saves about **631.25 MiB/rank** (two padded slabs), rather than the first
+version's estimated 1.08 GiB. The local convolution entry now matches legacy
+memory liveness. This is a storage-liveness model, **not a measured CUDA peak**;
+the conservative revision must repeat c=4/mixed survival at 0.92.
 
-The intent is E1: copying/view changes preserve bits, and in-place SiLU uses the
-same operation on the same values. CPU byte equality is verified. CUDA/cuDNN
-parity is still required: available workspace can affect convolution algorithm
-selection, and CPU results cannot certify CUDA SiLU or compiled execution.
-Strided advanced-index reads may cost more than indexing a pre-transposed buffer;
-prefill throughput must be measured. No claim that the OOM is resolved yet.
+The intent remains E1, with the legacy arithmetic, layout and convolution-entry
+live tensors restored. CPU byte equality, operator/layout and local storage
+liveness are verified. This does not fix the library algorithm explicitly, or
+reproduce the global caching allocator's history; GPU parity remains required.
+The cause of the first version's divergence is **not yet localized**. No claim
+that restoring these contracts has already resolved numerical parity or that
+chain13's survival automatically transfers to this higher-memory revision.
 
-Route hit: `Qwen4Exp PLE low-memory batched prefill enabled.` once per worker.
+Route hit: `Qwen4Exp PLE low-memory batched prefill enabled (legacy convolution
+live set, SiLU and output layout).` once per worker.
 The env accepts only `0` and `1`; an unset variable preserves the legacy path.
 
 ## CPU validation
@@ -82,6 +116,12 @@ special values, the failing token lengths at smaller channel count and full
 10240-channel width at short lengths. A weak-reference storage ledger counts
 backing storage once for views and rejects tensor scalar reads; it verifies a
 material peak reduction. It does not measure allocator-reserved memory.
+The revision also compares live tensor storage at convolution entry and the
+SiLU/masking/indexing ATen operators and input strides. These checks plus output
+stride equality fail against `401f950bd` and pass against the revision. Eleven
+CPU tests pass, including the existing 24 shape/dtype/kernel/dilation cases.
+Logical peaks for P=1/2/4 are respectively 837610 -> 576186,
+1496480 -> 973560 and 2811668 -> 1765756 bytes at reduced channel counts.
 
 The second imports this checkout's full `vllm.envs` with real `env_var` metadata,
 checks the default, metadata, strict parsing and preservation of the p3 registry,

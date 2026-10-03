@@ -3784,10 +3784,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         description=(
             "Reduce Qwen4Exp batched PLE prefill temporary storage using "
-            "in-place SiLU, a transpose view and earlier release of packing "
-            "and history buffers. Keeps the convolution shape and state "
-            "writeback contract; GPU numerical and peak-memory validation "
-            "is required before enabling in production."
+            "post-convolution release of packing and history buffers and "
+            "separate activation/transpose lifetimes. Preserves the legacy "
+            "pre-convolution live tensors, out-of-place SiLU and output "
+            "layout. GPU numerical and peak-memory validation is required "
+            "before enabling in production."
         ),
         category="experimental",
         declared_default="0",

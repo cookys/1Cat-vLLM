@@ -71,10 +71,23 @@ class StorageTrace(TorchDispatchMode):
         }
         self.references = []
         self.peak_bytes = 0
+        self.convolution_live_bytes = []
+
+    def live_bytes(self):
+        storages = {}
+        for ref in self.references:
+            tensor = ref()
+            if tensor is not None:
+                storage = tensor.untyped_storage()
+                if storage._cdata not in self.excluded:
+                    storages[storage._cdata] = storage.nbytes()
+        return sum(storages.values())
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         if func == torch.ops.aten._local_scalar_dense.default:
             raise AssertionError("prefill must not read a tensor scalar on the host")
+        if func in (torch.ops.aten.conv1d.default, torch.ops.aten.convolution.default):
+            self.convolution_live_bytes.append(self.live_bytes())
         result = func(*args, **(kwargs or {}))
         self.references.extend(
             weakref.ref(t) for t in tree_leaves(result) if isinstance(t, torch.Tensor)
@@ -163,7 +176,7 @@ class PrefillTests(unittest.TestCase):
         self.assert_bytes_equal(old_state, new_state)
         self.assert_bytes_equal(case[1], before_input)
         self.assert_bytes_equal(case[4], before_weight)
-        self.assertTrue(candidate.is_contiguous())
+        self.assertEqual(candidate.stride(), baseline.stride())
         self.assertNotEqual(candidate.data_ptr(), case[1].data_ptr())
         return old_trace, new_trace
 
@@ -254,6 +267,53 @@ class PrefillTests(unittest.TestCase):
         self.assert_bytes_equal(seen[0][1], seen[1][1])
         self.assertEqual(seen[0][2:], seen[1][2:])
 
+    def test_activation_and_indexing_use_legacy_operator_and_layout(self):
+        class LayoutTrace(TorchDispatchMode):
+            def __init__(self):
+                super().__init__()
+                self.operations = []
+
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                if func in (
+                    torch.ops.aten.silu.default,
+                    torch.ops.aten.silu_.default,
+                    torch.ops.aten.masked_fill_.Scalar,
+                    torch.ops.aten.index.Tensor,
+                ):
+                    value = args[0]
+                    self.operations.append(
+                        (str(func), tuple(value.shape), value.stride())
+                    )
+                return func(*args, **(kwargs or {}))
+
+        # The CUDA contract includes op identity and memory layout, not only
+        # CPU output values. The old in-place/view path passes byte parity but
+        # fails this check. Include the dense transposed x_p return layout.
+        for transposed in (False, True):
+            case = list(make_case([37, 3, 0, 2]))
+            if transposed:
+                case[1] = case[1].t().contiguous().t()
+            traces = []
+            for enabled in (False, True):
+                trace = LayoutTrace()
+                with trace:
+                    run_case(case, enabled)
+                traces.append(trace.operations)
+            self.assertEqual(traces[0], traces[1])
+            self.assertTrue(any(op == "aten.silu.default" for op, _, _ in traces[1]))
+            self.assertFalse(any(op == "aten.silu_.default" for op, _, _ in traces[1]))
+
+    def test_convolution_entry_live_storage_matches_legacy(self):
+        # Releasing packed_tokens or delaying output before F.conv1d changes
+        # the workspace headroom seen by library algorithm selection. This is
+        # distinct from testing convolution inputs or post-conv byte parity.
+        for lengths in ([37], [37, 3, 0, 2]):
+            baseline, candidate = self.check_case(make_case(lengths))
+            self.assertEqual(len(baseline.convolution_live_bytes), 1)
+            self.assertEqual(
+                baseline.convolution_live_bytes, candidate.convolution_live_bytes
+            )
+
     def test_production_lengths_reduced_channels_and_full_width_short_case(self):
         # Exact failing scheduler shape, scaled only in C to stay CPU-cheap.
         self.check_case(make_case([8080, 107], channels=8))
@@ -261,12 +321,17 @@ class PrefillTests(unittest.TestCase):
         self.check_case(make_case([11, 2], channels=10240))
 
     def test_padded_storage_peak_is_bounded(self):
-        for lengths in ([2048, 17], [2048, 17, 3, 2]):
+        for lengths in ([2048], [2048, 17], [2048, 17, 3, 2]):
             case = make_case(lengths, channels=32)
             old, new = self.check_case(case)
             # Require a material storage reduction, not just a matching flag
             # or source pattern. Views must not hide a retained backing slab.
-            self.assertLess(new.peak_bytes, old.peak_bytes * 0.65)
+            # The conservative revision keeps the legacy live set until
+            # convolution: it saves two padded slabs, rather than the first
+            # version's three slabs plus unpadded output. Allow small state
+            # and indexing buffers, but require at least 1.95 slabs saved.
+            slab_bytes = len(lengths) * max(lengths) * case[1].shape[1] * 2
+            self.assertGreaterEqual(old.peak_bytes - new.peak_bytes, 1.95 * slab_bytes)
             print(
                 f"lengths={lengths}: logical tensor peak "
                 f"{old.peak_bytes} -> {new.peak_bytes} bytes"

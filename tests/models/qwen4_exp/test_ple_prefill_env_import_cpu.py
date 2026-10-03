@@ -3,6 +3,7 @@
 """Import this checkout's full env registry with real metadata, CPU only.
 
 Run directly with an environment containing vLLM's Python dependencies.
+On C4140 use /data/venvs/1cat-m589/bin/python -B, not the tensor-only Astra venv.
 This does not AST-extract the registry, stub env_var or load the model.
 """
 
