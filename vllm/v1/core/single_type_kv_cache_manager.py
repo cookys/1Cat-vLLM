@@ -1539,6 +1539,7 @@ class MambaManager(SingleTypeKVCacheManager):
         *,
         retention_interval: int | None = None,
         replay_boundaries: Sequence[int] = (),
+        legacy_replay_boundaries: Sequence[int] | None = None,
     ) -> None:
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
         num_full_blocks = num_tokens // self.block_size
@@ -1555,6 +1556,24 @@ class MambaManager(SingleTypeKVCacheManager):
             retention_interval,
             boundaries,
         )
+        if legacy_replay_boundaries is not None and mask is not None:
+            legacy_boundaries = list(legacy_replay_boundaries)
+            if boundary := getattr(request, "shared_prefix_boundary", 0):
+                legacy_boundaries.append(boundary)
+            legacy_mask = self.reachable_block_mask(
+                num_cached_blocks_before,
+                num_full_blocks,
+                alignment_tokens,
+                self.kv_cache_spec,
+                retention_interval,
+                legacy_boundaries,
+            )
+            if legacy_mask is not None:
+                blocks = self.req_to_blocks[request.request_id]
+                for offset, (keep, old_keep) in enumerate(zip(mask, legacy_mask)):
+                    block = blocks[num_cached_blocks_before + offset]
+                    if keep and not old_keep and not block.is_null:
+                        block.mtp_prefix_only = True
         self.block_pool.cache_full_blocks(
             request=request,
             blocks=self.req_to_blocks[request.request_id],

@@ -13,6 +13,10 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashListWithBlockSize,
     KVCacheBlock,
 )
+from vllm.v1.core.mtp_prefix_snapshot import (
+    MTPPrefixBlockPoolView,
+    MTPPrefixSnapshots,
+)
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
     MambaManager,
@@ -50,6 +54,7 @@ class KVCacheCoordinator(ABC):
         self.enable_caching = enable_caching
         self.retention_interval: int | None = None
         self.shared_prefix_boundary = 0
+        self.mtp_prefix_snapshots: MTPPrefixSnapshots | None = None
 
         self.block_pool = BlockPool(
             num_gpu_blocks=kv_cache_config.num_blocks,
@@ -102,7 +107,7 @@ class KVCacheCoordinator(ABC):
             )
 
     def get_replay_boundaries(
-        self, request: Request, alignment: int
+        self, request: Request, alignment: int, *, _legacy: bool = False
     ) -> tuple[int, ...]:
         """Retain both identical resend and longer-sibling resume positions.
 
@@ -116,9 +121,11 @@ class KVCacheCoordinator(ABC):
             return (request.num_tokens - 1, request.num_tokens)
         resend = (request.num_tokens - 1) // alignment * alignment
         extension = request.num_tokens // alignment * alignment
-        return tuple(
-            sorted({max(resend - alignment, 0), max(extension - alignment, 0)})
-        )
+        boundaries = {max(resend - alignment, 0), max(extension - alignment, 0)}
+        snapshots = getattr(self, "mtp_prefix_snapshots", None)
+        if snapshots is not None and not _legacy:
+            boundaries.update(snapshots.extra_boundaries(request))
+        return tuple(sorted(boundaries))
 
     def _cache_manager_blocks(
         self,
@@ -135,6 +142,11 @@ class KVCacheCoordinator(ABC):
                 alignment_tokens=alignment,
                 retention_interval=self.retention_interval,
                 replay_boundaries=self.get_replay_boundaries(request, alignment),
+                legacy_replay_boundaries=(
+                    self.get_replay_boundaries(request, alignment, _legacy=True)
+                    if self.mtp_prefix_snapshots is not None
+                    else None
+                ),
             )
         else:
             manager.cache_blocks(request, num_tokens, alignment_tokens=alignment)
@@ -610,11 +622,45 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             self._cache_manager_blocks(
                 manager, request, num_tokens_to_cache, self.lcm_block_size
             )
+        if self.mtp_prefix_snapshots is not None:
+            self.mtp_prefix_snapshots.record_prefill(
+                request, num_computed_tokens, self.single_type_managers
+            )
+
+    def find_committed_prefix_hit(
+        self, request: Request, baseline_tokens: int
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int] | None:
+        snapshots = self.mtp_prefix_snapshots
+        assert snapshots is not None
+        from vllm.v1.core.mtp_prefix_snapshot import eligible_request
+
+        if not eligible_request(request):
+            return None
+        baseline_junction = self.shared_prefix_boundary
+        try:
+            cap = request.num_tokens - 1
+            while cap > baseline_tokens:
+                blocks, length = self.find_longest_cache_hit(
+                    request.block_hashes, cap, _skip_eagle_drop=True
+                )
+                if length <= baseline_tokens:
+                    break
+                if snapshots.accepts(request, blocks, length):
+                    return blocks, length
+                # A later decode snapshot or mismatched MTP lookahead must not
+                # hide an older certified prefill checkpoint. Re-run the whole
+                # fixed point with a lower cap; no group can exceed that cap.
+                cap = length - self.lcm_block_size
+        finally:
+            self.shared_prefix_boundary = baseline_junction
+        return None
 
     def find_longest_cache_hit(
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
+        *,
+        _skip_eagle_drop: bool = False,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         """
         Find the longest cache hit using an iterative fixed-point algorithm.
@@ -657,6 +703,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # ``curr_hit_length``. Each eagle group applies the drop at most once
         # per candidate length (see issue #32802).
         eagle_verified: set[int] = set()
+        lookup_pool = (
+            MTPPrefixBlockPoolView(self.block_pool)
+            if _skip_eagle_drop
+            else self.block_pool
+        )
 
         while True:
             curr_hit_length = hit_length
@@ -674,7 +725,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     )
                     continue
 
-                drop_eagle_block = use_eagle and idx not in eagle_verified
+                drop_eagle_block = (
+                    use_eagle and not _skip_eagle_drop and idx not in eagle_verified
+                )
 
                 _max_length = curr_hit_length
                 if drop_eagle_block:
@@ -686,7 +739,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     block_hashes=_get_block_hashes(spec),
                     max_length=_max_length,
                     kv_cache_group_ids=group_ids,
-                    block_pool=self.block_pool,
+                    block_pool=lookup_pool,
                     kv_cache_spec=spec,
                     drop_eagle_block=drop_eagle_block,
                     alignment_tokens=self.lcm_block_size,
