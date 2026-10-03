@@ -285,6 +285,106 @@ def test_rerank_fixes_raw_nvfp4_misrankings(cpu_ops):
     assert (tokens != truth).sum() < raw_wrong.sum()
 
 
+# --------------------------------------------------------------------------
+# tie-breaking: the smallest id wins, like torch.max / get_top_tokens
+# --------------------------------------------------------------------------
+def test_rerank_tie_picks_the_smallest_id(cpu_ops):
+    # Every logit is 0, so FP16 argmax (and LogitsProcessor.get_top_tokens)
+    # returns id 0.  The candidates come out of topk(sorted=False) in an
+    # arbitrary order; the rerank must not depend on it (it once returned 64).
+    weight = torch.zeros(128, 128, dtype=torch.float16)
+    x = torch.ones(1, 128, dtype=torch.float16)
+    assert int((x.float() @ weight.float().T).argmax()) == 0
+    for start in (0, 1000):
+        head = DraftNvfp4LMHead(_lm_head(weight, start=start), rerank_k=128)
+        assert head.top_tokens(x).tolist() == [start]
+        value, local_id = head.local_top_tokens(x)
+        assert value.tolist() == [0.0] and local_id.tolist() == [start]
+
+
+def _tie_weights():
+    """[256, 128] noise rows plus exact duplicate rows that tie for the win."""
+    gen = torch.Generator().manual_seed(31)
+    weight = (torch.randn(256, 128, generator=gen) * 0.01).half()
+    lo = torch.cat([torch.ones(64), torch.zeros(64)]).half()
+    hi = torch.cat([torch.zeros(64), torch.ones(64)]).half()
+    weight[[40, 200]] = lo  # batch row 0: two-way tie, smallest id 40
+    weight[[130, 7, 250]] = hi  # batch row 1: three-way tie, smallest id 7
+    weight[[10, 11]] = lo * 0.5  # a lower tie group inside the top-R: loses
+    return weight, torch.stack([lo, hi])
+
+
+@pytest.mark.parametrize("rerank_k", [8, 64])
+def test_rerank_ties_in_several_rows_pick_the_smallest_id(
+    cpu_ops, monkeypatch, rerank_k
+):
+    weight, x = _tie_weights()
+    head = DraftNvfp4LMHead(_lm_head(weight, start=500), rerank_k=rerank_k)
+    # What the FP16 path (get_top_tokens) answers: the first maximum.
+    reference = (x.float() @ weight.float().T).half().argmax(-1)
+    assert reference.tolist() == [40, 7]
+
+    real_topk = torch.topk
+
+    def candidates_in_descending_id_order(q, r, dim=-1, sorted=False, out=None):
+        values, ids = real_topk(q, r, dim=dim, sorted=True)
+        order = ids.argsort(dim=-1, descending=True)
+        values, ids = values.gather(-1, order), ids.gather(-1, order)
+        out[0].copy_(values)
+        out[1].copy_(ids)
+        return values, ids
+
+    # The natural order and the adversarial one (largest tied id first) agree.
+    assert head.top_tokens(x).tolist() == [540, 507]
+    monkeypatch.setattr(torch, "topk", candidates_in_descending_id_order)
+    assert head.top_tokens(x).tolist() == [540, 507]
+
+
+def test_rerank_unique_winner_beats_lower_tie_groups(cpu_ops):
+    # The exact winner is unique; the tie groups among the lower candidates
+    # (rows 10/11 and the duplicated rows of the other batch row) must not
+    # change the answer.
+    weight, x = _tie_weights()
+    weight[77] = x[0] * 2.0  # unique winner for batch row 0
+    head = DraftNvfp4LMHead(_lm_head(weight), rerank_k=8)
+    assert head.top_tokens(x[:1]).tolist() == [77]
+
+
+@pytest.mark.parametrize("rerank_k", [8, 64])
+def test_rerank_nan_row_never_leaks_the_tie_break_sentinel(cpu_ops, rerank_k):
+    _, head = _random_head(n=256, k=256, rerank_k=rerank_k, start=500)
+    hidden = _hidden(3)
+    hidden[1, 5] = float("nan")
+    values, ids = head.local_top_tokens(hidden)
+    assert values[1].isnan() and not values[[0, 2]].isnan().any()
+    assert ((ids >= 500) & (ids < 500 + 256)).all()
+
+
+def test_rerank_zero_tie_picks_the_smallest_id(cpu_ops):
+    weight = torch.zeros(128, 128, dtype=torch.float16)
+    head = DraftNvfp4LMHead(_lm_head(weight, start=32), rerank_k=0)
+    assert head.top_tokens(torch.ones(2, 128, dtype=torch.float16)).tolist() == [32, 32]
+
+
+def test_fp32_rerank_resolves_fp16_near_ties_differently(cpu_ops):
+    """Documented behaviour: the draft can differ from the FP16 path (E2).
+
+    Both logits are one FP16 value (1.0) in the FP16 GEMM, so the FP16 argmax is
+    the first id.  The FP32 rerank sees 1 + 2**-12 > 1 and picks id 1.  The
+    target distribution is unchanged: the draft is only a proposal.
+    """
+    weight = torch.zeros(128, 128, dtype=torch.float16)
+    weight[0, 0] = 1.0
+    weight[1, 0] = 1.0
+    weight[1, 1] = 2.0**-12
+    x = torch.ones(1, 128, dtype=torch.float16)
+    fp16_logits = (x.float() @ weight.float().T).half()
+    assert fp16_logits[0, 0] == fp16_logits[0, 1] == 1.0
+    assert int(fp16_logits.argmax()) == 0
+    head = DraftNvfp4LMHead(_lm_head(weight), rerank_k=128)
+    assert head.top_tokens(x).tolist() == [1]
+
+
 def test_padding_rows_are_masked(cpu_ops):
     k = 256
     gen = torch.Generator().manual_seed(5)
@@ -469,6 +569,28 @@ def test_tp_reduction_picks_the_global_winner(cpu_ops, monkeypatch):
     assert tokens[0] == 777
     assert tokens[1] == local_id[1]
     assert tokens[2] == local_id[2]
+
+
+def test_tp_reduction_resolves_ties_to_the_lowest_rank(cpu_ops, monkeypatch):
+    # Equal values on several ranks: the lowest rank, i.e. the smallest global
+    # id, wins - the same answer as torch.max over the full vocabulary.
+    _, head = _random_head(n=512, rerank_k=64, start=0)
+    hidden = _hidden(2)
+    local_value, _ = head.local_top_tokens(hidden)
+    peers = torch.tensor(
+        [
+            # row 0: ranks 1 and 2 tie above this rank
+            [[0.0, 600.0], [0.0, 700.0], [-1.0, 800.0]],
+            # row 1: ranks 1, 2 and 3 tie with this rank
+            [[0.0, 600.0], [0.0, 700.0], [0.0, 800.0]],
+        ]
+    )
+    peers[0, :2, 0] = local_value[0] + 1.0
+    peers[1, :, 0] = local_value[1]
+    _fake_tp(monkeypatch, peers)
+    tokens = head.top_tokens(hidden)
+    assert tokens[0] == 600
+    assert tokens[1] == head.local_top_tokens(hidden)[1][1]
 
 
 def test_tp_size_one_is_a_short_circuit(cpu_ops, monkeypatch):
@@ -677,34 +799,178 @@ def test_builder_swallows_construction_errors(sm70_gate, monkeypatch):
     assert _build(_model((torch.randn(512, 256) * 0.05).half())) is None
 
 
-@pytest.mark.parametrize("peer_sum, expect_head", [(4, True), (3, False)])
-def test_builder_tp_consensus(cpu_ops, sm70_gate, monkeypatch, peer_sum, expect_head):
-    monkeypatch.setattr(mod, "get_tensor_model_parallel_world_size", lambda: 4)
-    seen = []
+# ---- load-time TP consensus on the CPU group ------------------------------
+def _fake_cpu_consensus(monkeypatch, tp_size, rank, peers):
+    """Fake a TP group; ``peers`` maps the other ranks to their ``_STATE_*``.
 
-    def all_reduce(flag):
-        seen.append(flag.clone())
-        return torch.tensor([peer_sum], dtype=torch.int32)
+    The all-reduce stand-in checks that the collective only ever sees a CPU
+    int32 vector and that the device group is never used.
+    """
+    monkeypatch.setattr(mod, "get_tensor_model_parallel_world_size", lambda: tp_size)
+    monkeypatch.setattr(mod, "get_tensor_model_parallel_rank", lambda: rank)
+    calls = []
 
-    monkeypatch.setattr(mod, "tensor_model_parallel_all_reduce", all_reduce)
+    def all_reduce(table):
+        assert table.device.type == "cpu" and table.dtype == torch.int32
+        calls.append(table.tolist())
+        full = table.clone()
+        for peer, state in peers.items():
+            full[peer] = state
+        return full
+
+    def no_device_collective(*args, **kwargs):
+        raise AssertionError("the consensus must not use the device group")
+
+    monkeypatch.setattr(mod, "_tp_cpu_all_reduce", all_reduce)
+    monkeypatch.setattr(mod, "tensor_model_parallel_all_gather", no_device_collective)
+    return calls
+
+
+OK, FALLBACK, FATAL = mod._STATE_OK, mod._STATE_FALLBACK, mod._STATE_FATAL
+
+
+def test_builder_consensus_all_ranks_ok(cpu_ops, sm70_gate, monkeypatch):
+    calls = _fake_cpu_consensus(monkeypatch, 4, 1, {0: OK, 2: OK, 3: OK})
     head = _build(_model((torch.randn(512, 256) * 0.05).half()))
-    assert (head is not None) == expect_head
-    assert seen[0].tolist() == [1]
+    assert isinstance(head, DraftNvfp4LMHead)
+    assert calls == [[0, OK, 0, 0]]  # this rank only fills its own slot
 
 
-def test_builder_joins_the_collective_even_when_ineligible(monkeypatch):
+def test_builder_consensus_one_recoverable_peer_disables_everywhere(
+    cpu_ops, sm70_gate, monkeypatch, caplog
+):
+    calls = _fake_cpu_consensus(monkeypatch, 4, 0, {1: OK, 2: FALLBACK, 3: OK})
+    with caplog.at_level("INFO"):
+        head = _build(_model((torch.randn(512, 256) * 0.05).half()))
+    assert head is None
+    assert calls == [[OK, 0, 0, 0]]
+    assert "TP rank 2 could not build the head" in caplog.text
+    assert caplog.text.count("draft NVFP4 lm_head disabled") == 1
+
+
+def test_builder_consensus_local_recoverable_failure_still_joins(
+    sm70_gate, monkeypatch, caplog
+):
     # An ineligible rank must still take part in the all-reduce, otherwise the
     # peers that did build the head would hang.
-    monkeypatch.setattr(mod, "get_tensor_model_parallel_world_size", lambda: 4)
-    seen = []
+    calls = _fake_cpu_consensus(monkeypatch, 4, 3, {0: OK, 1: OK, 2: OK})
+    with caplog.at_level("INFO"):
+        assert _build(SimpleNamespace(lm_head=None)) is None
+    assert calls == [[0, 0, 0, FALLBACK]]
+    assert "no lm_head" in caplog.text
 
-    def all_reduce(flag):
-        seen.append(flag.tolist())
-        return flag
 
-    monkeypatch.setattr(mod, "tensor_model_parallel_all_reduce", all_reduce)
+@pytest.mark.parametrize(
+    "error",
+    [ValueError("bad shard"), RuntimeError("out of memory"), KeyError("op")],
+)
+def test_builder_construction_error_is_recoverable(
+    cpu_ops, sm70_gate, monkeypatch, error
+):
+    calls = _fake_cpu_consensus(monkeypatch, 2, 0, {1: OK})
+
+    def boom(packed, scales):
+        raise error
+
+    monkeypatch.setattr(mod, "_prepare_qpn2", boom)
+    assert _build(_model((torch.randn(512, 256) * 0.05).half())) is None
+    assert calls == [[FALLBACK, 0]]
+
+
+def test_builder_consensus_fatal_peer_aborts_every_rank(
+    cpu_ops, sm70_gate, monkeypatch
+):
+    calls = _fake_cpu_consensus(monkeypatch, 4, 0, {1: OK, 2: FATAL, 3: FALLBACK})
+    with pytest.raises(
+        RuntimeError,
+        match=r"draft NVFP4 lm_head: fatal CUDA error on rank 2; aborting startup",
+    ) as info:
+        _build(_model((torch.randn(512, 256) * 0.05).half()))
+    assert info.value.__cause__ is None  # the peer's exception is not ours
+    assert calls == [[OK, 0, 0, 0]]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        torch.cuda.OutOfMemoryError("CUDA out of memory. Tried to allocate 89 MiB"),
+        RuntimeError("CUDA error: an illegal memory access was encountered"),
+        RuntimeError("device-side assert triggered"),
+        RuntimeError("unspecified launch failure"),
+        RuntimeError("an illegal instruction was encountered"),
+    ],
+)
+def test_builder_local_fatal_error_aborts_with_the_cause(
+    cpu_ops, sm70_gate, monkeypatch, error
+):
+    # The failed rank reports FATAL (a CPU vector, no device work) and raises.
+    calls = _fake_cpu_consensus(monkeypatch, 4, 3, {0: OK, 1: OK, 2: OK})
+
+    def boom(packed, scales):
+        raise error
+
+    monkeypatch.setattr(mod, "_prepare_qpn2", boom)
+    with pytest.raises(RuntimeError, match=r"fatal CUDA error on rank 3") as info:
+        _build(_model((torch.randn(512, 256) * 0.05).half()))
+    assert info.value.__cause__ is error
+    assert calls == [[0, 0, 0, FATAL]]
+
+
+def test_builder_tp_one_has_no_collective(cpu_ops, sm70_gate, monkeypatch):
+    monkeypatch.setattr(mod, "get_tensor_model_parallel_world_size", lambda: 1)
+
+    def boom(*args, **kwargs):
+        raise AssertionError("no collective with tp_size == 1")
+
+    monkeypatch.setattr(mod, "_tp_cpu_all_reduce", boom)
+    assert isinstance(
+        _build(_model((torch.randn(512, 256) * 0.05).half())), DraftNvfp4LMHead
+    )
     assert _build(SimpleNamespace(lm_head=None)) is None
-    assert seen == [[0]]
+
+    def fatal(packed, scales):
+        raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    monkeypatch.setattr(mod, "_prepare_qpn2", fatal)
+    with pytest.raises(RuntimeError, match=r"fatal CUDA error on rank 0"):
+        _build(_model((torch.randn(512, 256) * 0.05).half()))
+
+
+def test_consensus_uses_the_tp_cpu_group(monkeypatch):
+    group = object()
+    monkeypatch.setattr(mod, "get_tp_group", lambda: SimpleNamespace(cpu_group=group))
+    monkeypatch.setattr(mod, "get_tensor_model_parallel_world_size", lambda: 3)
+    monkeypatch.setattr(mod, "get_tensor_model_parallel_rank", lambda: 2)
+    seen = {}
+
+    def all_reduce(tensor, op=None, group=None):
+        seen.update(op=op, group=group, tensor=tensor.clone())
+        tensor += torch.tensor([OK, FALLBACK, 0], dtype=torch.int32)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    assert mod._tp_consensus(OK) == [OK, FALLBACK, OK]
+    assert seen["group"] is group
+    assert seen["op"] == torch.distributed.ReduceOp.SUM
+    assert seen["tensor"].device.type == "cpu"
+    assert seen["tensor"].tolist() == [0, 0, OK]
+
+
+def test_fatal_cuda_error_classification():
+    fatal = [
+        torch.cuda.OutOfMemoryError("CUDA out of memory"),
+        RuntimeError("CUDA error: an illegal memory access was encountered"),
+        RuntimeError("CUDA error: unspecified launch failure"),
+        RuntimeError("CUDA error: device-side assert triggered"),
+    ]
+    recoverable = [
+        ValueError("CUDA error in the message but not a RuntimeError"),
+        RuntimeError("out of memory"),
+        RuntimeError("Triton compile failure: ptxas fatal"),
+        RuntimeError("nvfp4_qpn2_prepare_sm70 is not registered"),
+        AttributeError("_C has no op"),
+    ]
+    assert all(mod.is_fatal_cuda_error(e) for e in fatal)
+    assert not any(mod.is_fatal_cuda_error(e) for e in recoverable)
 
 
 # --------------------------------------------------------------------------
@@ -781,6 +1047,57 @@ def test_speculator_routes_through_the_draft_head(monkeypatch):
     stub._draft_nvfp4_head = None
     stub.use_local_argmax_reduction = False
     assert sample(stub, hidden, None, None, None, None).tolist() == [1]
+
+
+def test_speculator_warns_once_when_a_batch_exceeds_the_kernel_rows(caplog):
+    from vllm.logger import _print_warning_once
+    from vllm.v1.worker.gpu.spec_decode.eagle import speculator as spec
+
+    _print_warning_once.cache_clear()
+    taken = []
+    head = SimpleNamespace(
+        top_tokens=lambda h: taken.append(h.shape[0]) or torch.tensor([42])
+    )
+    _, stub = _speculator_stub(head)
+    sample = spec.EagleSpeculator._sample_draft
+    marker = "more than 64 rows"
+
+    with caplog.at_level("WARNING"):
+        sample(stub, torch.zeros(64, 8), None, None, None, None)
+        sample(stub, torch.zeros(0, 8), None, None, None, None)
+        assert marker not in caplog.text  # in range / empty: silent
+        for rows in (65, 80, 65, 300):  # new batch sizes do not log again
+            assert sample(
+                stub, torch.zeros(rows, 8), None, None, None, None
+            ).tolist() == [1]
+    assert caplog.text.count(marker) == 1
+    assert "FP16 lm_head path" in caplog.text
+    assert taken == [64]
+
+    # no head, or a probabilistic draft: nothing to warn about
+    caplog.clear()
+    _print_warning_once.cache_clear()
+    stub._draft_nvfp4_head = None
+    with caplog.at_level("WARNING"):
+        sample(stub, torch.zeros(65, 8), None, None, None, None)
+    assert marker not in caplog.text
+
+
+def test_rerank_zero_logs_the_diagnostic_mode_once(cpu_ops, caplog):
+    from vllm.logger import _print_warning_once
+
+    _print_warning_once.cache_clear()
+    with caplog.at_level("WARNING"):
+        _random_head(rerank_k=0)
+        _random_head(rerank_k=0, seed=1)
+        _random_head(rerank_k=64)
+    assert caplog.text.count("rerank_k=0 is active") == 1
+    assert "diagnostic" in caplog.text
+    caplog.clear()
+    _print_warning_once.cache_clear()
+    with caplog.at_level("WARNING"):
+        _random_head(rerank_k=64)
+    assert "rerank_k=0" not in caplog.text
 
 
 # --------------------------------------------------------------------------
