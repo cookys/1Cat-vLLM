@@ -23,13 +23,10 @@ Opt-in startup controls add:
    pages inside those ranges are advised. No checkpoint tensor data is read
    for this discovery, no whole-system cache drop occurs, and other weights
    sharing a checkpoint file are excluded.
-3. After the original synchronous shard copy, an additional advice for the
-   file-backed source shard. The mapping's inode/device identity is checked;
-   anonymous, deleted, noncontiguous and unsupported source mappings are skipped.
-   Other ranks may reread the unchanged file if they still need those pages.
-4. Optional pause while holding the lock after registration. Logs separate
-   lock wait, cache-advice time, allocation/registration time and pause time.
-5. In paced mode, exact-registration failure does not silently fall back to
+3. Optional pause while holding the lock after registration. Logs include the
+   resolved lock path and separate lock wait, cache-advice time,
+   allocation/registration time and pause time.
+4. In paced mode, exact-registration failure does not silently fall back to
    a power-of-two pinned allocation. It raises instead of changing the intended
    memory footprint. A successful registration that fails the pinned check
    is unregistered before any legacy fallback; failed cleanup retains the
@@ -37,10 +34,16 @@ Opt-in startup controls add:
 
 All new controls default off. The existing exact-pin default stays on.
 
+The cross-review follow-up removes the original post-copy advice. Each rank
+copies only its own overlap, while advising the entire source tensor could
+evict clean pages another rank has yet to read. Pages still mapped by the
+loader may remain resident anyway. Cache advice now runs only before pinning;
+record the candidate commit when comparing earlier startup measurements.
+
 | Environment | Default | Effect |
 | --- | --- | --- |
 | `VLLM_QWEN4EXP_PLE_PIN_SERIALIZE` | `0` | `1`: one cooperating local process can allocate/register at a time |
-| `VLLM_QWEN4EXP_PLE_PIN_DROP_CACHE` | `0` | `1`: pre-pin PLE checkpoint advice plus copied-shard advice |
+| `VLLM_QWEN4EXP_PLE_PIN_DROP_CACHE` | `0` | `1`: pre-pin PLE checkpoint advice |
 | `VLLM_QWEN4EXP_PLE_PIN_LOCK_PATH` | `/tmp/vllm-ple-pin-UID.lock` under the process temp directory | All local TP ranks must resolve to the same local filesystem path; never use a per-rank path |
 | `VLLM_QWEN4EXP_PLE_PIN_TIMEOUT_S` | `600` | Finite positive lock wait timeout; failure releases the fd |
 | `VLLM_QWEN4EXP_PLE_PIN_PAUSE_MS` | `0` | Finite nonnegative post-registration pause; recommend trying `250` only with serialization |
@@ -56,8 +59,8 @@ index emits a cache-advice warning and keeps the model-loading behavior.
 
 `flock` changes only the time at which a rank allocates/registers its table.
 File advice does not write checkpoint bytes, replace pointers, alter the TP
-row split or discard anonymous/COW tensor contents. The existing blocking
-copy completes before post-copy advice. The UVA view still spans one fully
+row split or discard anonymous/COW tensor contents. Shard loading performs
+only the original copies. The UVA view still spans one fully
 registered contiguous allocation, retained for the process lifetime.
 
 No `MADV_DONTNEED` is applied to a private writable safetensors mapping:
@@ -102,10 +105,21 @@ OMP_NUM_THREADS=1 .venv/bin/python tests/models/qwen4_exp/test_ple_host_startup_
 Fourteen tests passed, including three-process nonoverlap, timeout, exception
 and terminated-owner cleanup, symlink rejection, exact PLE header ranges,
 page-aligned advice, malformed-header fallback, real COW-byte preservation,
-anonymous-memory exclusion, advice/allocation/registration order under the
-lock, registration failure handling, materialization without an ambient model
-config, and 12 shard-copy
-parity cases (two ranks, three host/device splits, advice on/off).
+advice/allocation/registration order under the lock, lock-path logging,
+registration failure handling, materialization and automatic host budgeting
+without an ambient model config, and 12 shard-copy parity cases (two ranks,
+three host/device splits, cache flag on/off). Shard-copy tests also assert
+that no file advice occurs after materialization.
+
+The same follow-up gives mixed-batch PLE metadata an explicit CPU-derived
+`repeat_interleave` output length, avoiding a CUDA length synchronization,
+and skips empty non-spec request-index staging in pure speculative batches.
+The metadata CPU suite checks 36 batch/cache-mode combinations with an
+explicit-length guard and exact token/index parity:
+
+```bash
+OMP_NUM_THREADS=1 .venv/bin/python tests/v1/attention/test_ple_metadata_async_cpu.py
+```
 
 Read-only parsing of the real local E4M3 overlay found 128 PLE tensors in
 10 files, exactly 51,200,245,760 bytes (47.6839447 GiB); no real checkpoint

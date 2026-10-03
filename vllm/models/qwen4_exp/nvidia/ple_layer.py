@@ -82,7 +82,6 @@ from ..common.ple import (
 )
 from ..common.ple_host_startup import (
     PinStartupOptions,
-    advise_loaded_shard,
     pin_startup_guard,
 )
 
@@ -708,6 +707,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         # address of a buffer that no longer exists in the new process.
         self.layer_name = prefix
         vllm_config = get_current_vllm_config()
+        self._ple_vllm_config = vllm_config
         self._pin_checkpoint_model_path = getattr(
             vllm_config.model_config, "model", None
         )
@@ -754,7 +754,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         explicit = _ple_host_budget_bytes()
         if explicit is not None:
             return explicit
-        vllm_config = get_current_vllm_config()
+        vllm_config = self._ple_vllm_config
         table_bytes = self._meta_weight_shape[0] * self.embedding_dim
         if envs.VLLM_SM70_QWEN38_HYBRID_PLE:
             # Cache pages are resolved after model loading. Hybrid placement
@@ -893,23 +893,6 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             tp_start=tp_start,
             tp_end=tp_end,
         )
-        if (
-            os.getenv("VLLM_QWEN4EXP_PLE_PIN_DROP_CACHE", "0") == "1"
-            and copied
-            and loaded_weight.device.type == "cpu"
-            and loaded_weight.is_contiguous()
-        ):
-            # The existing copy is synchronous. This only advises the source
-            # file cache; it never discards the tensor's private/COW pages.
-            advised = advise_loaded_shard(
-                loaded_weight.data_ptr(), loaded_weight.nbytes
-            )
-            logger.info(
-                "PLE_PIN copied_shard pid=%d checkpoint_start=%d advised_bytes=%d",
-                os.getpid(),
-                checkpoint_start,
-                advised,
-            )
         self._checkpoint_shard_loaded = True
         return copied
 
