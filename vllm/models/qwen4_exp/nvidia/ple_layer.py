@@ -99,6 +99,11 @@ from ..common.ple import (
     ple_vram_reserve_bytes,
     total_host_bytes,
 )
+from ..common.ple_host_startup import (
+    PinStartupOptions,
+    advise_loaded_shard,
+    pin_startup_guard,
+)
 
 _MASK64 = (1 << 64) - 1
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
@@ -572,7 +577,9 @@ def _should_use_pinned_host_ple(config: Qwen4ExpTextConfig) -> bool:
 _PLE_REGISTERED_HOST_TABLES: list[torch.Tensor] = []
 
 
-def _ple_pinned_host_empty(shape: tuple[int, int], dtype: torch.dtype) -> torch.Tensor:
+def _ple_pinned_host_empty(
+    shape: tuple[int, int], dtype: torch.dtype, *, model_path: str | None = None
+) -> torch.Tensor:
     """Page-locked CPU tensor of exactly ``shape``.
 
     ``torch.empty(..., pin_memory=True)`` goes through the caching host
@@ -585,24 +592,41 @@ def _ple_pinned_host_empty(shape: tuple[int, int], dtype: torch.dtype) -> torch.
     """
     if shape[0] == 0:
         return torch.empty(shape, dtype=dtype, device="cpu")
-    if os.getenv("VLLM_QWEN4EXP_PLE_EXACT_PIN", "1") == "0":
-        return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
-    tensor = torch.empty(shape, dtype=dtype, device="cpu")
-    # cudaHostRegisterPortable | cudaHostRegisterMapped
-    err = torch.cuda.cudart().cudaHostRegister(tensor.data_ptr(), tensor.nbytes, 3)
-    if int(err) != 0 or not tensor.is_pinned():
-        logger.warning(
-            "Qwen4Exp PLE exact host registration failed (%s); falling back to "
-            "the power-of-two caching pinned allocator",
-            err,
+    options = PinStartupOptions.from_env()
+    paced = options.serialize or options.drop_cache or options.pause_s > 0
+    guard = pin_startup_guard(options, model_path) if paced else nullcontext()
+    with guard:
+        if os.getenv("VLLM_QWEN4EXP_PLE_EXACT_PIN", "1") == "0":
+            return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+        tensor = torch.empty(shape, dtype=dtype, device="cpu")
+        # Keep one registration for the entire contiguous UVA view.
+        # cudaHostRegisterPortable | cudaHostRegisterMapped
+        runtime = torch.cuda.cudart()
+        err = runtime.cudaHostRegister(tensor.data_ptr(), tensor.nbytes, 3)
+        if int(err) != 0 or not tensor.is_pinned():
+            if int(err) == 0:
+                undo = runtime.cudaHostUnregister(tensor.data_ptr())
+                if int(undo) != 0:
+                    # The driver still owns the registration. Never free it.
+                    _PLE_REGISTERED_HOST_TABLES.append(tensor)
+                    raise RuntimeError(f"PLE host unregister failed: {undo}")
+            if paced:
+                raise RuntimeError(
+                    f"PLE exact host registration failed ({err}); paced startup "
+                    "refuses a larger power-of-two pinned allocation"
+                )
+            logger.warning(
+                "Qwen4Exp PLE exact host registration failed (%s); falling back to "
+                "the power-of-two caching pinned allocator",
+                err,
+            )
+            return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+        _PLE_REGISTERED_HOST_TABLES.append(tensor)
+        logger.info(
+            "Qwen4Exp PLE host table pinned by registration: %s (exact size)",
+            format_gib(tensor.nbytes),
         )
-        return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
-    _PLE_REGISTERED_HOST_TABLES.append(tensor)
-    logger.info(
-        "Qwen4Exp PLE host table pinned by registration: %s (exact size)",
-        format_gib(tensor.nbytes),
-    )
-    return tensor
+        return tensor
 
 
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
@@ -838,7 +862,9 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             device=device,
         )
         host_storage = _ple_pinned_host_empty(
-            (placement.host_rows, self.embedding_dim), self._meta_weight_dtype
+            (placement.host_rows, self.embedding_dim),
+            self._meta_weight_dtype,
+            model_path=get_current_vllm_config().model_config.model,
         )
         # Publish only a complete allocation so a host allocation failure
         # cannot leave the idempotent path pointing at a half-built table.
@@ -888,6 +914,23 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             tp_start=tp_start,
             tp_end=tp_end,
         )
+        if (
+            os.getenv("VLLM_QWEN4EXP_PLE_PIN_DROP_CACHE", "0") == "1"
+            and copied
+            and loaded_weight.device.type == "cpu"
+            and loaded_weight.is_contiguous()
+        ):
+            # The existing copy is synchronous. This only advises the source
+            # file cache; it never discards the tensor's private/COW pages.
+            advised = advise_loaded_shard(
+                loaded_weight.data_ptr(), loaded_weight.nbytes
+            )
+            logger.info(
+                "PLE_PIN copied_shard pid=%d checkpoint_start=%d advised_bytes=%d",
+                os.getpid(),
+                checkpoint_start,
+                advised,
+            )
         self._checkpoint_shard_loaded = True
         return copied
 
