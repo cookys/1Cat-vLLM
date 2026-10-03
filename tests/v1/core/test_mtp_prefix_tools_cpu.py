@@ -25,6 +25,34 @@ PROBE = load("benchmarks/benchmark_mtp_committed_prefix.py")
 
 
 class ToolTests(unittest.TestCase):
+    def test_compare_rejects_partial_record_and_logprob_drift(self):
+        record = {
+            "complete": True,
+            "alignment": 1616,
+            "seed": 1,
+            "max_tokens": 1,
+            "cases": {
+                "case": {
+                    "prompt_sha256": "fixed",
+                    "token_ids": [12],
+                    "logprobs": [-1.0],
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            a, b = Path(directory) / "a.json", Path(directory) / "b.json"
+            a.write_text(json.dumps(record))
+            b.write_text(json.dumps(record))
+            with patch("sys.stdout", new_callable=io.StringIO):
+                self.assertEqual(PROBE.compare(a, b), 0)
+                record["cases"]["case"]["logprobs"] = [-1.01]
+                b.write_text(json.dumps(record))
+                self.assertEqual(PROBE.compare(a, b), 1)
+            record["complete"] = False
+            b.write_text(json.dumps(record))
+            with self.assertRaises(ValueError):
+                PROBE.compare(a, b)
+
     def test_length_proxy_skips_trimmed_missing_and_too_short(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "task.json"
