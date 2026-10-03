@@ -16,15 +16,28 @@ a second, 89 MB NVFP4 copy that is used only to *screen* candidates:
 4. Shard-local argmax over the exact candidate logits, then the same TP pair
    all-gather reduction as ``LogitsProcessor.get_top_tokens``.
 
-The draft token equals the FP16 argmax whenever the FP16 argmax of the shard
-is inside the NVFP4 top-R; otherwise it is still a valid proposal.  Greedy
-drafting makes the proposal distribution one-hot, so the verifier's rejection
-sampling stays exact for any proposal (quality tier E2: the target
-distribution is unchanged, only the acceptance rate may move).
+The draft token can differ from the FP16 path for two reasons: (a) the FP16
+argmax is outside the NVFP4 top-R, or (b) the top FP16 logits are within FP16
+rounding of each other (the FP16 GEMM rounds every logit to FP16, so a gap
+below one FP16 ulp is invisible to it) and the FP32 rerank resolves that
+near-tie differently.  Both are a valid greedy proposal.  Greedy drafting
+makes the proposal distribution one-hot, so the verifier's rejection sampling
+stays exact for any proposal (quality tier E2: the target distribution is
+unchanged, only the acceptance rate may move).
+
+Ties.  Among candidates whose exact FP32 logits are equal the smallest
+shard-local id wins, whatever order ``topk(sorted=False)`` returned them in.
+The raw ``R == 0`` path (``q.max``) also returns the first, i.e. smallest,
+index, and the TP pair reduction (``argmax`` over the rank-ordered gather)
+returns the lowest rank, i.e. the lowest vocabulary range.  All three stages
+agree with ``torch.max`` / ``LogitsProcessor.get_top_tokens``: an exact tie
+resolves to the smallest global token id.
 
 Nothing here is allowed to synchronize with the host inside
 ``local_top_tokens`` / ``top_tokens``: ``EagleSpeculator._sample_draft`` is
 recorded inside the FULL CUDA graphs of the draft prefill and decode steps.
+The hot-path temporaries are served from the CUDA-graph pool; there is no
+host-side allocation or synchronization.
 
 Quantization convention (see ``nvfp4_emulation_utils``)
 -------------------------------------------------------
@@ -44,9 +57,10 @@ import torch
 
 from vllm import _sm70_ops as sm70_ops
 from vllm.distributed import (
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_gather,
-    tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
@@ -71,6 +85,23 @@ SUPPORTED_SPLIT_K = (8, 16, 32)
 _MAX_EXACT_FP32_VOCAB = 1 << 24
 # Below this the shard is treated as numerically empty.
 _MIN_AMAX = 1e-12
+# Sentinel id for non-maximal candidates in the smallest-id tie-break.
+_INT64_MAX = torch.iinfo(torch.int64).max
+
+# Load-time TP consensus (see ``build_draft_nvfp4_lm_head``): what a rank
+# reports to its peers.
+_STATE_OK = 1  # head built
+_STATE_FALLBACK = 2  # recoverable: ineligible, bad value, missing op, Triton, ...
+_STATE_FATAL = 3  # the CUDA context is not trustworthy (OOM, sticky error)
+# Case-sensitive substrings of the RuntimeError text of a CUDA failure
+# after which the rank must not touch the device again.  ``torch.cuda.
+# OutOfMemoryError`` is matched by type.  The one place to extend the list.
+_FATAL_CUDA_MARKERS = (
+    "CUDA error",
+    "illegal",
+    "device-side assert",
+    "unspecified launch failure",
+)
 
 _REQUIRED_OPS = ("nvfp4_qpn2_prepare_sm70", "nvfp4_qpn2_gemm_sm70_out")
 _E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
@@ -133,6 +164,48 @@ def _exact_candidate_logits(
 
 def _missing_ops() -> list[str]:
     return [name for name in _REQUIRED_OPS if not hasattr(torch.ops._C, name)]
+
+
+def is_fatal_cuda_error(err: BaseException) -> bool:
+    """Whether ``err`` leaves the CUDA context unusable for further work.
+
+    ``torch.cuda.OutOfMemoryError`` and a ``RuntimeError`` carrying one of
+    ``_FATAL_CUDA_MARKERS`` are fatal; everything else (ineligible shard,
+    ``ValueError``, missing native op, Triton compile failure) is recoverable.
+    """
+    if isinstance(err, torch.cuda.OutOfMemoryError):
+        return True
+    if isinstance(err, RuntimeError):
+        text = str(err)
+        return any(marker in text for marker in _FATAL_CUDA_MARKERS)
+    return False
+
+
+def _tp_cpu_all_reduce(states: torch.Tensor) -> torch.Tensor:
+    """Sum the CPU int tensor ``states`` over the TP group's CPU (gloo) group.
+
+    Deliberately not ``tensor_model_parallel_all_reduce``: that one runs on the
+    device group and needs a healthy CUDA context on every rank.
+    """
+    torch.distributed.all_reduce(
+        states, op=torch.distributed.ReduceOp.SUM, group=get_tp_group().cpu_group
+    )
+    return states
+
+
+def _tp_consensus(state: int) -> list[int]:
+    """Every TP rank's ``_STATE_*``, indexed by TP rank; no collective at TP=1.
+
+    Each rank writes its state into its own slot of a zero int32 CPU vector and
+    one SUM all-reduce on the CPU group fills in all the others, so the result
+    also tells which rank failed.  Never touches the GPU.
+    """
+    tp_size = get_tensor_model_parallel_world_size()
+    if tp_size == 1:
+        return [state]
+    table = torch.zeros(tp_size, dtype=torch.int32)
+    table[get_tensor_model_parallel_rank()] = state
+    return [int(v) for v in _tp_cpu_all_reduce(table).tolist()]
 
 
 def _sm70_device_reason(device: torch.device) -> str | None:
@@ -297,7 +370,13 @@ def unpack_nvfp4_packed(
 # The draft head
 # ---------------------------------------------------------------------------
 class DraftNvfp4LMHead:
-    """NVFP4 screening copy of one lm_head shard plus the FP16 rerank."""
+    """NVFP4 screening copy of one lm_head shard plus the FP16 rerank.
+
+    Draft only (quality tier E2).  The token can differ from the FP16 path
+    when the FP16 argmax is outside the NVFP4 top-R, or when the top FP16
+    logits sit within FP16 rounding of each other and the FP32 rerank resolves
+    the near-tie differently; exact ties go to the smallest id.
+    """
 
     @staticmethod
     def eligible(
@@ -406,9 +485,11 @@ class DraftNvfp4LMHead:
         )
         self.codes, self.scales = _prepare_qpn2(packed, scales_e4m3)
         del packed, scales_e4m3
-        # Every per-call buffer is allocated here and only sliced afterwards:
-        # ``top_tokens`` is recorded inside CUDA graphs and stays
-        # allocation-free that way (the QPN8 rerank template does the same).
+        # The big per-call buffers are allocated here and only sliced
+        # afterwards (the QPN8 rerank template does the same).  The small
+        # hot-path temporaries (max / masked_fill / min / all-gather results) are
+        # served from the CUDA-graph pool while ``top_tokens`` is captured:
+        # no host-side allocation or synchronization.
         self.out = torch.empty((MAX_ROWS, n), dtype=torch.float16, device=device)
         self._pair = torch.empty((MAX_ROWS, 2), dtype=torch.float32, device=device)
         self.rerank_k = rerank_k  # property: allocates the candidate buffers
@@ -459,6 +540,12 @@ class DraftNvfp4LMHead:
         self._rerank_k = value
         if value == 0:
             self._topk_values = self._topk_ids = self._exact = None
+            logger.warning_once(
+                "SM70 MTP draft NVFP4 lm_head: rerank_k=0 is active. The draft "
+                "token is the raw 4-bit argmax with no FP16 rerank (diagnostic "
+                "tier; it can flip near-ties). Use VLLM_SM70_MTP_DRAFT_NVFP4_"
+                "RERANK_K=64 for serving."
+            )
             return
         # Separate exactly-sized tensors (not column slices of a wider one):
         # topk(out=...) and the Triton kernel need contiguous [M, R] rows.
@@ -489,7 +576,8 @@ class DraftNvfp4LMHead:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Shard-local winner per row: ``(value float32 [M], global id int64 [M])``.
 
-        No host synchronization: shapes and python ints only.
+        Exact ties go to the smallest shard-local id.  No host synchronization:
+        shapes and python ints only.
         """
         m, k = hidden_states.shape
         if not 1 <= m <= MAX_ROWS:
@@ -530,9 +618,14 @@ class DraftNvfp4LMHead:
         # GEMM the target uses.
         exact = self._exact[:m]
         _exact_candidate_logits(x, self.weight, candidate_ids, exact)
-        values, best = exact.max(dim=-1)
-        local_ids = candidate_ids.gather(1, best.unsqueeze(1)).squeeze(1)
-        return values, local_ids + self.org_vocab_start_index
+        # The candidates arrive in topk's arbitrary order, so take the maximum
+        # value and, among the candidates equal to it, the smallest id (what
+        # torch.max / get_top_tokens return).  A NaN row keeps its NaN
+        # candidates, so the sentinel can never leak into the result.
+        best = exact.max(dim=-1, keepdim=True).values
+        not_best = (exact != best) & (exact == exact)
+        local_ids = candidate_ids.masked_fill(not_best, _INT64_MAX).min(dim=-1).values
+        return best.squeeze(1), local_ids + self.org_vocab_start_index
 
     def top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Global draft token per row, int64 [M], identical on all TP ranks."""
@@ -561,13 +654,24 @@ def build_draft_nvfp4_lm_head(
 ) -> DraftNvfp4LMHead | None:
     """Build the head for ``model`` or return None (always logging why).
 
-    The caller has already checked the enabling env var.  Failures never
-    raise.  With TP > 1 every rank joins one tiny all-reduce so that a failure
-    on any rank disables the head on all of them: the head adds collectives to
-    the draft path, and a mixed state would deadlock.
+    The caller has already checked the enabling env var.  A recoverable
+    failure (ineligible shard, bad value, missing native op, Triton compile
+    failure) never raises and keeps the FP16 path.
+
+    With TP > 1 every rank joins one tiny all-reduce on the TP *CPU* (gloo)
+    group, so a failure on any rank disables the head on all of them: the head
+    adds collectives to the draft path and a mixed state would deadlock.  The
+    consensus never touches the GPU: after a sticky CUDA error a rank could not
+    take part in a device collective and its peers would hang.
+
+    A fatal CUDA failure (``is_fatal_cuda_error``: OOM or a sticky error) on
+    any rank, or at TP=1 on the only rank, makes every rank raise
+    ``RuntimeError`` so the process group exits consistently instead of falling
+    back on a context that may be unusable.
     """
     head: DraftNvfp4LMHead | None = None
     reason = ""
+    fatal_error: Exception | None = None
     try:
         lm_head = getattr(model, "lm_head", None)
         scale = getattr(getattr(model, "logits_processor", None), "scale", 1.0)
@@ -584,14 +688,32 @@ def build_draft_nvfp4_lm_head(
     except Exception as err:
         head = None
         reason = f"construction failed: {type(err).__name__}: {err}"
+        if is_fatal_cuda_error(err):
+            fatal_error = err
 
-    tp_size = get_tensor_model_parallel_world_size()
-    if tp_size > 1:
-        flag = torch.tensor([int(head is not None)], dtype=torch.int32, device=device)
-        flag = tensor_model_parallel_all_reduce(flag)
-        if int(flag.item()) != tp_size and head is not None:
-            head = None
-            reason = "a peer TP rank could not build the head"
+    # From here on a failed rank does no GPU work at all.
+    if fatal_error is not None:
+        state = _STATE_FATAL
+    elif head is not None:
+        state = _STATE_OK
+    else:
+        state = _STATE_FALLBACK
+    states = _tp_consensus(state)
+
+    if _STATE_FATAL in states:
+        culprit = states.index(_STATE_FATAL)
+        if fatal_error is not None:
+            logger.error("SM70 MTP draft NVFP4 lm_head: %s", reason)
+        raise RuntimeError(
+            f"draft NVFP4 lm_head: fatal CUDA error on rank {culprit}; aborting startup"
+        ) from fatal_error
+    if head is not None and any(s != _STATE_OK for s in states):
+        first = next(i for i, s in enumerate(states) if s != _STATE_OK)
+        head = None  # drops the buffers; no device synchronization
+        reason = (
+            f"TP rank {first} could not build the head; every rank falls back "
+            "to the FP16 path"
+        )
     if head is None:
         logger.info("SM70 MTP draft NVFP4 lm_head disabled: %s", reason)
     return head

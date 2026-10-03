@@ -41,6 +41,9 @@ from vllm.v1.worker.gpu.spec_decode.eagle.draft_hidden_dump import (
     maybe_create_draft_hidden_dumper,
 )
 from vllm.v1.worker.gpu.spec_decode.eagle.draft_nvfp4_lm_head import (
+    MAX_ROWS as DRAFT_NVFP4_MAX_ROWS,
+)
+from vllm.v1.worker.gpu.spec_decode.eagle.draft_nvfp4_lm_head import (
     DraftNvfp4LMHead,
     build_draft_nvfp4_lm_head,
 )
@@ -394,12 +397,20 @@ class EagleSpeculator:
     ) -> torch.Tensor:
         if self._draft_hidden_dump is not None:
             self._draft_hidden_dump.maybe_dump(hidden_states, draft_step)
-        if (
-            draft_logits is None
-            and self._draft_nvfp4_head is not None
-            and 0 < hidden_states.shape[0] <= 64
-        ):
-            return self._draft_nvfp4_head.top_tokens(hidden_states)
+        if draft_logits is None and self._draft_nvfp4_head is not None:
+            rows = hidden_states.shape[0]
+            if 0 < rows <= DRAFT_NVFP4_MAX_ROWS:
+                return self._draft_nvfp4_head.top_tokens(hidden_states)
+            if rows > DRAFT_NVFP4_MAX_ROWS:
+                # The message carries no row count on purpose: warning_once
+                # keys on its arguments and every new batch size would log
+                # again.  The condition is static, so once is enough.
+                logger.warning_once(
+                    "Draft NVFP4 lm_head: a draft batch has more than %d rows "
+                    "(the QPN2 kernel limit); the FP16 lm_head path is used for "
+                    "such batches (logged once).",
+                    DRAFT_NVFP4_MAX_ROWS,
+                )
         if draft_logits is not None:
             logits = self.model.compute_logits(hidden_states)
             # This drafter's position contract keys the proposed token at pos + 1.
