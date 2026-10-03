@@ -61,6 +61,12 @@ class MambaSpec:
     mamba_type: str = "gdn"
 
 
+@dataclasses.dataclass(frozen=True)
+class CircularSpec:
+    block_size: int
+    prefix_cacheable: bool = False
+
+
 class Request:
     def __init__(self, name, tokens):
         self.request_id = name
@@ -101,6 +107,7 @@ def load_runtime():
         cdiv=lambda a, b: (a + b - 1) // b,
         FullAttentionSpec=FullSpec,
         MambaSpec=MambaSpec,
+        CircularBufferSpec=CircularSpec,
         MTPPrefixCertificate=POLICY.MTPPrefixCertificate,
         MTPPrefixSnapshots=POLICY.MTPPrefixSnapshots,
         MTPPrefixBlockPoolView=POLICY.MTPPrefixBlockPoolView,
@@ -119,7 +126,6 @@ def load_runtime():
         "HiddenStateCacheSpec",
         "SinkFullAttentionSpec",
         "PrefixAnchoredSWASpec",
-        "CircularBufferSpec",
         "SlidingWindowMLASpec",
         "KpoolTailSpec",
         "CrossAttentionSpec",
@@ -165,12 +171,14 @@ def load_runtime():
             "SingleTypeKVCacheManager",
             "FullAttentionManager",
             "MambaManager",
+            "CircularBufferManager",
             "get_manager_for_kv_cache_spec",
         },
     )
     ns["spec_manager_map"] = {
         FullSpec: ns["FullAttentionManager"],
         MambaSpec: ns["MambaManager"],
+        CircularSpec: ns["CircularBufferManager"],
     }
     extract(
         "vllm/v1/core/kv_cache_coordinator.py",
@@ -185,6 +193,7 @@ def load_runtime():
         set(),
         [
             ("Scheduler", "_mamba_block_aligned_split", "split_chunk"),
+            ("Scheduler", "_update_after_schedule", "update_after_schedule"),
         ],
     )
     extract(
@@ -223,9 +232,9 @@ def load_runtime():
 NS = load_runtime()
 
 
-def coordinator(enabled=True, blocks=600):
+def coordinator(enabled=True, blocks=600, *, rings=False):
     groups = [
-        types.SimpleNamespace(kv_cache_spec=s, is_eagle_group=False)
+        types.SimpleNamespace(kv_cache_spec=s, is_eagle_group=False, layer_names=[])
         for s in (
             FullSpec(8),
             FullSpec(16),
@@ -233,6 +242,16 @@ def coordinator(enabled=True, blocks=600):
             MambaSpec(16, mamba_type="ple"),
         )
     ]
+    groups[0].layer_names = ["mtp.layers.60.self_attn.attn"]
+    groups[1].layer_names = ["mtp.layers.60.self_attn.indexer.compressed_key_cache"]
+    if rings:
+        groups.append(
+            types.SimpleNamespace(
+                kv_cache_spec=CircularSpec(8),
+                is_eagle_group=False,
+                layer_names=["mtp.layers.60.self_attn.indexer.raw_key_cache"],
+            )
+        )
     result = NS["HybridKVCacheCoordinator"](
         kv_cache_config=types.SimpleNamespace(
             num_blocks=blocks, kv_cache_groups=groups
@@ -248,7 +267,12 @@ def coordinator(enabled=True, blocks=600):
     )
     result.configure_prefix_cache_retention(0)
     if enabled:
-        result.mtp_prefix_snapshots = POLICY.MTPPrefixSnapshots(16)
+        result.mtp_prefix_snapshots = POLICY.MTPPrefixSnapshots(
+            16,
+            cacheable_group_ids=tuple(
+                i for i, g in enumerate(groups) if g.kv_cache_spec.prefix_cacheable
+            ),
+        )
     return result
 
 
@@ -289,6 +313,36 @@ def lookup(c, r):
 
 
 class SnapshotTests(unittest.TestCase):
+    def test_scheduled_telemetry_covers_prompt_only(self):
+        c = coordinator()
+        c.mtp_prefix_snapshots.telemetry = True
+        r = Request("r", list(range(43)))
+        r.use_structured_output = False
+        r.num_computed_tokens = 32
+        scheduler = types.SimpleNamespace(
+            requests={"r": r},
+            kv_cache_manager=types.SimpleNamespace(coordinator=c),
+            enable_return_routed_experts=False,
+            finished_req_ids={"old"},
+        )
+        output = types.SimpleNamespace(
+            num_scheduled_tokens={"r": 14}, has_structured_output_requests=False
+        )
+        lines = []
+        old_logger = NS["logger"]
+        NS["logger"] = types.SimpleNamespace(
+            info=lambda fmt, *args: lines.append(fmt % args)
+        )
+        try:
+            NS["update_after_schedule"](scheduler, output)
+            self.assertEqual(len(lines), 1)
+            self.assertIn("start=32 end=43 prefill_tokens=11", lines[0])
+            self.assertEqual(r.num_computed_tokens, 46)
+            NS["update_after_schedule"](scheduler, output)
+            self.assertEqual(len(lines), 1)  # Ordinary decode is not prefill.
+        finally:
+            NS["logger"] = old_logger
+
     def test_public_lookup_counters_junction_and_skip_read(self):
         c = coordinator()
         prefill(c, Request("producer", list(range(43))))
@@ -322,6 +376,8 @@ class SnapshotTests(unittest.TestCase):
                     hf_text_config=types.SimpleNamespace(
                         model_type="qwen4_exp_text",
                         mtp_num_hidden_layers=1,
+                        num_hidden_layers=60,
+                        indexer_compress_ratio=4,
                     )
                 ),
                 speculative_config=types.SimpleNamespace(
@@ -332,6 +388,7 @@ class SnapshotTests(unittest.TestCase):
                     enable_prefix_caching=True,
                     mamba_cache_mode="align",
                 ),
+                scheduler_config=types.SimpleNamespace(async_scheduling=False),
                 parallel_config=types.SimpleNamespace(
                     pipeline_parallel_size=1,
                     data_parallel_size=1,
@@ -342,19 +399,41 @@ class SnapshotTests(unittest.TestCase):
 
         gate = NS["configure_mtp_prefix_snapshots"]
         self.assertEqual(
-            gate(config(), coordinator(), has_connector=False).alignment, 16
+            gate(config(), coordinator(rings=True), has_connector=False).alignment, 16
         )
         for field, value in (("method", "eagle"), ("num_speculative_tokens", 5)):
             cfg = config()
             setattr(cfg.speculative_config, field, value)
             with self.assertRaises(ValueError):
-                gate(cfg, coordinator(), has_connector=False)
+                gate(cfg, coordinator(rings=True), has_connector=False)
         with self.assertRaises(ValueError):
-            gate(config(), coordinator(), has_connector=True)
-        c = coordinator()
-        c.single_type_managers = c.single_type_managers[:-1]  # Missing PLE group.
+            gate(config(), coordinator(rings=True), has_connector=True)
+        cfg = config()
+        cfg.scheduler_config.async_scheduling = True
+        with self.assertRaises(ValueError):
+            gate(cfg, coordinator(rings=True), has_connector=False)
+        c = coordinator(rings=True)
+        c.single_type_managers = (
+            *c.single_type_managers[:3],
+            c.single_type_managers[4],
+        )
         with self.assertRaises(ValueError):
             gate(config(), c, has_connector=False)
+        for suffix in ("attn", "indexer.compressed_key_cache", "indexer.raw_key_cache"):
+            c = coordinator(rings=True)
+            for group in c.kv_cache_config.kv_cache_groups:
+                group.layer_names = [
+                    name
+                    for name in group.layer_names
+                    if name != "mtp.layers.60.self_attn." + suffix
+                ]
+            with self.subTest(missing=suffix), self.assertRaises(ValueError):
+                gate(config(), c, has_connector=False)
+        for ratio in (3, 0):
+            cfg = config()
+            cfg.model_config.hf_text_config.indexer_compress_ratio = ratio
+            with self.assertRaises(ValueError):
+                gate(cfg, coordinator(rings=True), has_connector=False)
 
     def test_finished_prefill_reuses_one_more_page(self):
         c = coordinator()
@@ -405,7 +484,7 @@ class SnapshotTests(unittest.TestCase):
                 # Same address AND same hash are insufficient after reuse.
                 block.block_hash = original_hash
                 c.block_pool.cached_block_hash_to_block.insert(original_hash, block)
-                self.assertFalse(POLICY.MTPPrefixSnapshots.accepts(r, blocks, n))
+                self.assertFalse(c.mtp_prefix_snapshots.accepts(r, blocks, n))
 
     def test_mixed_producer_certificates_are_rejected(self):
         c = coordinator()
@@ -413,7 +492,25 @@ class SnapshotTests(unittest.TestCase):
         r = Request("r", list(range(43)))
         blocks, n = lookup(c, r)[1]
         blocks[2][-1].mtp_prefix_certificate = POLICY.MTPPrefixCertificate(32, 32, True)
-        self.assertFalse(POLICY.MTPPrefixSnapshots.accepts(r, blocks, n))
+        self.assertFalse(c.mtp_prefix_snapshots.accepts(r, blocks, n))
+
+    def test_qsa_ring_is_private_and_excluded_from_certificates(self):
+        c = coordinator(rings=True)
+        r = Request("p", list(range(43)))
+        prefill(c, r)
+        consumer = Request("r", list(range(43)))
+        groups, length = lookup(c, consumer)[1]
+        self.assertEqual(length, 32)
+        self.assertEqual(groups[-1], [])
+        c.allocate_new_computed_blocks(consumer.request_id, groups, length, 0)
+        ring = c.single_type_managers[-1].req_to_blocks[consumer.request_id]
+        self.assertEqual(len(ring), 1)
+        self.assertIsNone(ring[0].block_hash)
+        self.assertIsNone(ring[0].mtp_prefix_certificate)
+        c.free(consumer.request_id)
+        self.assertEqual(
+            c.block_pool.get_num_free_blocks(), c.block_pool.num_gpu_blocks - 1
+        )
 
     def test_ordinary_pool_cannot_see_experimental_states(self):
         c = coordinator()
@@ -431,6 +528,21 @@ class SnapshotTests(unittest.TestCase):
         duplicate.block_hash = key
         mapping.insert(key, duplicate)
         self.assertIs(mapping.get_one_block(key), duplicate)
+
+    def test_candidate_view_prefers_committed_duplicate(self):
+        c = coordinator()
+        prefill(c, Request("p", list(range(43))))
+        blocks, _ = lookup(c, Request("r", list(range(43))))[1]
+        certified = blocks[2][-1]
+        key = certified.block_hash
+        mapping = c.block_pool.cached_block_hash_to_block
+        mapping.pop(key, certified.block_id)
+        pending = c.block_pool.get_new_blocks(1)[0]
+        pending.block_hash = key
+        mapping.insert(key, pending)
+        mapping.insert(key, certified)
+        self.assertIs(mapping.get_one_block(key), pending)
+        self.assertIs(mapping.get_one_block(key, allow_mtp_prefix=True), certified)
 
     def test_only_true_prefill_and_known_lookahead_can_be_recorded(self):
         for changes in (

@@ -42,9 +42,16 @@ def eligible_request(request: Request) -> bool:
 
 
 class MTPPrefixSnapshots:
-    def __init__(self, alignment: int, *, telemetry: bool = False):
+    def __init__(
+        self,
+        alignment: int,
+        *,
+        telemetry: bool = False,
+        cacheable_group_ids: tuple[int, ...] | None = None,
+    ):
         self.alignment = alignment
         self.telemetry = telemetry
+        self.cacheable_group_ids = cacheable_group_ids
         self.pending: dict[str, list[MTPPrefixCertificate]] = {}
         self.lookup_hits = 0
         self.lookup_saved_tokens = 0
@@ -81,6 +88,10 @@ class MTPPrefixSnapshots:
             return False
         terminal_blocks = []
         for manager in managers:
+            if not manager.kv_cache_spec.prefix_cacheable:
+                # Only gated QSA raw rings may enter here. At an aligned
+                # compression-group boundary they need no historical rows.
+                continue
             index = end // manager.block_size - 1
             blocks = manager.req_to_blocks[request.request_id]
             if not 0 <= index < len(blocks):
@@ -109,8 +120,8 @@ class MTPPrefixSnapshots:
         # be used by this policy. reset_hash removes them on pool eviction.
         return len(certificates) if publish else 0
 
-    @staticmethod
     def accepts(
+        self,
         request: Request,
         blocks_by_group: Sequence[Sequence[KVCacheBlock]],
         boundary: int,
@@ -120,6 +131,10 @@ class MTPPrefixSnapshots:
             or not 0 < boundary < request.num_prompt_tokens
         ):
             return False
+        if self.cacheable_group_ids is not None:
+            if any(i >= len(blocks_by_group) for i in self.cacheable_group_ids):
+                return False
+            blocks_by_group = [blocks_by_group[i] for i in self.cacheable_group_ids]
         if not blocks_by_group or any(not blocks for blocks in blocks_by_group):
             return False
         certificate = blocks_by_group[0][-1].mtp_prefix_certificate
@@ -158,6 +173,7 @@ def configure_mtp_prefix_snapshots(config, coordinator, *, has_connector: bool):
     from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
     from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
     from vllm.v1.core.single_type_kv_cache_manager import (
+        CircularBufferManager,
         FullAttentionManager,
         MambaManager,
     )
@@ -167,8 +183,37 @@ def configure_mtp_prefix_snapshots(config, coordinator, *, has_connector: bool):
     parallel = config.parallel_config
     managers = coordinator.single_type_managers
     mamba = [m for m in managers if isinstance(m, MambaManager)]
+    groups = coordinator.kv_cache_config.kv_cache_groups
+    layers = {
+        name: manager
+        for group, manager in zip(groups, managers)
+        for name in group.layer_names
+    }
+    # The standalone drafter registers its real attention modules in the shared
+    # static context. Verify their presence in the final scheduler cache config;
+    # merely recognizing the model's architecture name is insufficient.
+    draft = f"mtp.layers.{getattr(text, 'num_hidden_layers', -1)}.self_attn"
+    draft_full = (draft + ".attn", draft + ".indexer.compressed_key_cache")
+    ratio = getattr(text, "indexer_compress_ratio", 0)
+    rings_safe = (
+        isinstance(ratio, int)
+        and ratio > 0
+        and all(
+            type(manager) is CircularBufferManager
+            and group.layer_names
+            and all(
+                name.endswith(".self_attn.indexer.raw_key_cache")
+                for name in group.layer_names
+            )
+            and manager.block_size % ratio == 0
+            and coordinator.lcm_block_size % manager.block_size == 0
+            for group, manager in zip(groups, managers)
+            if not manager.kv_cache_spec.prefix_cacheable
+        )
+    )
     supported = (
         config.use_v2_model_runner
+        and not config.scheduler_config.async_scheduling
         and config.cache_config.enable_prefix_caching
         and config.cache_config.mamba_cache_mode == "align"
         and getattr(text, "model_type", None) == "qwen4_exp_text"
@@ -182,19 +227,40 @@ def configure_mtp_prefix_snapshots(config, coordinator, *, has_connector: bool):
         and parallel.prefill_context_parallel_size == 1
         and not has_connector
         and isinstance(coordinator, HybridKVCacheCoordinator)
-        and all(type(m) in (FullAttentionManager, MambaManager) for m in managers)
+        and all(
+            type(m) in (FullAttentionManager, MambaManager, CircularBufferManager)
+            for m in managers
+        )
+        and all(
+            type(layers.get(name)) is FullAttentionManager
+            and layers[name].kv_cache_spec.prefix_cacheable
+            for name in draft_full
+        )
+        and type(layers.get(draft + ".indexer.raw_key_cache")) is CircularBufferManager
+        and rings_safe
         and {m.kv_cache_spec.mamba_type for m in mamba}
         == {MambaAttentionBackendEnum.GDN_ATTN, MambaAttentionBackendEnum.SHORT_CONV}
         and all(
             m.mamba_cache_mode == "align" and m.block_size == coordinator.lcm_block_size
             for m in mamba
         )
-        and all(m.kv_cache_spec.prefix_cacheable for m in managers)
+        and all(
+            m.kv_cache_spec.prefix_cacheable
+            for m in managers
+            if type(m) is not CircularBufferManager
+        )
     )
     if not supported:
         raise ValueError(
             "VLLM_SM70_MTP_COMMITTED_PREFIX_CACHE requires Qwen4Exp V2 MTP4, "
             "one draft layer, align prefix caching, GDN + PLE short-conv, "
-            "full-attention groups, PP/DP/DCP/PCP=1 and no KV/EC connector"
+            "registered draft main/compressed KV, aligned QSA raw rings, "
+            "synchronous scheduling, PP/DP/DCP/PCP=1 "
+            "and no KV/EC connector"
         )
-    return MTPPrefixSnapshots(coordinator.lcm_block_size)
+    return MTPPrefixSnapshots(
+        coordinator.lcm_block_size,
+        cacheable_group_ids=tuple(
+            i for i, m in enumerate(managers) if m.kv_cache_spec.prefix_cacheable
+        ),
+    )

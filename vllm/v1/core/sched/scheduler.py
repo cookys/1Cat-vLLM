@@ -339,7 +339,8 @@ class Scheduler(SchedulerInterface):
             snapshots.telemetry = envs.VLLM_SM70_MTP_COMMITTED_PREFIX_CACHE_LOG
             coordinator.mtp_prefix_snapshots = snapshots
             logger.info(
-                "MTP_COMMITTED_PREFIX enabled: completed true-prefill only; "
+                "MTP_COMMITTED_PREFIX enabled: sync scheduling, "
+                "completed true-prefill only; "
                 "alignment=%d, MTP next-token guard, all-group certificates; "
                 "state-vs-recompute bit equality requires GPU validation",
                 snapshots.alignment,
@@ -1400,6 +1401,20 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
+            snapshots = self.kv_cache_manager.coordinator.mtp_prefix_snapshots
+            if snapshots is not None and snapshots.telemetry:
+                start = request.num_computed_tokens
+                prompt_end = min(start + num_scheduled_token, request.num_prompt_tokens)
+                if start < prompt_end:
+                    logger.info(
+                        "MTP_COMMITTED_PREFIX scheduled request=%s "
+                        "prompt_tokens=%d start=%d end=%d prefill_tokens=%d",
+                        req_id,
+                        request.num_prompt_tokens,
+                        start,
+                        prompt_end,
+                        prompt_end - start,
+                    )
             request.num_computed_tokens += num_scheduled_token
             request.num_in_flight_tokens += num_scheduled_token
             request.is_prefill_chunk = request.num_computed_tokens < (

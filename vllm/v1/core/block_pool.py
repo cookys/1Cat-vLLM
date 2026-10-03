@@ -72,6 +72,14 @@ class BlockHashToBlockMap:
                     blocks if allow_mtp_prefix or not blocks.mtp_prefix_only else None
                 )
             if isinstance(blocks, dict):
+                if allow_mtp_prefix:
+                    # A pending/uncertified duplicate must not hide a completed
+                    # checkpoint. Cross-group identity and lookahead validation
+                    # still happen in MTPPrefixSnapshots.accepts().
+                    for block in blocks.values():
+                        cert = block.mtp_prefix_certificate
+                        if cert is not None and cert.committed:
+                            return block
                 return next(
                     (
                         b
