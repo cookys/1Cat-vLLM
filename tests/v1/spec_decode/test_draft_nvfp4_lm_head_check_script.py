@@ -86,12 +86,44 @@ def test_load_hidden_dump_accepts_directory_file_and_plain_tensor(script, tmp_pa
 def test_load_hidden_dump_round_trips_the_real_dumper(script, tmp_path):
     from vllm.v1.worker.gpu.spec_decode.eagle.draft_hidden_dump import DraftHiddenDumper
 
-    dumper = DraftHiddenDumper(str(tmp_path), 4)
+    dumper = DraftHiddenDumper(
+        str(tmp_path),
+        4,
+        max_rows=4,
+        hidden_size=K,
+        dtype=torch.float16,
+        device="cpu",
+    )
+    tokens = torch.arange(16, dtype=torch.int64).view(4, 4) + 500
     batches = [_hidden(m, seed=m) for m in (1, 2, 4)]
-    for i, batch in enumerate(batches):
-        dumper.maybe_dump(batch, i)
+    for step, batch in enumerate(batches):
+        dumper.stage(batch)
+        dumper.dump_step(step, batch.shape[0], tokens)
     hidden, files = script.load_hidden_dump(tmp_path, "rank0_step*.pt")
     assert files == 3 and torch.equal(hidden, torch.cat(batches))
+    hidden, loaded_tokens, files = script.load_dump(tmp_path, "rank0_step*.pt")
+    assert files == 3 and torch.equal(hidden, torch.cat(batches))
+    expected = torch.cat([tokens[:m, step] for step, m in enumerate((1, 2, 4))])
+    assert torch.equal(loaded_tokens, expected)
+
+
+def test_load_dump_returns_tokens_only_when_every_file_has_them(
+    script, tmp_path, capsys
+):
+    torch.save(
+        {"hidden": _hidden(2, 1), "draft_tokens": torch.tensor([7, 8])},
+        tmp_path / "rank0_step00000.pt",
+    )
+    _, tokens, _ = script.load_dump(tmp_path, "rank0_step*.pt")
+    assert tokens.tolist() == [7, 8]
+    torch.save(
+        {"hidden": _hidden(3, 2)}, tmp_path / "rank0_step00001.pt"
+    )  # an old dump
+    _, tokens, files = script.load_dump(tmp_path, "rank0_step*.pt")
+    assert tokens is None and files == 2
+    assert "no draft_tokens" in capsys.readouterr().err
+    with pytest.raises(script.NoDumpFiles):
+        script.load_dump(tmp_path, "nothing*.pt")
 
 
 def test_global_disagreement_with_the_tp_style_reduction(script, cpu_ops):
@@ -135,29 +167,69 @@ def test_single_shard_scope_and_rank_histogram(script, cpu_ops):
     assert result["fp16_top1_top2_gap_p50"] >= result["fp16_top1_top2_gap_p10"] >= 0
 
 
+def _args(tmp_path, **overrides):
+    values = {
+        "hidden_dump": tmp_path,
+        "hidden_glob": None,
+        "tp_rank": "2",
+        "max_hidden_rows": 0,
+        "num_hidden": 16,
+        "sigma": 1.0,
+        "seed": 0,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
 def test_tp_rank_picks_the_default_dump_files(script, tmp_path):
     torch.save({"hidden": _hidden(4, 1)}, tmp_path / "rank0_step00000.pt")
     torch.save({"hidden": _hidden(5, 2)}, tmp_path / "rank2_step00000.pt")
-    args = SimpleNamespace(
-        hidden_dump=tmp_path,
-        hidden_glob=None,
-        tp_rank="2",
-        max_hidden_rows=0,
-        num_hidden=0,
-        sigma=1.0,
-        seed=0,
-    )
-    hidden, source, files = script.make_hidden(args, torch.device("cpu"))
-    assert hidden.shape[0] == 5 and files == 1
+    args = _args(tmp_path)
+    rows = script.make_hidden(args, torch.device("cpu"))
+    assert rows.hidden.shape[0] == 5 and rows.files == 1 and not rows.synthetic
+    assert rows.draft_tokens is None and rows.source.startswith("dump:")
     args.tp_rank = "all"
-    hidden, _, _ = script.make_hidden(args, torch.device("cpu"))
-    assert hidden.shape[0] == 4
+    assert script.make_hidden(args, torch.device("cpu")).hidden.shape[0] == 4
     args.tp_rank, args.hidden_glob = "2", "rank*_step*.pt"
-    hidden, _, files = script.make_hidden(args, torch.device("cpu"))
-    assert hidden.shape[0] == 9 and files == 2
-    args.hidden_glob, args.tp_rank = None, "1"
-    with pytest.raises(SystemExit, match="hidden-glob"):
-        script.make_hidden(args, torch.device("cpu"))
+    rows = script.make_hidden(args, torch.device("cpu"))
+    assert rows.hidden.shape[0] == 9 and rows.files == 2
+
+
+def test_hidden_dump_without_files_falls_back_to_synthetic(script, tmp_path, capsys):
+    # --hidden-dump given but nothing matches: no SystemExit, a loud warning
+    rows = script.make_hidden(_args(tmp_path, tp_rank="1"), torch.device("cpu"))
+    assert rows.synthetic and rows.source == "synthetic" and rows.files == 0
+    assert rows.hidden.shape == (16, K) and rows.hidden.dtype == torch.float16
+    assert rows.draft_tokens is None
+    assert "hidden-glob" in rows.note
+    assert "WARNING" in capsys.readouterr().err
+    # a missing file path behaves the same way
+    rows = script.make_hidden(_args(tmp_path / "missing.pt"), torch.device("cpu"))
+    assert rows.synthetic
+    # without --hidden-dump nothing changes: the labelled random rows
+    rows = script.make_hidden(_args(None), torch.device("cpu"))
+    assert not rows.synthetic and rows.source == "random_normal_sigma=1.0"
+
+
+def test_synthetic_rows_report_no_accuracy_and_a_null_disagreement(
+    script, cpu_ops, tmp_path, capsys
+):
+    weights, heads = _shards(1, rows=256)
+    rows = script.make_hidden(_args(tmp_path), torch.device("cpu"))
+    assert script.consistency_section(heads, weights, rows) == {
+        "dump_consistency": None,
+        "dump_consistency_detail": None,
+        "dump_consistency_ok": None,
+    }
+    section = script.accuracy_section(heads, weights, rows, [0, 64])
+    assert section == {"accuracy": None, "disagreement_rate": None}
+    assert "not measured" in capsys.readouterr().err
+    # the same rows through the real-dump path would have produced numbers
+    real = rows._replace(synthetic=False)
+    section = script.accuracy_section(heads, weights, real, [0, 64])
+    assert set(section["disagreement_rate"]) == {"0", "64"}
+    assert section["disagreement_rate"] == section["accuracy"]["disagreement_rate"]
+    assert all(head.rerank_k == 64 for head in heads)  # left as production
 
 
 def test_f16_ulp_matches_numpy_nextafter(script):
@@ -206,3 +278,96 @@ def test_padding_rows_are_masked_in_both_paths(script, cpu_ops):
     result = script.evaluate(heads, weights, hidden, [0, 64])
     assert result["disagreement_rate"]["64"] == 0.0
     assert 0.0 < result["logits_rel_l2"] < 0.2  # padding excluded, no inf/nan
+
+
+def _fp16_tokens(weights, hidden):
+    """Independent global FP16 argmax over the concatenated shards."""
+    return torch.cat([hidden @ w.t() for w in weights], dim=1).argmax(-1)
+
+
+def test_dump_consistency_is_one_when_the_dump_matches_the_fp16_head(script, cpu_ops):
+    weights, heads = _shards(2)  # shard r owns ids [r * 256, (r + 1) * 256)
+    hidden = _hidden(70, seed=9)
+    detail = script.dump_consistency(
+        heads, weights, hidden, _fp16_tokens(weights, hidden)
+    )
+    assert detail["scope"] == "global" and detail["value"] == 1.0
+    assert (detail["rows_total"], detail["rows_checked"], detail["rows_matching"]) == (
+        70,
+        70,
+        70,
+    )
+    assert detail["mismatch_near_tie_rows"] == 0
+
+
+def test_dump_consistency_counts_the_rows_that_differ(script, cpu_ops, capsys):
+    weights, heads = _shards(2)
+    hidden = _hidden(40, seed=10)
+    tokens = _fp16_tokens(weights, hidden)
+    wrong = tokens.clone()
+    wrong[:4] = (wrong[:4] + 1) % 512  # an NVFP4-style (or wrong-tensor) token
+    detail = script.dump_consistency(heads, weights, hidden, wrong)
+    assert detail["rows_matching"] == 36 and detail["value"] == pytest.approx(0.9)
+    assert script.report_dump_consistency(detail) is False
+    captured = capsys.readouterr()
+    assert captured.out.startswith("dump_consistency=0.9000")
+    assert "WARNING" in captured.err and "NVFP4_LM_HEAD" in captured.err
+    ok = script.dump_consistency(heads, weights, hidden, tokens)
+    assert script.report_dump_consistency(ok) is True
+    assert capsys.readouterr().err == ""
+
+
+def test_dump_consistency_with_one_shard_checks_only_its_own_rows(script, cpu_ops):
+    weights, heads = _shards(2)
+    hidden = _hidden(60, seed=11)
+    tokens = _fp16_tokens(weights, hidden)  # global winners over both shards
+    in_shard0 = tokens < 256
+    assert 0 < int(in_shard0.sum()) < 60
+    detail = script.dump_consistency(heads[:1], weights[:1], hidden, tokens)
+    assert detail["scope"] == "shard"
+    assert detail["rows_checked"] == int(in_shard0.sum())
+    assert detail["value"] == 1.0
+    # shard 1 has start 256: its rows are the other ones
+    detail = script.dump_consistency(heads[1:], weights[1:], hidden, tokens)
+    assert (
+        detail["rows_checked"] == 60 - int(in_shard0.sum()) and detail["value"] == 1.0
+    )
+    # nothing dumped lies in the loaded shard -> not measurable, never a warning
+    outside = torch.full((60,), 400, dtype=torch.int64)
+    detail = script.dump_consistency(heads[:1], weights[:1], hidden, outside)
+    assert detail["value"] is None and detail["rows_checked"] == 0
+    assert script.report_dump_consistency(detail) is True
+
+
+def test_dump_consistency_separates_fp16_near_ties(script, cpu_ops):
+    def tie_rows(weight):
+        weight[6] = weight[5]  # identical rows -> identical FP16 logits
+
+    weights, heads = _shards(1, rows=256, edit=tie_rows)
+    hidden = _hidden(20, seed=12)
+    hidden[:4] = (weights[0][5].float() * 40).half()  # rows 5 and 6 tie on top
+    tokens = _fp16_tokens(weights, hidden)
+    assert (tokens[:4] == 5).all()  # the first maximum
+    tokens[:4] = 6  # the server's kernel broke the tie the other way
+    detail = script.dump_consistency(heads, weights, hidden, tokens)
+    assert detail["rows_matching"] == 16 and detail["mismatch_near_tie_rows"] == 4
+
+
+def test_consistency_section_prints_first_and_flags_a_bad_dump(script, cpu_ops, capsys):
+    weights, heads = _shards(2)
+    hidden = _hidden(32, seed=13)
+    tokens = _fp16_tokens(weights, hidden)
+    rows = script.HiddenRows(hidden, "dump:x (1 file(s))", 1, tokens, False, None)
+    section = script.consistency_section(heads, weights, rows)
+    assert section["dump_consistency"] == 1.0 and section["dump_consistency_ok"]
+    assert section["dump_consistency_detail"]["rows_checked"] == 32
+    assert capsys.readouterr().out.startswith("dump_consistency=1.0000")
+    bad = rows._replace(draft_tokens=(tokens + 1) % 512)
+    section = script.consistency_section(heads, weights, bad)
+    assert section["dump_consistency_ok"] is False
+    assert section["dump_consistency"] < script.DUMP_CONSISTENCY_MIN
+    assert "WARNING" in capsys.readouterr().err
+    # an old dump without draft_tokens: no metric, said so on the first line
+    old = rows._replace(draft_tokens=None)
+    assert script.consistency_section(heads, weights, old)["dump_consistency"] is None
+    assert "no draft_tokens" in capsys.readouterr().out
