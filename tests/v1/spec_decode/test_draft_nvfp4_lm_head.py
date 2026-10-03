@@ -936,6 +936,30 @@ def test_builder_tp_one_has_no_collective(cpu_ops, sm70_gate, monkeypatch):
         _build(_model((torch.randn(512, 256) * 0.05).half()))
 
 
+@pytest.mark.parametrize("default_device", ["meta"])
+def test_consensus_tensors_are_pinned_to_cpu(
+    sm70_gate, monkeypatch, caplog, default_device
+):
+    # An outer default-device context (meta here, cuda in a worker) must not
+    # move the consensus vector off the CPU: the collective runs on the gloo
+    # group and a failed rank must not touch the GPU.
+    calls = _fake_cpu_consensus(monkeypatch, 4, 3, {0: OK, 1: FALLBACK, 2: OK})
+    with torch.device(default_device):
+        assert mod._tp_consensus(OK) == [OK, FALLBACK, OK, OK]
+        with caplog.at_level("INFO"):
+            # ineligible rank -> same decision table as without the context
+            assert _build(SimpleNamespace(lm_head=None)) is None
+    assert calls == [[0, 0, 0, OK], [0, 0, 0, FALLBACK]]
+    assert "no lm_head" in caplog.text
+
+    _fake_cpu_consensus(monkeypatch, 4, 0, {1: OK, 2: FATAL, 3: OK})
+    with (
+        torch.device(default_device),
+        pytest.raises(RuntimeError, match=r"fatal CUDA error on rank 2"),
+    ):
+        _build(SimpleNamespace(lm_head=None))
+
+
 def test_consensus_uses_the_tp_cpu_group(monkeypatch):
     group = object()
     monkeypatch.setattr(mod, "get_tp_group", lambda: SimpleNamespace(cpu_group=group))
