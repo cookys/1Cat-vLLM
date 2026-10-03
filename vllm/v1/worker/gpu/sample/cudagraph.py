@@ -35,6 +35,31 @@ buffer of a round-robin pool by every ``apply_staged_writes()`` (every step),
 and ``RequestState.prefill_len`` likewise on every step that adds a request.
 A graph that baked those pointers would read stale buffers.
 
+Capture-time state. The eager warmup of every key runs ``post_update`` (and the
+model-state postprocess when it is in the graph) on the dummy request slots
+``0..num_reqs-1``, which writes persistent state: ``output_bin_counts``,
+``num_computed_tokens``, ``total_len``, ``last_sampled_tokens``,
+``all_token_ids`` and the model state's accepted-token counts. Nothing
+restores those on its own: ``RequestState.add_request`` resets most of them but
+``PenaltiesState.add_request`` only schedules a ``bincount`` for requests that
+use penalties, so a request without penalties would keep the dummy token's
+count forever. ``_capture_key`` therefore snapshots exactly the regions listed
+by ``_persistent_regions`` before the warmup and copies them back once the
+capture scope has closed (the capture itself executes nothing). The input
+buffers (``input_ids``, ``positions``, ``seq_lens``, ``query_start_loc``) are
+rewritten every step and are not restored. Block copies of the Mamba align
+postprocess cannot be restored; they are not triggered because the dummy
+``num_computed_tokens`` stays below one Mamba block, and in align mode the
+postprocess is only captured when its context exists (never at startup today).
+
+Memory. The graph pool measured 58 MiB per GPU for the (1, 5) key on V100
+(2026-10-03), and the orchestrator accepted that as the budget. The design
+estimate was about 30 MiB; it counted the sort outputs and the softmax/cumsum
+copies but not the torch.sort/cub workspaces for 5 x 248320 fp32 keys with
+int64 indices, the fp32 cumsum/softmax temporaries held alongside them, or the
+rejection-sampler temporaries. The static input buffers (about 4.7 MiB, mostly
+the fp32 logits) are allocated outside the pool and come on top.
+
 Numerics. Under capture ``apply_top_k_top_p_triton`` already routes to the
 full-vocabulary reference (``apply_top_k_top_p_pytorch``). That is exactly what
 eager execution does with ``VLLM_SM70_TOPK_TOPP_BRANCHFREE=2`` when top-k and
@@ -184,6 +209,29 @@ def model_state_postprocess_is_capture_safe(model_state: Any) -> bool:
         return True
     ctx = getattr(model_state, "_mamba_ctx", None)
     return ctx is not None and bool(getattr(ctx, "is_initialized", False))
+
+
+def model_state_persistent_regions(
+    model_state: Any, num_reqs: int
+) -> list[tuple[torch.Tensor, slice]]:
+    """Persistent tensors the model-state postprocess writes for dummy slots.
+
+    ``MambaHybridModelState.postprocess_state`` scatters ``num_sampled`` into
+    ``num_accepted_tokens_gpu[slot]`` and, in align mode with an initialized
+    context, snapshots the whole buffer into ``ctx.num_accepted_tokens_out`` and
+    may reset an entry to 1. The state-block copies of the align kernel cannot
+    be listed; see the module docstring.
+    """
+    regions: list[tuple[torch.Tensor, slice]] = []
+    num_accepted = getattr(model_state, "num_accepted_tokens_gpu", None)
+    if isinstance(num_accepted, torch.Tensor):
+        regions.append((num_accepted, slice(0, num_reqs)))
+    ctx = getattr(model_state, "_mamba_ctx", None)
+    if ctx is not None and getattr(ctx, "is_initialized", False):
+        scratch = getattr(ctx, "num_accepted_tokens_out", None)
+        if isinstance(scratch, torch.Tensor):
+            regions.append((scratch, slice(None)))
+    return regions
 
 
 def compute_signature(
@@ -435,7 +483,53 @@ class SamplingCudaGraphManager:
             return 0
         return torch.cuda.mem_get_info(self.device)[0]
 
+    def _persistent_regions(self, num_reqs: int) -> list[tuple[torch.Tensor, slice]]:
+        """Every persistent region the warmup writes for slots ``0..num_reqs-1``.
+
+        The list is read from ``post_update`` (``output_bin_counts``,
+        ``num_computed_tokens``, ``total_len``, ``last_sampled_tokens``,
+        ``all_token_ids``, the last as whole rows) and, when it runs inside the
+        graph, from the model-state postprocess. Each entry is a tensor and the
+        slice of its first dimension that is saved and restored.
+        """
+        rows = slice(0, num_reqs)
+        req_states = self.req_states
+        regions: list[tuple[torch.Tensor, slice]] = [
+            (self.sampler.penalties_state.output_bin_counts, rows),
+            (req_states.num_computed_tokens.gpu, rows),
+            (req_states.total_len.gpu, rows),
+            (req_states.last_sampled_tokens, rows),
+            (req_states.all_token_ids.gpu, rows),
+        ]
+        if self.model_state_in_graph:
+            regions.extend(model_state_persistent_regions(self.model_state, num_reqs))
+        return regions
+
+    def _snapshot_regions(
+        self, regions: list[tuple[torch.Tensor, slice]]
+    ) -> list[torch.Tensor]:
+        return [tensor[rows].clone() for tensor, rows in regions]
+
+    def _restore_regions(
+        self,
+        regions: list[tuple[torch.Tensor, slice]],
+        saved: list[torch.Tensor],
+    ) -> None:
+        for (tensor, rows), values in zip(regions, saved, strict=True):
+            tensor[rows].copy_(values)
+        # The restore runs on the capture side stream; later main-stream work
+        # (add_request writes) must not overtake it.
+        self._synchronize()
+
     def _capture_key(self, key: SamplingGraphKey) -> None:
+        regions = self._persistent_regions(key.num_reqs)
+        saved = self._snapshot_regions(regions)
+        self._capture_key_unrestored(key)
+        # The capture executed nothing; only the warmup wrote persistent state.
+        # Put back the values it found (not zeros: a slot may hold live state).
+        self._restore_regions(regions, saved)
+
+    def _capture_key_unrestored(self, key: SamplingGraphKey) -> None:
         self._fill_dummy_inputs(key)
         # Eager warmup: JIT-compile every Triton kernel of the chain and let
         # ATen set up its sort/scan workspaces before the capture.
@@ -472,10 +566,14 @@ class SamplingCudaGraphManager:
         slots. The speculative layout is then written explicitly because
         ``make_dummy`` models one logit per request.
 
-        The warmup run updates request slots ``0..num_reqs-1`` (num_computed,
-        total_len, last_sampled, accepted counts). Nothing is live while
-        ``capture_model`` runs and ``add_request`` overwrites every one of
-        those fields when a slot is first used.
+        The warmup run writes persistent state for the dummy request slots
+        ``0..num_reqs-1``: the regions listed by ``_persistent_regions``
+        (``output_bin_counts``, ``num_computed_tokens``, ``total_len``,
+        ``last_sampled_tokens``, ``all_token_ids`` and, when the model-state
+        postprocess is in the graph, its accepted-token counts).
+        ``add_request`` does not reset all of them (``output_bin_counts`` is
+        only rewritten for requests that use penalties), so ``_capture_key``
+        restores the values it saved before the warmup once the capture is done.
         """
         assert self.bufs is not None
         b = self.bufs
