@@ -2,26 +2,37 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GPU check for the draft-only NVFP4 lm_head (VLLM_SM70_MTP_DRAFT_NVFP4_LM_HEAD).
 
-Loads the rows of one tensor-parallel lm_head shard from the Flash-Next
-checkpoint, quantizes them with the production helper, runs the real QPN2 ops
-and reports:
+Loads lm_head rows from the Flash-Next checkpoint, quantizes them with the
+production helper, runs the real QPN2 ops and the real rerank, and reports:
 
 * the weight and logits relative L2 error (NVFP4 vs the FP16 GEMM),
-* a bit-convention check of the packing against the real kernel,
-* top-1 agreement with the FP16 argmax for several rerank sizes R,
-* the rank histogram of the FP16 argmax inside the NVFP4 logits,
+* a packing-convention check of the real prepare+GEMM kernels,
+* ``disagreement_rate`` per rerank size R: the fraction of hidden-state rows
+  whose final draft token of the NVFP4+rerank path differs from the FP16 path
+  (R=0 is the raw NVFP4 argmax, tier-3 diagnostic),
+* the rank histogram of the FP16 argmax inside its own shard's NVFP4 logits,
 * CUDA-event timings (eager and CUDA-graph replay) of the FP16 GEMM, the QPN2
   GEMM for split_k in {8, 16, 32} and the whole head, for M in {1, 2, 4},
-* resident bytes and the allocator delta of building the head.
+* resident bytes, quantize time and peak extra memory of building the head.
 
-It needs one idle SM70 GPU (about 2 GB of VRAM, under a minute); pick it with
-CUDA_VISIBLE_DEVICES. Random hidden states make the rank histogram pessimistic
-(random vectors have no dominant token); use ``--hidden-dump`` with real draft
-hidden states ([n, 2560] float16 saved with torch.save) for the numbers that
-matter.
+Scope.  ``--tp-rank <r>`` loads one shard (about 1 GB of VRAM); the final token
+is then the shard-local winner.  ``--tp-rank all`` loads all ``--tp-size``
+shards on the one GPU (about 2 GB) and reproduces the production TP reduction,
+so the disagreement is that of the real global draft token.
+
+Hidden states.  ``--hidden-dump`` takes (a) a directory written by
+``VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_DIR`` (files ``rank*_step*.pt``, dicts with a
+``hidden`` tensor; ``--hidden-glob`` selects them, default ``rank0_step*.pt``
+because the hidden states are replicated across TP ranks), (b) one such file,
+or (c) a plain ``torch.save``'d float16 tensor [n, 2560].  Without it the rows
+are random N(0, --sigma), which makes the numbers pessimistic: random vectors
+have no dominant token.
 
     CUDA_VISIBLE_DEVICES=<gpu> python benchmarks/sm70_draft_nvfp4_lm_head_check.py \
-        --tp-rank 0 --out /data/bench/draft_nvfp4_lm_head_rank0.json
+        --tp-rank all --hidden-dump /data/bench/draft_hidden \
+        --out /data/bench/draft_nvfp4_lm_head.json
+
+It needs one idle SM70 GPU and under a minute; pick it with CUDA_VISIBLE_DEVICES.
 """
 
 from __future__ import annotations
@@ -47,13 +58,23 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-dir", type=Path, default=Path("/data/models/Qwen3.8-Flash-Next-NVFP4")
     )
-    parser.add_argument("--tp-rank", type=int, default=0)
+    parser.add_argument(
+        "--tp-rank",
+        type=str,
+        default="0",
+        help='shard index, or "all" to emulate the whole TP reduction on one GPU',
+    )
     parser.add_argument("--tp-size", type=int, default=4)
     parser.add_argument(
         "--hidden-dump",
         type=Path,
         default=None,
-        help="torch.save'd float16 tensor [n, 2560] of real draft hidden states",
+        help="dump directory / file from VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_DIR, or a "
+        "torch.save'd float16 tensor [n, 2560]",
+    )
+    parser.add_argument("--hidden-glob", type=str, default="rank0_step*.pt")
+    parser.add_argument(
+        "--max-hidden-rows", type=int, default=0, help="cap on rows used (0 = all)"
     )
     parser.add_argument("--num-hidden", type=int, default=512)
     parser.add_argument("--sigma", type=float, default=1.0)
@@ -82,20 +103,37 @@ def load_shard(model_dir: Path, tp_rank: int, tp_size: int) -> tuple[torch.Tenso
     return shard.to(torch.float16), start
 
 
-def make_hidden(
-    args: argparse.Namespace, device: torch.device
-) -> tuple[torch.Tensor, str]:
-    if args.hidden_dump is not None:
-        loaded = torch.load(args.hidden_dump, map_location="cpu")
+def load_hidden_dump(path: Path, glob: str) -> tuple[torch.Tensor, int]:
+    """Hidden states [n, 2560] float16 (CPU) from a dump directory, file or tensor."""
+    files = sorted(path.glob(glob)) if path.is_dir() else [path]
+    if not files:
+        raise SystemExit(f"no files matching {glob!r} in {path}")
+    parts = []
+    for file in files:
+        loaded = torch.load(file, map_location="cpu")
         if isinstance(loaded, dict):
             loaded = loaded["hidden"]
-        hidden = loaded.reshape(-1, HIDDEN_SIZE).to(torch.float16)
-        return hidden.to(device).contiguous(), f"dump:{args.hidden_dump}"
-    gen = torch.Generator(device="cpu").manual_seed(args.seed)
-    hidden = torch.randn(args.num_hidden, HIDDEN_SIZE, generator=gen) * args.sigma
-    return hidden.to(torch.float16).to(
-        device
-    ).contiguous(), f"random_normal_sigma={args.sigma}"
+        parts.append(loaded.reshape(-1, HIDDEN_SIZE).to(torch.float16))
+    return torch.cat(parts), len(files)
+
+
+def make_hidden(
+    args: argparse.Namespace, device: torch.device
+) -> tuple[torch.Tensor, str, int]:
+    files = 0
+    if args.hidden_dump is not None:
+        hidden, files = load_hidden_dump(args.hidden_dump, args.hidden_glob)
+        source = f"dump:{args.hidden_dump} ({files} file(s))"
+    else:
+        gen = torch.Generator(device="cpu").manual_seed(args.seed)
+        hidden = torch.randn(args.num_hidden, HIDDEN_SIZE, generator=gen) * args.sigma
+        hidden = hidden.to(torch.float16)
+        source = f"random_normal_sigma={args.sigma}"
+    if args.max_hidden_rows > 0:
+        hidden = hidden[: args.max_hidden_rows]
+    if hidden.shape[0] < 4:
+        raise SystemExit("need at least 4 hidden-state rows")
+    return hidden.to(device).contiguous(), source, files
 
 
 @torch.no_grad()
@@ -138,46 +176,72 @@ def weight_error(weight: torch.Tensor) -> float:
 
 
 @torch.no_grad()
-def accuracy(
-    head: dh.DraftNvfp4LMHead,
-    weight: torch.Tensor,
+def evaluate(
+    heads: list[dh.DraftNvfp4LMHead],
+    weights: list[torch.Tensor],
     hidden: torch.Tensor,
     ranks: list[int],
 ) -> dict:
-    start = head.org_vocab_start_index
-    agree = {r: 0 for r in ranks}
+    """FP16 path vs NVFP4+rerank path on every hidden-state row.
+
+    With several heads the final token is reduced across them exactly like the
+    TP all-gather does (largest value wins, first shard on a tie).
+    """
+    num_shards, n = len(heads), heads[0].rows
+    starts = torch.tensor(
+        [h.org_vocab_start_index for h in heads], device=hidden.device
+    )
+    disagree = dict.fromkeys(ranks, 0)
     sq_err = torch.zeros((), dtype=torch.float64, device=hidden.device)
     sq_ref = torch.zeros_like(sq_err)
-    all_ranks, gaps, ties = [], [], 0
-    rows_total = 0
-    weight_t = weight.t()
+    all_ranks, gaps, ties, total = [], [], 0, 0
     for begin in range(0, hidden.shape[0], dh.MAX_ROWS):
         h = hidden[begin : begin + dh.MAX_ROWS].contiguous()
         m = h.shape[0]
-        ref = h @ weight_t  # FP16 GEMM, the numerics of the target lm_head
-        ref_arg = ref.argmax(dim=-1)
-        top2 = ref.float().topk(2, dim=-1).values
+        rows = torch.arange(m, device=h.device)
+        refs = [h @ w.t() for w in weights]  # FP16 GEMM: the target's numerics
+        qs = []
+        for head in heads:
+            q = torch.empty(m, n, dtype=torch.float16, device=h.device)
+            dh._qpn2_gemm_out(
+                q,
+                h,
+                head.codes,
+                head.scales,
+                head.global_scale,
+                head.split_k,
+                head.accumulator_chains,
+            )
+            qs.append(q)
+        for ref, q in zip(refs, qs):
+            sq_err += ((q.float() - ref.float()) ** 2).sum().double()
+            sq_ref += (ref.float() ** 2).sum().double()
+
+        full = torch.cat(refs, dim=1)
+        top2 = full.float().topk(2, dim=-1).values
         gaps.append((top2[:, 0] - top2[:, 1]).cpu())
         ties += int((top2[:, 0] == top2[:, 1]).sum())
-        q = torch.empty(m, head.rows, dtype=torch.float16, device=h.device)
-        dh._qpn2_gemm_out(
-            q,
-            h,
-            head.codes,
-            head.scales,
-            head.global_scale,
-            head.split_k,
-            head.accumulator_chains,
-        )
-        sq_err += ((q.float() - ref.float()) ** 2).sum().double()
-        sq_ref += (ref.float() ** 2).sum().double()
-        target = q.float().gather(1, ref_arg[:, None])
-        all_ranks.append(((q.float() > target).sum(dim=-1) + 1).cpu())
+        ref_index = full.argmax(dim=-1)  # index into the concatenated shards
+        ref_shard, ref_local = ref_index // n, ref_index % n
+        ref_token = ref_local + starts[ref_shard]
+
+        # rank of the FP16 argmax inside its own shard's NVFP4 logits
+        winner_q = torch.stack(qs)[ref_shard, rows]
+        target = winner_q.gather(1, ref_local[:, None])
+        all_ranks.append(((winner_q.float() > target.float()).sum(dim=-1) + 1).cpu())
+
         for r in ranks:
-            head.rerank_k = r
-            _, ids = head.local_top_tokens(h)
-            agree[r] += int((ids - start == ref_arg).sum())
-        rows_total += m
+            values, ids = [], []
+            for head in heads:
+                head.rerank_k = r
+                value, token = head.local_top_tokens(h)
+                values.append(value)
+                ids.append(token)
+            winner = torch.stack(values).argmax(dim=0)
+            token = torch.stack(ids).gather(0, winner[None])[0]
+            disagree[r] += int((token != ref_token).sum())
+        total += m
+
     ranks_t = torch.cat(all_ranks)
     counts, previous = [], 0
     for edge in RANK_EDGES:
@@ -186,9 +250,12 @@ def accuracy(
     counts.append(int(ranks_t.numel()) - previous)
     gaps_t = torch.cat(gaps)
     return {
-        "rows": rows_total,
+        "scope": "global" if num_shards > 1 else "shard",
+        "shards": num_shards,
+        "rows": total,
         "logits_rel_l2": float((sq_err / sq_ref).sqrt()),
-        "top1_agreement": {str(r): agree[r] / rows_total for r in ranks},
+        "disagreement_rate": {str(r): disagree[r] / total for r in ranks},
+        "disagreement_rows": {str(r): disagree[r] for r in ranks},
         "rank_hist": dict(zip(RANK_LABELS, counts)),
         "rank_p50": float(ranks_t.float().median()),
         "rank_p99": float(ranks_t.float().quantile(0.99)),
@@ -203,10 +270,8 @@ def _time_events(fn, warmup: int, iters: int) -> float:
     for _ in range(warmup):
         fn()
     torch.accelerator.synchronize()
-    begin, end = (
-        torch.cuda.Event(enable_timing=True),
-        torch.cuda.Event(enable_timing=True),
-    )
+    begin = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
     begin.record()
     for _ in range(iters):
         fn()
@@ -305,71 +370,90 @@ def main() -> None:
     ranks = sorted({int(r) for r in args.ranks.split(",")})
     if not set(ranks) <= set(dh.RERANK_K_CHOICES):
         raise SystemExit(f"--ranks must be a subset of {dh.RERANK_K_CHOICES}")
-
-    shard_cpu, start = load_shard(args.model_dir, args.tp_rank, args.tp_size)
-    weight = shard_cpu.to(device)
-    del shard_cpu
-    lm_head = SimpleNamespace(
-        weight=weight,
-        bias=None,
-        shard_indices=SimpleNamespace(
-            org_vocab_start_index=start, num_org_vocab_padding=0
-        ),
+    shard_ids = (
+        list(range(args.tp_size)) if args.tp_rank == "all" else [int(args.tp_rank)]
     )
     config = SimpleNamespace(method="mtp", draft_sample_method="greedy")
-    ok, reason = dh.DraftNvfp4LMHead.eligible(lm_head, config, device)
     name = torch.cuda.get_device_name(device)
-    print(f"gate: eligible={ok} ({reason}); device {name} {capability}")
-    if not ok:
-        raise SystemExit(2)
+    print(f"device {name} {capability}; shards {shard_ids} of tp_size={args.tp_size}")
 
-    torch.accelerator.synchronize()
-    allocated_before = torch.accelerator.memory_allocated(device)
-    torch.accelerator.reset_peak_memory_stats(device)
-    head = dh.DraftNvfp4LMHead(lm_head, rerank_k=64)
-    torch.accelerator.synchronize()
-    allocated_delta = torch.accelerator.memory_allocated(device) - allocated_before
-    build_peak = torch.accelerator.max_memory_allocated(device) - allocated_before
+    weights, heads, builds = [], [], []
+    for shard in shard_ids:
+        shard_cpu, start = load_shard(args.model_dir, shard, args.tp_size)
+        weight = shard_cpu.to(device)
+        del shard_cpu
+        lm_head = SimpleNamespace(
+            weight=weight,
+            bias=None,
+            shard_indices=SimpleNamespace(
+                org_vocab_start_index=start, num_org_vocab_padding=0
+            ),
+        )
+        ok, reason = dh.DraftNvfp4LMHead.eligible(lm_head, config, device)
+        print(f"shard {shard}: gate eligible={ok} ({reason})")
+        if not ok:
+            raise SystemExit(2)
+        torch.accelerator.synchronize()
+        allocated_before = torch.accelerator.memory_allocated(device)
+        head = dh.DraftNvfp4LMHead(lm_head, rerank_k=64)
+        torch.accelerator.synchronize()
+        builds.append(
+            {
+                "shard": shard,
+                "quantize_seconds": head.quantize_seconds,
+                "peak_extra_bytes": head.peak_extra_bytes,
+                "resident_bytes": head.resident_bytes(),
+                "allocated_delta_bytes": torch.accelerator.memory_allocated(device)
+                - allocated_before,
+                "global_scale": head.global_scale,
+            }
+        )
+        weights.append(weight)
+        heads.append(head)
 
-    hidden, hidden_source = make_hidden(args, device)
-    print(f"hidden: {hidden_source} shape={tuple(hidden.shape)}")
+    hidden, hidden_source, hidden_files = make_hidden(args, device)
+    print(f"hidden: {hidden_source} rows={hidden.shape[0]}")
 
     summary: dict = {
-        "device": torch.cuda.get_device_name(device),
+        "device": name,
         "capability": list(capability),
-        "tp_rank": args.tp_rank,
         "tp_size": args.tp_size,
-        "rows": head.rows,
-        "k": head.hidden_size,
-        "global_scale": head.global_scale,
-        "split_k": head.split_k,
-        "accumulator_chains": head.accumulator_chains,
+        "shards": shard_ids,
+        "rows_per_shard": heads[0].rows,
+        "k": heads[0].hidden_size,
+        "split_k": heads[0].split_k,
+        "accumulator_chains": heads[0].accumulator_chains,
         "hidden_source": hidden_source,
+        "hidden_files": hidden_files,
         "num_hidden": int(hidden.shape[0]),
-        "resident_bytes": head.resident_bytes(),
-        "allocated_delta_bytes": allocated_delta,
-        "build_peak_over_baseline_bytes": build_peak,
-        "weight_rel_l2": weight_error(weight),
-        "convention_check": convention_check(weight, device),
+        "builds": builds,
+        "resident_bytes": builds[0]["resident_bytes"],
+        "quantize_seconds": builds[0]["quantize_seconds"],
+        "peak_extra_bytes": builds[0]["peak_extra_bytes"],
+        "weight_rel_l2": weight_error(weights[0]),
+        "convention_check": convention_check(weights[0], device),
     }
     print(
-        f"resident={summary['resident_bytes'] / 1e6:.1f} MB "
-        f"allocator delta={allocated_delta / 1e6:.1f} MB "
-        f"build peak={build_peak / 1e6:.1f} MB"
+        f"per-rank resident={summary['resident_bytes'] / 1e6:.1f} MB "
+        f"quantize={summary['quantize_seconds']:.2f}s "
+        f"peak_extra={summary['peak_extra_bytes'] / 1e6:.1f} MB"
     )
     print(
         f"weight rel-L2={summary['weight_rel_l2']:.4f} "
         f"kernel-vs-dequant convention check={summary['convention_check']}"
     )
 
-    summary["accuracy"] = accuracy(head, weight, hidden, ranks)
-    head.rerank_k = 64  # accuracy() leaves the last tested R behind
+    summary["accuracy"] = evaluate(heads, weights, hidden, ranks)
+    for head in heads:
+        head.rerank_k = 64  # evaluate() leaves the last tested R behind
     acc = summary["accuracy"]
-    print(f"logits rel-L2={acc['logits_rel_l2']:.4f}")
-    print(f"top-1 agreement with the FP16 argmax per R: {acc['top1_agreement']}")
+    print(f"logits rel-L2={acc['logits_rel_l2']:.4f} scope={acc['scope']}")
+    print(f"disagreement_rate per R (NVFP4+rerank vs FP16): {acc['disagreement_rate']}")
     print(f"rank histogram of the FP16 argmax in NVFP4 logits: {acc['rank_hist']}")
 
-    summary["timings_us"] = timings(head, weight, hidden, args.warmup, args.iters)
+    summary["timings_us"] = timings(
+        heads[0], weights[0], hidden, args.warmup, args.iters
+    )
     for m, entry in summary["timings_us"].items():
         line = {
             k: (
