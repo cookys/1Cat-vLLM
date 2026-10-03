@@ -21,7 +21,7 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_sliding_window,
 )
 from vllm.v1.metrics.stats import PrefixCacheStats
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
 
@@ -231,6 +231,37 @@ class KVCacheManager:
                 request.block_hashes, max_cache_hit_length
             )
         )
+
+        snapshots = self.coordinator.mtp_prefix_snapshots
+        if snapshots is not None:
+            baseline_tokens = num_new_computed_tokens
+            candidate = self.coordinator.find_committed_prefix_hit(
+                request, baseline_tokens
+            )
+            if candidate is not None:
+                computed_blocks, num_new_computed_tokens = candidate
+                snapshots.lookup_hits += 1
+                snapshots.lookup_saved_tokens += (
+                    num_new_computed_tokens - baseline_tokens
+                )
+            if snapshots.telemetry:
+                exclusive, evicted, free = snapshots.pool_stats(self.block_pool)
+                logger.info(
+                    "MTP_COMMITTED_PREFIX lookup request=%s prompt_tokens=%d "
+                    "baseline_tokens=%d hit_tokens=%d saved_tokens=%d "
+                    "exclusive_blocks=%d evicted_blocks=%d free_blocks=%d "
+                    "lookup_hits=%d total_saved_tokens=%d",
+                    request.request_id,
+                    request.num_prompt_tokens,
+                    baseline_tokens,
+                    num_new_computed_tokens,
+                    num_new_computed_tokens - baseline_tokens,
+                    exclusive,
+                    evicted,
+                    free,
+                    snapshots.lookup_hits,
+                    snapshots.lookup_saved_tokens,
+                )
 
         # Keep the existing two-value lookup API used by 1Cat connectors. The
         # synchronous coordinator exposes the junction from this lookup only.
@@ -452,6 +483,24 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        snapshots = self.coordinator.mtp_prefix_snapshots
+        if snapshots is not None:
+            # A certified B is strictly inside the prompt. Its postprocess and
+            # MTP proposal precede a later target prefill on the same stream,
+            # hence precede the final output. The final AsyncOutput alone is
+            # NOT a fence for its own postprocess (which is submitted later).
+            publish = request.status in (
+                RequestStatus.FINISHED_STOPPED,
+                RequestStatus.FINISHED_LENGTH_CAPPED,
+            )
+            count = snapshots.finish(request.request_id, publish=publish)
+            if snapshots.telemetry:
+                logger.info(
+                    "MTP_COMMITTED_PREFIX finish request=%s publish=%s certificates=%d",
+                    request.request_id,
+                    publish,
+                    count,
+                )
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(
