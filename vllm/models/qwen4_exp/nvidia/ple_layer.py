@@ -2041,7 +2041,10 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         if has_initial_states_p is None:
             raise ValueError("has_initial_states_p is required for prefill short-conv")
 
-        output = torch.empty_like(x_p)
+        low_memory = envs.VLLM_QWEN4EXP_PLE_PREFILL_LOW_MEMORY
+        # Advanced indexing below owns the final output in the low-memory path.
+        # Avoid allocating another full, unpadded output just to copy into it.
+        output = None if low_memory else torch.empty_like(x_p)
         q_starts = query_start_loc_p.to(torch.int64)
         if state_indices_tensor_p.numel() < num_prefills:
             raise ValueError(
@@ -2056,13 +2059,15 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 f"need >= {num_prefills}."
             )
         if num_prefills == 0 or x_p.numel() == 0:
-            return output
+            return torch.empty_like(x_p) if output is None else output
         lengths = q_starts[1:] - q_starts[:-1]
         # Use the CPU-computed packing width from the metadata builder instead
         # of synchronizing on lengths.max().
         max_len = metadata.max_prefill_query_len
         if max_len <= 0:
-            return output
+            return torch.empty_like(x_p) if output is None else output
+        if low_memory:
+            logger.info_once("Qwen4Exp PLE low-memory batched prefill enabled.")
 
         hidden_size = x_p.shape[1]
         positions = torch.arange(
@@ -2105,13 +2110,34 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         else:
             history = packed_tokens
 
+        if low_memory:
+            # history owns the concatenation (or the sole reference when there
+            # is no history prefix). Do not retain the padded packing slab.
+            del packed_tokens
+
         conv_output = F.conv1d(
             history,
             conv_weights.unsqueeze(1).contiguous(),
             groups=history.size(1),
             dilation=self.short_conv_dilation,
         )
-        conv_output = F.silu(conv_output).transpose(1, 2).contiguous()
+        next_state = None
+        if low_memory:
+            if self.conv_state_len > 0 and conv_state.shape[0] > 0:
+                # gather copies only the short tail. Preserve the original
+                # state writeback order, but release the large history before
+                # the activation/output allocations. This must not be a view.
+                next_state = self._gather_prefill_conv_tail(
+                    history, lengths, num_prefills
+                )
+            del history
+            # conv_output is a fresh, private F.conv1d result. No other reader
+            # needs the pre-activation values. Keep the transpose as a view:
+            # advanced indexing still emits a fresh contiguous [tokens, C]
+            # output, so a whole padded transpose copy is unnecessary.
+            conv_output = F.silu(conv_output, inplace=True).transpose(1, 2)
+        else:
+            conv_output = F.silu(conv_output).transpose(1, 2).contiguous()
 
         token_positions = torch.arange(max_len, device=x_p.device, dtype=torch.int64)
         valid_tokens = token_positions.view(1, max_len) < lengths.view(num_prefills, 1)
@@ -2119,19 +2145,19 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             num_prefills, 1
         )
         conv_output.masked_fill_(~valid_output_mask.unsqueeze(-1), 0)
-        output.copy_(conv_output[req_indices, col_indices])
+        if low_memory:
+            output = conv_output[req_indices, col_indices]
+            del conv_output
+        else:
+            assert output is not None
+            output.copy_(conv_output[req_indices, col_indices])
 
         if self.conv_state_len > 0 and conv_state.shape[0] > 0:
-            state_starts = lengths.to(device=history.device, dtype=torch.int64).view(
-                num_prefills, 1, 1
-            )
-            state_offsets = torch.arange(
-                self.conv_state_len, device=history.device, dtype=torch.int64
-            ).view(1, 1, self.conv_state_len)
-            next_state = history.gather(
-                dim=2,
-                index=(state_starts + state_offsets).expand(-1, history.size(1), -1),
-            )
+            if not low_memory:
+                next_state = self._gather_prefill_conv_tail(
+                    history, lengths, num_prefills
+                )
+            assert next_state is not None
             # Write back without a host synchronization. Valid, non-empty rows
             # receive their new state; padding and zero-length rows keep the
             # current cache value.
@@ -2145,7 +2171,22 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             )
             existing_state[..., : self.conv_state_len] = safe_next_state
             conv_state.index_copy_(0, state_indices, existing_state)
+        assert output is not None
         return output
+
+    def _gather_prefill_conv_tail(
+        self, history: torch.Tensor, lengths: torch.Tensor, num_prefills: int
+    ) -> torch.Tensor:
+        state_starts = lengths.to(device=history.device, dtype=torch.int64).view(
+            num_prefills, 1, 1
+        )
+        state_offsets = torch.arange(
+            self.conv_state_len, device=history.device, dtype=torch.int64
+        ).view(1, 1, self.conv_state_len)
+        return history.gather(
+            dim=2,
+            index=(state_starts + state_offsets).expand(-1, history.size(1), -1),
+        )
 
     def _short_conv_dilated_spec_batched(
         self,

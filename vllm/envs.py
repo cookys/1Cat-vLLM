@@ -326,6 +326,7 @@ if TYPE_CHECKING:
     VLLM_SM70_MTP_ROUTER_BATCH: bool = False
     VLLM_SM70_MTP_SHARED_BATCH: bool = False
     VLLM_SM70_MTP_PLE_CONV: bool = False
+    VLLM_QWEN4EXP_PLE_PREFILL_LOW_MEMORY: bool = False
     VLLM_SM70_QWEN38_FUSED_HC_FP16: bool = False
     VLLM_SM70_QWEN38_BATCH_FASTPATH: bool = False
     VLLM_SM70_QWEN38_DUAL_COMPILE: bool = False
@@ -3775,6 +3776,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+    ),
+    "VLLM_QWEN4EXP_PLE_PREFILL_LOW_MEMORY": env_var(
+        lambda: (
+            env_with_choices("VLLM_QWEN4EXP_PLE_PREFILL_LOW_MEMORY", "0", ["0", "1"])()
+            == "1"
+        ),
+        description=(
+            "Reduce Qwen4Exp batched PLE prefill temporary storage using "
+            "in-place SiLU, a transpose view and earlier release of packing "
+            "and history buffers. Keeps the convolution shape and state "
+            "writeback contract; GPU numerical and peak-memory validation "
+            "is required before enabling in production."
+        ),
+        category="experimental",
+        declared_default="0",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("Qwen4Exp PLE batched prefill",),
     ),
     # Fuse the MTP4 PLE rollback, depthwise convolution, SiLU and state commit.
     "VLLM_SM70_MTP_PLE_CONV": env_var(
