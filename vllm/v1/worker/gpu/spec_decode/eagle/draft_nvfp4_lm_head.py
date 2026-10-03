@@ -37,6 +37,7 @@ python float so both sides agree on the value.
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import torch
@@ -96,6 +97,37 @@ def _qpn2_gemm_out(
 ) -> None:
     sm70_ops.nvfp4_qpn2_gemm_sm70_out(
         out, x, codes, scales, global_scale, split_k, accumulator_chains
+    )
+
+
+def _use_triton_rerank(x: torch.Tensor) -> bool:
+    return x.is_cuda
+
+
+def _exact_candidate_logits(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """``out[i, j] = x[i] . weight[candidate_ids[i, j]]`` in float32.
+
+    On CUDA this is the in-tree Triton kernel ``indexed_fp32_logits`` (one
+    program per (row, candidate), FP32 dot read straight from the FP16 rows).
+    It takes our shapes as is: ``x`` FP16 [M, K] contiguous, ``weight`` FP16
+    [N, K] row-major contiguous, ``candidate_ids`` int64 [M, R] contiguous
+    shard-local ids, ``out`` FP32 [M, R] contiguous.  Other devices (the CPU
+    unit tests) use the equivalent gather + FP32 batched matmul.
+    """
+    if _use_triton_rerank(x):
+        from vllm.model_executor.layers.sm70_fp32_lm_head import indexed_fp32_logits
+
+        indexed_fp32_logits(x, weight, candidate_ids, out)
+        return
+    m, r = candidate_ids.shape
+    rows = weight.index_select(0, candidate_ids.reshape(-1)).view(m, r, -1)
+    out.copy_(
+        torch.bmm(x.float().unsqueeze(1), rows.float().transpose(1, 2)).squeeze(1)
     )
 
 
@@ -299,6 +331,8 @@ class DraftNvfp4LMHead:
             return False, "lm_head.weight is not a 2-D tensor"
         if weight.dtype != torch.float16:
             return False, f"lm_head weight dtype {weight.dtype} is not float16"
+        if not weight.is_contiguous():
+            return False, "lm_head weight is not contiguous (rerank reads rows)"
         if getattr(lm_head, "bias", None) is not None:
             return False, "lm_head has a bias"
         n, k = weight.shape
@@ -350,9 +384,16 @@ class DraftNvfp4LMHead:
             raise ValueError(f"unsupported accumulator_chains={accumulator_chains}")
 
         device = weight.device
+        cuda = device.type == "cuda"
+        if cuda:
+            torch.accelerator.synchronize(device)
+            torch.accelerator.reset_peak_memory_stats(device)
+            allocated_before = torch.accelerator.memory_allocated(device)
+        started = time.perf_counter()
+
+        self._device = device
         self.rows = n
         self.hidden_size = k
-        self.rerank_k = rerank_k
         self.split_k = split_k
         self.accumulator_chains = accumulator_chains
         self.org_vocab_start_index = int(lm_head.shard_indices.org_vocab_start_index)
@@ -365,26 +406,83 @@ class DraftNvfp4LMHead:
         )
         self.codes, self.scales = _prepare_qpn2(packed, scales_e4m3)
         del packed, scales_e4m3
-        # Static output buffer: ``top_tokens`` is recorded inside CUDA graphs.
+        # Every per-call buffer is allocated here and only sliced afterwards:
+        # ``top_tokens`` is recorded inside CUDA graphs and stays
+        # allocation-free that way (the QPN8 rerank template does the same).
         self.out = torch.empty((MAX_ROWS, n), dtype=torch.float16, device=device)
-        if device.type == "cuda":
+        self._pair = torch.empty((MAX_ROWS, 2), dtype=torch.float32, device=device)
+        self.rerank_k = rerank_k  # property: allocates the candidate buffers
+
+        if cuda:
+            torch.accelerator.synchronize(device)
+        self.quantize_seconds = time.perf_counter() - started
+        self.peak_extra_bytes = (
+            torch.accelerator.max_memory_allocated(device) - allocated_before
+            if cuda
+            else 0
+        )
+        if cuda:
             torch.accelerator.empty_cache()
+            # Compile/launch every kernel of the path now (Triton rerank, topk,
+            # QPN2) so a problem surfaces as a load-time fallback and nothing
+            # is JIT-compiled inside CUDA graph capture. No collective here.
+            self.local_top_tokens(
+                torch.zeros((1, k), dtype=torch.float16, device=device)
+            )
+            torch.accelerator.synchronize(device)
         logger.info(
             "SM70 MTP draft NVFP4 lm_head active: rows=%d K=%d rerank_k=%d "
-            "split_k=%d chains=%d resident=%.1f MB",
+            "split_k=%d chains=%d quantize=%.2fs peak_extra=%.1f MB "
+            "resident=%.1f MB",
             n,
             k,
             rerank_k,
             split_k,
             accumulator_chains,
+            self.quantize_seconds,
+            self.peak_extra_bytes / 1e6,
             self.resident_bytes() / 1e6,
         )
 
-    def resident_bytes(self) -> int:
-        """Bytes held by the NVFP4 copy plus the static FP16 output buffer."""
-        return sum(
-            t.numel() * t.element_size() for t in (self.codes, self.scales, self.out)
+    @property
+    def rerank_k(self) -> int:
+        return self._rerank_k
+
+    @rerank_k.setter
+    def rerank_k(self, value: int) -> None:
+        """Change R (diagnostics only); reallocates the candidate buffers.
+
+        Never call this while a CUDA graph that uses the head is captured.
+        """
+        if value not in RERANK_K_CHOICES:
+            raise ValueError(f"rerank_k={value} not in {RERANK_K_CHOICES}")
+        self._rerank_k = value
+        if value == 0:
+            self._topk_values = self._topk_ids = self._exact = None
+            return
+        # Separate exactly-sized tensors (not column slices of a wider one):
+        # topk(out=...) and the Triton kernel need contiguous [M, R] rows.
+        device = self._device
+        self._topk_values = torch.empty(
+            (MAX_ROWS, value), dtype=torch.float16, device=device
         )
+        self._topk_ids = torch.empty(
+            (MAX_ROWS, value), dtype=torch.int64, device=device
+        )
+        self._exact = torch.empty((MAX_ROWS, value), dtype=torch.float32, device=device)
+
+    def resident_bytes(self) -> int:
+        """Bytes held by the NVFP4 copy and every preallocated buffer."""
+        tensors = (
+            self.codes,
+            self.scales,
+            self.out,
+            self._pair,
+            self._topk_values,
+            self._topk_ids,
+            self._exact,
+        )
+        return sum(t.numel() * t.element_size() for t in tensors if t is not None)
 
     def local_top_tokens(
         self, hidden_states: torch.Tensor
@@ -419,20 +517,21 @@ class DraftNvfp4LMHead:
         pad = self.num_org_vocab_padding
         if pad > 0:
             q[:, -pad:] = float("-inf")
-        r = self.rerank_k
+        r = self._rerank_k
         if r == 0:
             values, local_ids = q.max(dim=-1)
             return values.float(), local_ids + self.org_vocab_start_index
         # The rerank is permutation invariant, so skip sorting the candidates.
-        candidates = torch.topk(q, r, dim=-1, sorted=False).indices
-        rows = self.weight.index_select(0, candidates.reshape(-1))
-        # fp32 product of the gathered FP16 rows: at least as accurate as the
-        # FP16 GEMM the target uses.
-        exact = torch.bmm(
-            x.float().unsqueeze(1), rows.view(m, r, k).float().transpose(1, 2)
-        ).squeeze(1)
+        candidate_ids = self._topk_ids[:m]
+        torch.topk(
+            q, r, dim=-1, sorted=False, out=(self._topk_values[:m], candidate_ids)
+        )
+        # fp32 products against the FP16 rows: at least as accurate as the FP16
+        # GEMM the target uses.
+        exact = self._exact[:m]
+        _exact_candidate_logits(x, self.weight, candidate_ids, exact)
         values, best = exact.max(dim=-1)
-        local_ids = candidates.gather(1, best.unsqueeze(1)).squeeze(1)
+        local_ids = candidate_ids.gather(1, best.unsqueeze(1)).squeeze(1)
         return values, local_ids + self.org_vocab_start_index
 
     def top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -443,8 +542,10 @@ class DraftNvfp4LMHead:
             return global_ids
         # Same reduction as LogitsProcessor.get_top_tokens: fp32 (value, id)
         # pairs are exact for ids below 2**24.
-        local_pair = torch.stack([local_values.float(), global_ids.float()], dim=-1)
-        gathered = tensor_model_parallel_all_gather(local_pair, dim=-1)
+        pair = self._pair[: hidden_states.shape[0]]
+        pair[:, 0] = local_values
+        pair[:, 1] = global_ids
+        gathered = tensor_model_parallel_all_gather(pair, dim=-1)
         gathered = gathered.view(hidden_states.shape[0], tp_size, 2)
         winner = gathered[:, :, 0].argmax(dim=-1, keepdim=True)
         tokens = gathered[:, :, 1].gather(dim=-1, index=winner)
