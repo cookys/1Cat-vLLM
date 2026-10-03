@@ -781,3 +781,99 @@ def test_speculator_routes_through_the_draft_head(monkeypatch):
     stub._draft_nvfp4_head = None
     stub.use_local_argmax_reduction = False
     assert sample(stub, hidden, None, None, None, None).tolist() == [1]
+
+
+# --------------------------------------------------------------------------
+# real hidden-state dump (VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_DIR)
+# --------------------------------------------------------------------------
+def _dumper(tmp_path, steps=3):
+    from vllm.v1.worker.gpu.spec_decode.eagle.draft_hidden_dump import DraftHiddenDumper
+
+    return DraftHiddenDumper(str(tmp_path), steps)
+
+
+def test_dumper_saves_the_first_n_nonzero_batches(tmp_path):
+    dumper = _dumper(tmp_path, steps=3)
+    batches = [torch.zeros(2, 8).half()] + [
+        _hidden(m, k=8, seed=m) for m in (1, 4, 2, 3)
+    ]
+    for i, batch in enumerate(batches):
+        dumper.maybe_dump(batch, torch.tensor(i % 4))
+    files = sorted(p.name for p in tmp_path.iterdir())
+    assert files == [f"rank0_step{n:05d}.pt" for n in range(3)]  # no .tmp left
+    assert dumper.saved == 3 and dumper.skipped_zero == 1
+    first = torch.load(tmp_path / files[0])
+    assert torch.equal(first["hidden"], batches[1])
+    assert (
+        first["hidden"].dtype == torch.float16 and first["hidden"].device.type == "cpu"
+    )
+    assert (first["n"], first["rank"], first["rows"]) == (0, 0, 1)
+    assert first["current_draft_step"] == 1
+    assert torch.equal(torch.load(tmp_path / files[2])["hidden"], batches[3])
+
+
+def test_dumper_names_files_by_tp_rank(tmp_path, monkeypatch):
+    from vllm.v1.worker.gpu.spec_decode.eagle import draft_hidden_dump as dump
+
+    monkeypatch.setattr(dump, "_tp_rank", lambda: 3)
+    _dumper(tmp_path).maybe_dump(_hidden(2, k=8), 2)
+    assert [p.name for p in tmp_path.iterdir()] == ["rank3_step00000.pt"]
+
+
+def test_dumper_does_nothing_during_graph_capture(tmp_path, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    dumper = _dumper(tmp_path)
+    dumper.maybe_dump(_hidden(2, k=8), 0)
+    assert dumper.saved == 0 and list(tmp_path.iterdir()) == []
+
+
+def test_dumper_env_gating(tmp_path, monkeypatch):
+    from vllm.v1.worker.gpu.spec_decode.eagle.draft_hidden_dump import (
+        maybe_create_draft_hidden_dumper,
+    )
+
+    envs.disable_envs_cache()
+    for name in (
+        "VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_DIR",
+        "VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_STEPS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    assert envs.VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_DIR is None
+    assert envs.VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_STEPS == 256
+    assert maybe_create_draft_hidden_dumper() is None
+    target = tmp_path / "dump"
+    monkeypatch.setenv("VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_DIR", str(target))
+    monkeypatch.setenv("VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_STEPS", "5")
+    dumper = maybe_create_draft_hidden_dumper()
+    assert dumper is not None and dumper.max_batches == 5 and target.is_dir()
+    monkeypatch.setenv("VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_STEPS", "0")
+    assert maybe_create_draft_hidden_dumper() is None
+
+
+def test_speculator_calls_the_dumper_first_and_only_when_set():
+    from vllm.v1.worker.gpu.spec_decode.eagle import speculator as spec
+
+    order = []
+    dumper = SimpleNamespace(
+        maybe_dump=lambda h, step: order.append(("dump", tuple(h.shape), step))
+    )
+    head = SimpleNamespace(
+        top_tokens=lambda h: order.append("head") or torch.tensor([9])
+    )
+    _, stub = _speculator_stub(head)
+    stub._draft_hidden_dump = dumper
+    hidden, step = torch.zeros(3, 8), torch.tensor(2)
+    assert spec.EagleSpeculator._sample_draft(
+        stub, hidden, None, None, step, None
+    ).tolist() == [9]
+    assert order == [("dump", (3, 8), step), "head"]
+    # the dump also sees batches the NVFP4 head does not serve (> 64 rows)
+    order.clear()
+    spec.EagleSpeculator._sample_draft(stub, torch.zeros(65, 8), None, None, step, None)
+    assert order == [("dump", (65, 8), step)]
+    # unset -> no dumper is consulted
+    stub._draft_hidden_dump = None
+    order.clear()
+    spec.EagleSpeculator._sample_draft(stub, hidden, None, None, step, None)
+    assert order == ["head"]

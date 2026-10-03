@@ -447,6 +447,8 @@ if TYPE_CHECKING:
     VLLM_SM70_TOPK_TOPP_BRANCHFREE: int = 0
     VLLM_SM70_MTP_DRAFT_NVFP4_LM_HEAD: bool = False
     VLLM_SM70_MTP_DRAFT_NVFP4_RERANK_K: int = 64
+    VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_DIR: str | None = None
+    VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_STEPS: int = 256
     VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH: int = 0
     VLLM_SM70_ASYNC_STAGED_INPUT_PREP: bool = False
     VLLM_SM70_ASYNC_CPU_TRACE: bool = False
@@ -6234,6 +6236,45 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="experimental",
         declared_default="64",
         effective_default="64",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+    ),
+    # Diagnostic dump of the hidden states fed to EagleSpeculator._sample_draft,
+    # the real inputs of the draft lm_head (see draft_hidden_dump.py).
+    "VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_DIR": env_var(
+        lambda: os.getenv("VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_DIR"),
+        description=(
+            "Diagnostic: directory where the V2 EagleSpeculator saves the "
+            "real hidden states it feeds to _sample_draft, one file per "
+            "batch named rank{tp_rank}_step{n:05d}.pt (a dict with a CPU "
+            "float16 hidden tensor [rows, hidden] plus n, rank, rows and "
+            "current_draft_step). Unset (default) means no dumper exists and "
+            "the draft path pays one attribute check. The copy to the host "
+            "synchronizes, so use it only for diagnostics, and run it with "
+            "CUDA graphs disabled for the drafter: _sample_draft is recorded "
+            "inside the FULL draft graphs and a replay does not run it. "
+            "All-zero warmup batches are skipped and nothing is written "
+            "during graph capture. Feed the directory to benchmarks/"
+            "sm70_draft_nvfp4_lm_head_check.py --hidden-dump."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+    ),
+    "VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_STEPS": env_var(
+        lambda: int(os.getenv("VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_STEPS", "256")),
+        description=(
+            "Number of non-zero hidden-state batches that "
+            "VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_DIR saves per rank before the "
+            "dumper goes quiet. Each draft step of each round is one batch "
+            "of at most num_reqs rows, so 256 covers about 64 rounds of a "
+            "4-step draft. Values of 0 or less disable the dump."
+        ),
+        category="debug",
+        declared_default="256",
+        effective_default="256",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
     ),

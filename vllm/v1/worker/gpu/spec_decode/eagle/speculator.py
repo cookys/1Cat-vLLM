@@ -36,6 +36,10 @@ from vllm.v1.worker.gpu.spec_decode.eagle.cudagraph import (
     DecodeEagleCudaGraphManager,
     PrefillEagleCudaGraphManager,
 )
+from vllm.v1.worker.gpu.spec_decode.eagle.draft_hidden_dump import (
+    DraftHiddenDumper,
+    maybe_create_draft_hidden_dumper,
+)
 from vllm.v1.worker.gpu.spec_decode.eagle.draft_nvfp4_lm_head import (
     DraftNvfp4LMHead,
     build_draft_nvfp4_lm_head,
@@ -153,6 +157,11 @@ class EagleSpeculator:
         # Draft-only NVFP4 lm_head (VLLM_SM70_MTP_DRAFT_NVFP4_LM_HEAD); built
         # in load_model once the draft's lm_head is final.
         self._draft_nvfp4_head: DraftNvfp4LMHead | None = None
+        # Diagnostic dump of the real draft hidden states
+        # (VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_DIR); None unless the env is set.
+        self._draft_hidden_dump: DraftHiddenDumper | None = (
+            maybe_create_draft_hidden_dumper()
+        )
 
         self.prefill_cudagraph_manager: PrefillEagleCudaGraphManager | None = None
         self.decode_cudagraph_manager: DecodeEagleCudaGraphManager | None = None
@@ -383,6 +392,8 @@ class EagleSpeculator:
         draft_step: torch.Tensor,
         draft_logits: torch.Tensor | None,
     ) -> torch.Tensor:
+        if self._draft_hidden_dump is not None:
+            self._draft_hidden_dump.maybe_dump(hidden_states, draft_step)
         if (
             draft_logits is None
             and self._draft_nvfp4_head is not None
