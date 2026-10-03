@@ -4,7 +4,8 @@
 
 No device allocation/copy or sampling operation belongs here. The align
 allocator already preserves a boundary state when the next chunk moves to a
-new block. We retain one additional boundary and certify the existing blocks.
+new block. For warm producers we retain one additional boundary and certify
+the existing blocks. Cold producers keep the ordinary scheduler's chunking.
 Certificates are deliberately unavailable until the producer finishes normally.
 """
 
@@ -27,6 +28,12 @@ class MTPPrefixCertificate:
     # One object shared by the terminal block of EVERY cache group. Identity
     # couples the groups and is a generation token, including same-hash reuse.
     committed: bool = False
+
+
+@dataclass(slots=True)
+class MTPPrefixAdmission:
+    baseline_tokens: int
+    scheduled: bool = False
 
 
 def eligible_request(request: Request) -> bool:
@@ -53,8 +60,44 @@ class MTPPrefixSnapshots:
         self.telemetry = telemetry
         self.cacheable_group_ids = cacheable_group_ids
         self.pending: dict[str, list[MTPPrefixCertificate]] = {}
+        self.admissions: dict[str, MTPPrefixAdmission] = {}
         self.lookup_hits = 0
         self.lookup_saved_tokens = 0
+
+    def observe_lookup(self, request: Request, baseline_tokens: int) -> None:
+        """Track ordinary usable hits, before the candidate no-drop lookup.
+
+        A waiting request can fail allocation and retry after cache eviction.
+        Replace its provisional decision on each lookup until it is scheduled.
+        A cold request never becomes warm merely by completing its first chunk.
+        """
+        current = self.admissions.get(request.request_id)
+        if current is None or not current.scheduled:
+            self.admissions[request.request_id] = MTPPrefixAdmission(
+                baseline_tokens
+                if eligible_request(request) and not request.skip_reading_prefix_cache
+                else 0
+            )
+
+    def admit(self, request: Request) -> bool:
+        """Freeze only after successful allocation; report the first admission."""
+        admission = self.admissions.get(request.request_id)
+        if admission is None:
+            admission = MTPPrefixAdmission(0)
+            self.admissions[request.request_id] = admission
+        if admission.scheduled:
+            return False
+        admission.scheduled = True
+        return True
+
+    def is_warm_producer(self, request: Request) -> bool:
+        admission = self.admissions.get(request.request_id)
+        return bool(
+            admission is not None
+            and admission.baseline_tokens > 0
+            and eligible_request(request)
+            and not request.skip_reading_prefix_cache
+        )
 
     def pool_stats(self, pool) -> tuple[int, int, int]:
         """Diagnostic only: ordinary eviction owns these blocks, no private pin."""
@@ -65,7 +108,7 @@ class MTPPrefixSnapshots:
         )
 
     def extra_boundaries(self, request: Request) -> tuple[int, ...]:
-        if not eligible_request(request):
+        if not self.is_warm_producer(request):
             return ()
         # Strictly inside the original prompt: token[B] must be known, and a
         # later target prefill must execute before the producer's final output.
@@ -79,7 +122,8 @@ class MTPPrefixSnapshots:
         managers: Sequence[SingleTypeKVCacheManager],
     ) -> bool:
         if not (
-            eligible_request(request)
+            self.is_warm_producer(request)
+            and self.admissions[request.request_id].scheduled
             and request.num_output_tokens == 0
             and request.num_output_placeholders == 0
             and request.num_computed_tokens < end < request.num_prompt_tokens
@@ -112,6 +156,7 @@ class MTPPrefixSnapshots:
         return True
 
     def finish(self, request_id: str, *, publish: bool) -> int:
+        self.admissions.pop(request_id, None)
         certificates = self.pending.pop(request_id, ())
         if publish:
             for certificate in certificates:

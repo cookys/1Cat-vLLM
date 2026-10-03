@@ -339,7 +339,7 @@ class Scheduler(SchedulerInterface):
             snapshots.telemetry = envs.VLLM_SM70_MTP_COMMITTED_PREFIX_CACHE_LOG
             coordinator.mtp_prefix_snapshots = snapshots
             logger.info(
-                "MTP_COMMITTED_PREFIX enabled: sync scheduling, "
+                "MTP_COMMITTED_PREFIX enabled: policy=warm_v2, sync scheduling, "
                 "completed true-prefill only; "
                 "alignment=%d, MTP next-token guard, all-group certificates; "
                 "state-vs-recompute bit equality requires GPU validation",
@@ -1408,12 +1408,14 @@ class Scheduler(SchedulerInterface):
                 if start < prompt_end:
                     logger.info(
                         "MTP_COMMITTED_PREFIX scheduled request=%s "
-                        "prompt_tokens=%d start=%d end=%d prefill_tokens=%d",
+                        "prompt_tokens=%d start=%d end=%d prefill_tokens=%d "
+                        "warm_producer=%s",
                         req_id,
                         request.num_prompt_tokens,
                         start,
                         prompt_end,
                         prompt_end - start,
+                        snapshots.is_warm_producer(request),
                     )
             request.num_computed_tokens += num_scheduled_token
             request.num_in_flight_tokens += num_scheduled_token

@@ -69,7 +69,7 @@ def swe_proxy(paths, alignment):
 
 
 def log_accounting(paths):
-    lookups, finishes = [], []
+    lookups, finishes, admissions = [], [], []
     scheduled = collections.Counter()
     for path in paths:
         for line in path.read_text(errors="replace").splitlines():
@@ -90,6 +90,8 @@ def log_accounting(paths):
                 lookups.append(fields)
             elif "MTP_COMMITTED_PREFIX finish " in line:
                 finishes.append(fields)
+            elif "MTP_COMMITTED_PREFIX admit " in line:
+                admissions.append(fields)
             elif "MTP_COMMITTED_PREFIX scheduled " in line:
                 scheduled[fields["request"]] += int(fields["prefill_tokens"])
     # Scheduling retries are separate observations, not necessarily executed
@@ -100,6 +102,15 @@ def log_accounting(paths):
     completed = {row["request"] for row in finishes if row["publish"] == "True"}
     return {
         "lookup_attempts": len(lookups),
+        # Unlike lookup intent, admission records require successful allocation.
+        # A preempted/resumed request can have more than one admission.
+        "admissions": len(admissions),
+        "warm_producer_admissions": sum(
+            row["warm_producer"] == "True" for row in admissions
+        ),
+        "non_warm_admissions": sum(
+            row["warm_producer"] == "False" for row in admissions
+        ),
         "unique_requests": len(rows),
         "last_lookup_hit_requests": hits,
         "last_lookup_hit_fraction": hits / len(rows) if rows else None,
@@ -132,6 +143,9 @@ def log_accounting(paths):
             "forward executed. Scheduled counters cover actual scheduler outputs; "
             "the normal-finished subset excludes aborts (but includes recomputation "
             "after any preemption). Logs must cover each entire request. "
+            "Warm means an ordinary usable prefix hit at first successful "
+            "allocation, including a shared system prompt. Admission counters "
+            "require warm_v2 logs (absent in v1 logs); resumed admissions count again. "
             "Exclusive blocks count extra Mamba blocks, not all certificate blocks."
         ),
     }
