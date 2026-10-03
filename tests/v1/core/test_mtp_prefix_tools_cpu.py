@@ -25,6 +25,24 @@ PROBE = load("benchmarks/benchmark_mtp_committed_prefix.py")
 
 
 class ToolTests(unittest.TestCase):
+    def test_bootstrap_resends_preserve_legacy_prompts_and_order(self):
+        legacy = list(PROBE.cases([10, 11, 12], 32, 7))
+        boot = list(PROBE.cases([10, 11, 12], 32, 7, bootstrap_resends=True))
+        self.assertEqual(len(legacy), 20)  # Each runs greedy and sampled.
+        self.assertEqual(len(boot), 28)
+        self.assertEqual(
+            [row for row in boot if not row[0].endswith(("-warm", "-hit"))], legacy
+        )
+        names = [name for name, _, _ in boot]
+        prompts = {name: tokens for name, _, tokens in boot}
+        for multiplier in (2, 10):
+            for family in ("a", "b"):
+                p = f"m{multiplier}-{family}-producer"
+                self.assertEqual(prompts[p], prompts[p + "-warm"])
+                self.assertEqual(prompts[p], prompts[p + "-hit"])
+                self.assertLess(names.index(p), names.index(p + "-warm"))
+                self.assertLess(names.index(p + "-warm"), names.index(p + "-hit"))
+
     def test_compare_rejects_partial_record_and_logprob_drift(self):
         record = {
             "complete": True,
@@ -109,6 +127,50 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(result["scheduled_prefill_tokens"], 22)
         self.assertEqual(result["normal_finished_scheduled_prefill_tokens"], 11)
         self.assertEqual(result["published_certificates"], 1)
+        self.assertEqual(result["admissions"], 0)  # v1 log compatibility.
+
+    def test_warm_admissions_require_success_not_lookup_intent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "server.log"
+            path.write_text(
+                "\n".join(
+                    [
+                        (
+                            "MTP_COMMITTED_PREFIX lookup request=r prompt_tokens=43 "
+                            "baseline_tokens=16 hit_tokens=16 saved_tokens=0 "
+                            "exclusive_blocks=0 evicted_blocks=0 free_blocks=0 "
+                            "warm_producer=True"
+                        ),
+                        (
+                            "MTP_COMMITTED_PREFIX lookup request=r prompt_tokens=43 "
+                            "baseline_tokens=0 hit_tokens=0 saved_tokens=0 "
+                            "exclusive_blocks=0 evicted_blocks=2 free_blocks=99 "
+                            "warm_producer=False"
+                        ),
+                        (
+                            "MTP_COMMITTED_PREFIX admit request=r baseline_tokens=0 "
+                            "warm_producer=False"
+                        ),
+                        (
+                            "MTP_COMMITTED_PREFIX admit request=warm "
+                            "baseline_tokens=16 warm_producer=True"
+                        ),
+                        (
+                            "MTP_COMMITTED_PREFIX scheduled request=warm "
+                            "prefill_tokens=16 warm_producer=True"
+                        ),
+                        (
+                            "MTP_COMMITTED_PREFIX scheduled request=warm "
+                            "prefill_tokens=11 warm_producer=True"
+                        ),
+                    ]
+                )
+            )
+            result = ANALYZE.log_accounting([path])
+        self.assertEqual(result["lookup_attempts"], 2)
+        self.assertEqual(result["admissions"], 2)
+        self.assertEqual(result["warm_producer_admissions"], 1)
+        self.assertEqual(result["non_warm_admissions"], 1)
 
     def test_streamed_numeric_ids_and_first_token(self):
         events = [

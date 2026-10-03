@@ -66,7 +66,7 @@ def completion(base, body):
     }
 
 
-def cases(vocab, alignment, seed):
+def cases(vocab, alignment, seed, *, bootstrap_resends=False):
     """A/B interleaving exercises slot reuse; changed token[B] must miss B."""
     rng = random.Random(seed)
     for multiplier in (2, 10):
@@ -74,6 +74,12 @@ def cases(vocab, alignment, seed):
         prompts = {key: rng.choices(vocab, k=size) for key in ("a", "b")}
         for key in prompts:
             yield f"m{multiplier}-{key}-producer", key, prompts[key]
+        if bootstrap_resends:
+            # V2 needs an ordinary warm hit to create its first certificate.
+            # Keep the default 40-case order unchanged for historical comparisons.
+            for phase in ("warm", "hit"):
+                for key in prompts:
+                    yield f"m{multiplier}-{key}-producer-{phase}", key, prompts[key]
         for append in (1024, 2048, 4096):
             for key in prompts:
                 prompt = prompts[key] + rng.choices(vocab, k=append)
@@ -114,6 +120,11 @@ def main():
     parser.add_argument("--alignment", type=int, default=1616)
     parser.add_argument("--seed", type=int, default=20261003)
     parser.add_argument("--max-tokens", type=int, default=64)
+    parser.add_argument(
+        "--bootstrap-resends",
+        action="store_true",
+        help="Add warm producer and certified-hit resends (56 cases instead of 40).",
+    )
     parser.add_argument("--label")
     parser.add_argument("--out", type=Path)
     parser.add_argument("--compare", nargs=2, type=Path)
@@ -140,12 +151,15 @@ def main():
         "alignment": args.alignment,
         "seed": args.seed,
         "max_tokens": args.max_tokens,
+        "bootstrap_resends": args.bootstrap_resends,
         "complete": False,
         "cases": {},
     }
     run_salt = f"committed-prefix-{args.label}-{time.time_ns()}"
     for sampling in ("greedy", "sampled"):
-        for name, family, prompt in cases(vocab, args.alignment, args.seed):
+        for name, family, prompt in cases(
+            vocab, args.alignment, args.seed, bootstrap_resends=args.bootstrap_resends
+        ):
             name = f"{sampling}-{name}"
             body = {
                 "model": args.model,

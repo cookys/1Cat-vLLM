@@ -65,12 +65,20 @@ class EnvImportTests(unittest.TestCase):
                 assert isinstance(registration, EnvVar), name
                 metadata = registration.metadata
                 assert metadata.description
-                assert metadata.declared_default == "False"
+                assert metadata.declared_default == "0"
                 assert metadata.effective_default == "False"
                 assert metadata.automatic_conditions == ()
                 assert metadata.acceleration_paths
             assert e.environment_variables[names[0]].metadata.category == "experimental"
             assert e.environment_variables[names[1]].metadata.category == "debug"
+            description = e.environment_variables[names[0]].metadata.description
+            assert "Warm-producer policy" in description
+            # The integration base must keep both production features available.
+            for name in (
+                "VLLM_SM70_SAMPLING_CUDAGRAPH",
+                "VLLM_QWEN4EXP_PLE_PREFILL_LOW_MEMORY",
+            ):
+                assert name in e.environment_variables, name
         """)
 
     def test_real_getters_validate_values(self):

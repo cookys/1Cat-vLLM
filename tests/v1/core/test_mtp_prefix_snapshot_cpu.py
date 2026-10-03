@@ -198,10 +198,11 @@ def load_runtime():
     )
     extract(
         "vllm/v1/core/kv_cache_manager.py",
-        set(),
+        {"KVCacheBlocks"},
         [
             ("KVCacheManager", "free", "free_request"),
             ("KVCacheManager", "get_computed_blocks", "get_computed_blocks"),
+            ("KVCacheManager", "allocate_slots", "allocate_slots"),
         ],
     )
     ns["torch"] = torch
@@ -277,6 +278,12 @@ def coordinator(enabled=True, blocks=600, *, rings=False):
 
 
 def prefill(c, r, *, finish="stop", budget=64):
+    # Certificate/eviction fixtures below explicitly represent an already-warm
+    # producer. Admission integration tests use run_request instead; those call
+    # the real public lookup and allocator and never inject a warm decision.
+    if c.mtp_prefix_snapshots is not None:
+        c.mtp_prefix_snapshots.observe_lookup(r, 16)
+        c.mtp_prefix_snapshots.admit(r)
     scheduler = types.SimpleNamespace(
         use_eagle=True,
         mamba_state_block_size=16,
@@ -310,6 +317,267 @@ def lookup(c, r):
     if c.mtp_prefix_snapshots is None:
         return baseline, baseline
     return baseline, c.find_committed_prefix_hit(r, baseline[1]) or baseline
+
+
+def cache_manager(c):
+    manager = types.SimpleNamespace(
+        coordinator=c,
+        block_pool=c.block_pool,
+        enable_caching=True,
+        log_stats=False,
+        max_model_len=256,
+        empty_kv_cache_blocks=NS["KVCacheBlocks"](
+            tuple(() for _ in c.single_type_managers)
+        ),
+        create_kv_cache_blocks=NS["KVCacheBlocks"],
+    )
+    for method in ("get_computed_blocks", "allocate_slots", "free_request"):
+        setattr(manager, method, types.MethodType(NS[method], manager))
+    return manager
+
+
+def splitter(c):
+    return types.SimpleNamespace(
+        use_eagle=True,
+        mamba_state_block_size=16,
+        cache_config=types.SimpleNamespace(block_size=8),
+        mamba_state_retention_interval=0,
+        mamba_dense_boundaries_on_contention=False,
+        kv_cache_manager=cache_manager(c),
+    )
+
+
+def run_request(c, r, *, budget=64, finish="stop"):
+    """Real lookup -> split -> allocate -> cache -> free, ordinary warmup."""
+    scheduler = splitter(c)
+    manager = scheduler.kv_cache_manager
+    cached, hit = manager.get_computed_blocks(r)
+    initial_hit = hit
+    ends = []
+    while r.num_computed_tokens < r.num_prompt_tokens:
+        c.new_step_starts()
+        n = NS["split_chunk"](
+            scheduler,
+            r,
+            min(budget, r.num_prompt_tokens - r.num_computed_tokens - hit),
+            hit,
+        )
+        assert n > 0
+        allocated = manager.allocate_slots(r, n, hit, cached, num_lookahead_tokens=4)
+        assert allocated is not None
+        r.num_computed_tokens += hit + n
+        ends.append(r.num_computed_tokens)
+        cached, hit = None, 0
+    if finish is not None:
+        r.status = finish
+        manager.free_request(r)
+    return initial_hit, ends
+
+
+class WarmAdmissionTests(unittest.TestCase):
+    def test_cold_on_off_chunking_and_blocks_match(self):
+        for size in (15, 16, 17, 31, 32, 33, 43, 64, 65, 127, 161):
+            for budget in (8, 16, 33, 64):
+                with self.subTest(size=size, budget=budget):
+                    off, on = coordinator(False), coordinator()
+                    tokens = list(range(size))
+                    expected = run_request(off, Request("cold", tokens), budget=budget)
+                    actual = run_request(on, Request("cold", tokens), budget=budget)
+                    self.assertEqual(actual, expected)
+                    policy = on.mtp_prefix_snapshots
+                    self.assertEqual(policy.admissions, {})
+                    self.assertEqual(policy.pending, {})
+                    self.assertFalse(
+                        any(b.mtp_prefix_certificate for b in on.block_pool.blocks)
+                    )
+                    self.assertEqual(policy.pool_stats(on.block_pool)[0], 0)
+
+                    # Include physical block assignments / cache hashes, not only
+                    # chunk lengths. Host policy must not allocate an extra page.
+                    def layout(c):
+                        return [
+                            (b.block_id, b.block_hash, b.ref_cnt)
+                            for b in c.block_pool.blocks
+                        ]
+
+                    self.assertEqual(layout(on), layout(off))
+
+    def test_three_requests_bootstrap_cold_warm_certified(self):
+        c = coordinator()
+        tokens = list(range(43))
+        self.assertEqual(run_request(c, Request("cold", tokens)), (0, [16, 43]))
+        self.assertEqual(run_request(c, Request("warm", tokens)), (16, [32, 43]))
+        self.assertEqual(run_request(c, Request("hit", tokens)), (32, [43]))
+        self.assertEqual(c.mtp_prefix_snapshots.lookup_saved_tokens, 16)
+        self.assertEqual(c.mtp_prefix_snapshots.admissions, {})
+
+    def test_warm_append_can_exceed_one_page(self):
+        c = coordinator()
+        run_request(c, Request("cold", list(range(43))))
+        warm = Request("warm-long-append", list(range(101)))
+        hit, ends = run_request(c, warm)
+        self.assertEqual(hit, 16)
+        self.assertIn(96, ends)
+        self.assertEqual(lookup(c, Request("next", list(range(105))))[1][1], 96)
+
+    def test_failed_admission_then_eviction_reclassifies_cold(self):
+        for reserve_full in (False, True):
+            with self.subTest(reserve_full=reserve_full):
+                c = coordinator()
+                run_request(c, Request("seed", list(range(43))))
+                r = Request("waiting", list(range(43)))
+                manager = cache_manager(c)
+                cached, hit = manager.get_computed_blocks(r)
+                self.assertEqual(hit, 16)
+                # Keep cached pages visible but consume all free capacity. No
+                # allocator mock: touching them changes the real refcounts.
+                pressure = [b for b in c.block_pool.blocks if not b.is_null]
+                c.block_pool.touch(pressure)
+                c.new_step_starts()
+                self.assertIsNone(
+                    manager.allocate_slots(
+                        r,
+                        16,
+                        hit,
+                        cached,
+                        num_lookahead_tokens=4,
+                        full_sequence_must_fit=reserve_full,
+                    )
+                )
+                self.assertFalse(
+                    c.mtp_prefix_snapshots.admissions[r.request_id].scheduled
+                )
+                c.block_pool.free_blocks(pressure)
+                evict = c.block_pool.get_new_blocks(c.block_pool.get_num_free_blocks())
+                c.block_pool.free_blocks(evict)
+                self.assertEqual(run_request(c, r), (0, [16, 43]))
+                self.assertEqual(c.mtp_prefix_snapshots.pending, {})
+
+    def test_retry_can_become_warm_but_scheduled_cold_cannot(self):
+        c = coordinator()
+        r = Request("waiting", list(range(43)))
+        manager = cache_manager(c)
+        self.assertEqual(manager.get_computed_blocks(r)[1], 0)
+        run_request(c, Request("seed", list(range(43))))
+        self.assertEqual(run_request(c, r), (16, [32, 43]))
+        cold = Request("other", list(range(99, 142)))
+        manager.get_computed_blocks(cold)
+        c.new_step_starts()
+        self.assertIsNotNone(manager.allocate_slots(cold, 16, num_lookahead_tokens=4))
+        cold.num_computed_tokens = 16
+        policy = c.mtp_prefix_snapshots
+        # Later hits / computed progress cannot promote this request.
+        policy.observe_lookup(cold, 32)
+        self.assertFalse(policy.is_warm_producer(cold))
+        self.assertEqual(policy.extra_boundaries(cold), ())
+        cold.status = "abort"
+        manager.free_request(cold)
+
+    def test_finish_abort_preempt_clear_admission_and_id_reuse(self):
+        for status in ("stop", "length", "abort", "error", "running", "ignored"):
+            with self.subTest(status=status):
+                c = coordinator()
+                run_request(c, Request("seed", list(range(43))))
+                r = Request("reused", list(range(43)))
+                run_request(c, r, finish=status)
+                policy = c.mtp_prefix_snapshots
+                self.assertNotIn(r.request_id, policy.admissions)
+                self.assertNotIn(r.request_id, policy.pending)
+                other = Request(r.request_id, list(range(99, 142)))
+                self.assertEqual(run_request(c, other), (0, [16, 43]))
+        c = coordinator()
+        run_request(c, Request("seed", list(range(43))))
+        r = Request("preempted", list(range(43)))
+        r.num_preemptions = 1
+        off = coordinator(False)
+        run_request(off, Request("seed", list(range(43))))
+        control = Request("preempted", list(range(43)))
+        control.num_preemptions = 1
+        self.assertEqual(run_request(c, r), run_request(off, control))
+        self.assertFalse(any(b.mtp_prefix_certificate for b in c.block_pool.blocks))
+
+    def test_skip_read_and_candidate_only_are_not_warm_producers(self):
+        c = coordinator()
+        for name in ("seed", "warm"):
+            run_request(c, Request(name, list(range(43))))
+        r = Request("skip", list(range(43)))
+        r.skip_reading_prefix_cache = True
+        self.assertEqual(run_request(c, r), (0, [16, 43]))
+        # A certificate can remain when an older legacy state is evicted.
+        # Candidate lookup remains valid, but does not bootstrap producer status.
+        c = coordinator()
+        for name in ("seed", "warm"):
+            run_request(c, Request(name, list(range(43))))
+        for block in c.block_pool.blocks:
+            if (
+                block.block_hash is not None
+                and not block.mtp_prefix_only
+                and block.mtp_prefix_certificate is None
+                and block.block_hash[-4:] in (b"\x00\x00\x00\x02", b"\x00\x00\x00\x03")
+            ):
+                c.block_pool._maybe_evict_cached_block(block)
+        r = Request("candidate-only", list(range(61)))
+        manager = cache_manager(c)
+        _, hit = manager.get_computed_blocks(r)
+        self.assertEqual(hit, 32)
+        self.assertEqual(
+            c.mtp_prefix_snapshots.admissions[r.request_id].baseline_tokens, 0
+        )
+        self.assertFalse(c.mtp_prefix_snapshots.is_warm_producer(r))
+        self.assertEqual(run_request(c, r), (32, [61]))
+
+    def test_cold_production_geometry_ignores_later_progress(self):
+        for length in (1615, 1616, 3249, 16177, 65553):
+            for budget in (8192, 16384):
+                traces = []
+                for enabled in (False, True):
+                    c = coordinator(enabled)
+                    scheduler = splitter(c)
+                    scheduler.mamba_state_block_size = 1616
+                    r = Request("cold", [1])
+                    r.num_tokens = r.num_prompt_tokens = length
+                    if enabled:
+                        c.mtp_prefix_snapshots.alignment = 1616
+                        c.mtp_prefix_snapshots.observe_lookup(r, 0)
+                    ends = []
+                    while r.num_computed_tokens < length:
+                        n = NS["split_chunk"](
+                            scheduler, r, min(budget, length - r.num_computed_tokens)
+                        )
+                        self.assertGreater(n, 0)
+                        if enabled:
+                            c.mtp_prefix_snapshots.admit(r)
+                        r.num_computed_tokens += n
+                        ends.append(r.num_computed_tokens)
+                    traces.append(ends)
+                with self.subTest(length=length, budget=budget):
+                    self.assertEqual(*traces)
+                if length == 16177 and budget == 8192:
+                    self.assertEqual(traces[1], [8080, 14544, 16177])
+
+    def test_cold_and_warm_decisions_stay_request_local(self):
+        c = coordinator()
+        run_request(c, Request("seed", list(range(43))))
+        manager = cache_manager(c)
+        cold = Request("cold", list(range(99, 142)))
+        warm = Request("warm", list(range(43)))
+        _, cold_hit = manager.get_computed_blocks(cold)
+        cached, warm_hit = manager.get_computed_blocks(warm)
+        self.assertEqual((cold_hit, warm_hit), (0, 16))
+        c.new_step_starts()
+        self.assertIsNotNone(
+            manager.allocate_slots(warm, 16, warm_hit, cached, num_lookahead_tokens=4)
+        )
+        self.assertIsNotNone(manager.allocate_slots(cold, 16, num_lookahead_tokens=4))
+        warm.num_computed_tokens, cold.num_computed_tokens = 32, 16
+        policy = c.mtp_prefix_snapshots
+        self.assertTrue(policy.is_warm_producer(warm))
+        self.assertFalse(policy.is_warm_producer(cold))
+        self.assertEqual(policy.extra_boundaries(cold), ())
+        for r in (warm, cold):
+            r.status = "abort"
+            manager.free_request(r)
+        self.assertEqual(policy.admissions, {})
 
 
 class SnapshotTests(unittest.TestCase):
@@ -559,6 +827,8 @@ class SnapshotTests(unittest.TestCase):
             with self.subTest(changes=changes):
                 c = coordinator()
                 r = Request("p", list(range(43)))
+                c.mtp_prefix_snapshots.observe_lookup(r, 16)
+                c.mtp_prefix_snapshots.admit(r)
                 for k, v in changes.items():
                     setattr(r, k, v)
                 self.assertFalse(

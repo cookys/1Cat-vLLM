@@ -217,6 +217,9 @@ class KVCacheManager:
         # or calls a pooling model with all pooling).
         request.shared_prefix_boundary = 0
         if not self.enable_caching or request.skip_reading_prefix_cache:
+            snapshots = self.coordinator.mtp_prefix_snapshots
+            if snapshots is not None:
+                snapshots.observe_lookup(request, 0)
             return self.empty_kv_cache_blocks, 0
 
         # NOTE: When all tokens hit the cache, we must recompute the last token
@@ -235,6 +238,7 @@ class KVCacheManager:
         snapshots = self.coordinator.mtp_prefix_snapshots
         if snapshots is not None:
             baseline_tokens = num_new_computed_tokens
+            snapshots.observe_lookup(request, baseline_tokens)
             candidate = self.coordinator.find_committed_prefix_hit(
                 request, baseline_tokens
             )
@@ -250,7 +254,7 @@ class KVCacheManager:
                     "MTP_COMMITTED_PREFIX lookup request=%s prompt_tokens=%d "
                     "baseline_tokens=%d hit_tokens=%d saved_tokens=%d "
                     "exclusive_blocks=%d evicted_blocks=%d free_blocks=%d "
-                    "lookup_hits=%d total_saved_tokens=%d",
+                    "lookup_hits=%d total_saved_tokens=%d warm_producer=%s",
                     request.request_id,
                     request.num_prompt_tokens,
                     baseline_tokens,
@@ -261,6 +265,7 @@ class KVCacheManager:
                     free,
                     snapshots.lookup_hits,
                     snapshots.lookup_saved_tokens,
+                    snapshots.is_warm_producer(request),
                 )
 
         # Keep the existing two-value lookup API used by 1Cat connectors. The
@@ -456,6 +461,16 @@ class KVCacheManager:
             num_tokens_main_model,
             num_encoder_tokens,
         )
+
+        snapshots = self.coordinator.mtp_prefix_snapshots
+        if snapshots is not None and snapshots.admit(request) and snapshots.telemetry:
+            logger.info(
+                "MTP_COMMITTED_PREFIX admit request=%s baseline_tokens=%d "
+                "warm_producer=%s",
+                request.request_id,
+                snapshots.admissions[request.request_id].baseline_tokens,
+                snapshots.is_warm_producer(request),
+            )
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
