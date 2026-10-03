@@ -109,6 +109,10 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states import init_model_state
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
 from vllm.v1.worker.gpu.pp_utils import PPHandler, scatter_draft_tokens
+from vllm.v1.worker.gpu.sample.cudagraph import (
+    SamplingCudaGraphManager,
+    SamplingGraphOutput,
+)
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
@@ -145,6 +149,12 @@ def _detach_model_runtime_state(model: nn.Module) -> None:
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
+    # SM70 sampling CUDA graph (VLLM_SM70_SAMPLING_CUDAGRAPH). Class-level
+    # defaults so runners built without __init__ keep the eager behaviour.
+    sampling_graph: SamplingCudaGraphManager | None = None
+    # Set by sample() when the graph replaced the eager sampling chain.
+    _sampling_graph_output: SamplingGraphOutput | None = None
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
@@ -938,6 +948,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.speculator.capture(captured_attn_states)
         if self._ple_offload_connector is not None:
             self._ple_offload_connector.release_outputs()
+        self._capture_sampling_graph()
 
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.cuda.mem_get_info()[0]
@@ -950,6 +961,53 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cuda_graph_size / (1 << 30),
         )
         return cuda_graph_size
+
+    def _capture_sampling_graph(self) -> None:
+        """Capture the post-target sampling chain (VLLM_SM70_SAMPLING_CUDAGRAPH)."""
+        self.sampling_graph = None
+        if not envs.VLLM_SM70_SAMPLING_CUDAGRAPH:
+            return
+        blockers = []
+        if self.sampler is None or self.rejection_sampler is None:
+            blockers.append("this rank does not sample or there is no speculator")
+        if self.speculator is None or self.num_speculative_steps < 1:
+            blockers.append("speculative decoding is off")
+        if isinstance(self.speculator, DFlash2Speculator):
+            blockers.append("the DFlash2 sparse verification path is used")
+        if self.use_pp:
+            blockers.append("pipeline parallelism is on")
+        if self.device.type != "cuda":
+            blockers.append("the device is not CUDA")
+        if self.sampler is not None and self.sampler.compute_nans:
+            blockers.append("VLLM_COMPUTE_NANS_IN_LOGITS is enabled")
+        if getattr(self.speculator, "draft_logits", None) is not None:
+            blockers.append(
+                "the speculator keeps draft logits (probabilistic drafting)"
+            )
+        if blockers:
+            logger.warning(
+                "VLLM_SM70_SAMPLING_CUDAGRAPH=1 but the sampling graph is not "
+                "captured: %s.",
+                "; ".join(blockers),
+            )
+            return
+        assert self.sampler is not None and self.rejection_sampler is not None
+        manager = SamplingCudaGraphManager(
+            sampler=self.sampler,
+            rejection_sampler=self.rejection_sampler,
+            req_states=self.req_states,
+            input_buffers=self.input_buffers,
+            model_state=self.model_state,
+            post_update_fn=self._post_update_sampled,
+            postprocess_state_fn=self._postprocess_model_state,
+            device=self.device,
+            max_num_reqs=self.max_num_reqs,
+            num_speculative_steps=self.num_speculative_steps,
+            vocab_size=self.vocab_size,
+            max_graph_reqs=envs.VLLM_SM70_SAMPLING_CUDAGRAPH_MAX_REQS,
+        )
+        manager.capture()
+        self.sampling_graph = manager
 
     def _remove_request(self, req_id: str) -> bool:
         req_idx = self.req_states.remove_request(req_id)
@@ -1286,6 +1344,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
+        self._sampling_graph_output = None
         sample_hidden_states = hidden_states[input_batch.logits_indices]
         sampler_output = None
         cached_logits = None
@@ -1370,6 +1429,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # Rejection sampling for spec decoding.
                 assert self.rejection_sampler is not None
                 assert self.speculator is not None
+                if self.sampling_graph is not None:
+                    # One graph replay instead of ~100 eager launches. It also
+                    # runs post_update (and the model-state postprocess when
+                    # that is capture-safe), which sample_tokens then skips.
+                    graph_output = self.sampling_graph.run(
+                        logits,
+                        input_batch,
+                        grammar_output,
+                        self.speculator.draft_logits,
+                    )
+                    if graph_output is not None:
+                        self._sampling_graph_output = graph_output
+                        return (
+                            graph_output.sampler_output,
+                            graph_output.num_sampled,
+                            graph_output.num_rejected,
+                        )
                 sampler_output = self.rejection_sampler(
                     logits,
                     input_batch,
@@ -1401,7 +1477,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
         return sampler_output, num_sampled, num_rejected
 
-    def postprocess_sampled(
+    def _post_update_sampled(
         self,
         idx_mapping: torch.Tensor,
         sampled_tokens: torch.Tensor,
@@ -1409,7 +1485,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_rejected: torch.Tensor,
         query_start_loc: torch.Tensor | None = None,
     ) -> None:
-        # Update the number of computed tokens.
+        # Update the number of computed tokens. The sampling CUDA graph calls
+        # this same method, so the eager and the captured path cannot drift.
         if self.is_last_pp_rank:
             assert self.sampler is not None
             output_bin_counts = self.sampler.penalties_state.output_bin_counts
@@ -1428,11 +1505,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.total_len.gpu,
         )
 
+    def _postprocess_model_state(
+        self, idx_mapping: torch.Tensor, num_sampled: torch.Tensor
+    ) -> None:
         self.model_state.postprocess_state(
             idx_mapping,
             num_sampled,
             self.req_states.num_computed_tokens.gpu,
         )
+
+    def postprocess_sampled(
+        self,
+        idx_mapping: torch.Tensor,
+        sampled_tokens: torch.Tensor,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        query_start_loc: torch.Tensor | None = None,
+    ) -> None:
+        self._post_update_sampled(
+            idx_mapping,
+            sampled_tokens,
+            num_sampled,
+            num_rejected,
+            query_start_loc,
+        )
+        self._postprocess_model_state(idx_mapping, num_sampled)
 
     def postprocess_num_computed_tokens(self, input_batch: InputBatch) -> None:
         post_update_num_computed_tokens(
@@ -1797,6 +1894,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
+        sampling_graph_output = self._sampling_graph_output
+        self._sampling_graph_output = None
         self._sm70_v2_mtp_profile_finish(
             mtp_profile_ctx, "target_sample", mtp_sample_start
         )
@@ -1856,13 +1955,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # This sequencing may slightly reduce latency as async D2H copy does not
         # need to wait for the postprocess to finish.
         mtp_state_update_start = self._sm70_v2_mtp_profile_start(mtp_profile_ctx)
-        self.postprocess_sampled(
-            input_batch.idx_mapping,
-            sampler_output.sampled_token_ids,
-            num_sampled,
-            num_rejected,
-            input_batch.query_start_loc,
-        )
+        if sampling_graph_output is None:
+            self.postprocess_sampled(
+                input_batch.idx_mapping,
+                sampler_output.sampled_token_ids,
+                num_sampled,
+                num_rejected,
+                input_batch.query_start_loc,
+            )
+        elif not sampling_graph_output.model_state_done:
+            # The graph ran post_update; the model-state postprocess was not
+            # capture-safe at capture time (e.g. the Mamba align context did
+            # not exist yet), so it runs eagerly, after the AsyncOutput copy
+            # was enqueued, exactly as in the eager path.
+            self._postprocess_model_state(input_batch.idx_mapping, num_sampled)
         self._sm70_v2_mtp_profile_finish(
             mtp_profile_ctx, "target_state_update", mtp_state_update_start
         )

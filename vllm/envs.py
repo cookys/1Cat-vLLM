@@ -445,6 +445,8 @@ if TYPE_CHECKING:
     VLLM_SM70_TOPK_TOPP_8_WARPS: bool = False
     VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS: bool = True
     VLLM_SM70_TOPK_TOPP_BRANCHFREE: int = 0
+    VLLM_SM70_SAMPLING_CUDAGRAPH: int = 0
+    VLLM_SM70_SAMPLING_CUDAGRAPH_MAX_REQS: int = 1
     VLLM_SM70_MTP_DRAFT_NVFP4_LM_HEAD: bool = False
     VLLM_SM70_MTP_DRAFT_NVFP4_RERANK_K: int = 64
     VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_DIR: str | None = None
@@ -1073,6 +1075,24 @@ def deprecated_env(
         return getter()
 
     return _read
+
+
+def env_positive_int(env_name: str, default: str) -> Callable[[], int]:
+    """Create a getter for an integer environment variable that must be >= 1.
+
+    A value that is not an integer raises the usual ``ValueError`` from
+    ``int()``; an integer below 1 raises ``ValueError`` with the variable name.
+    """
+
+    def _get_positive_int() -> int:
+        value = int(os.getenv(env_name, default))
+        if value < 1:
+            raise ValueError(
+                f"Invalid value '{value}' for {env_name}. Must be an integer >= 1."
+            )
+        return value
+
+    return _get_positive_int
 
 
 def env_with_choices(
@@ -6184,6 +6204,57 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="configuration",
         declared_default="0",
         effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+    ),
+    # Capture the post-target sampling chain of the V2 speculative-decode path
+    # (temperature/min-p/top-k/top-p, rejection sampling, post_update) as one
+    # CUDA graph per admitted (num_reqs, num_logits, signature) key.
+    "VLLM_SM70_SAMPLING_CUDAGRAPH": env_var(
+        lambda: int(
+            env_with_choices("VLLM_SM70_SAMPLING_CUDAGRAPH", "0", ["0", "1"])()
+        ),
+        description=(
+            "SM70 V2 speculative decoding: capture the post-target sampling "
+            "chain as a CUDA graph so the host stops launching about a "
+            "hundred eager kernels between the verify graph and the first "
+            "draft graph. 0 (default) keeps the eager path. 1 captures one "
+            "graph per admitted (num_reqs, num_logits, sampling signature) "
+            "key at capture_model time, in a dedicated graph pool. The graph "
+            "covers temperature, min-p, top-k/top-p, rejection sampling, "
+            "post_update and, when it is safe to capture, the model-state "
+            "postprocess; the NCCL logits gather, the async output copy and "
+            "the draft proposal stay eager. Top-k/top-p inside the graph is "
+            "the full-vocabulary reference path, the same numerics as "
+            "VLLM_SM70_TOPK_TOPP_BRANCHFREE=2. Only uniform speculative "
+            "batches without logprobs, penalties, logit bias, bad words, "
+            "structured output, NaN counting or probabilistic draft logits "
+            "are admitted; every other batch runs eagerly and the reason is "
+            "logged once. Any value other than 0 or 1 is rejected."
+        ),
+        category="experimental",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+    ),
+    # Largest request count for which a sampling graph is captured; every
+    # num_reqs in 1..MAX_REQS gets one graph per captured signature.
+    "VLLM_SM70_SAMPLING_CUDAGRAPH_MAX_REQS": env_var(
+        lambda: int(env_positive_int("VLLM_SM70_SAMPLING_CUDAGRAPH_MAX_REQS", "1")()),
+        description=(
+            "Largest num_reqs for which VLLM_SM70_SAMPLING_CUDAGRAPH captures "
+            "a sampling graph. Every num_reqs from 1 to this value is "
+            "captured with the uniform speculative shape "
+            "num_reqs * (num_speculative_tokens + 1). Default 1 keeps the "
+            "graph pool near 30 MB per GPU at a 248320-token vocabulary; "
+            "larger values capture more shapes into the same pool. Batches "
+            "with more requests than this run eagerly. Must be an integer "
+            "of at least 1."
+        ),
+        category="tuning",
+        declared_default="1",
+        effective_default="1",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
     ),
