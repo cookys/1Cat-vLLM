@@ -31,13 +31,28 @@ a 4-bit effect; ``disagreement_rate_not_near_tie`` is the disagreement over the
 remaining rows.  Padding rows of a shard are masked in both paths.
 
 Hidden states.  ``--hidden-dump`` takes (a) a directory written by
-``VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_DIR`` (files ``rank*_step*.pt``, dicts with a
-``hidden`` tensor; the files are filtered by ``--tp-rank``, i.e.
-``rank<r>_step*.pt`` (``rank0_step*.pt`` for ``--tp-rank all``), because the
-hidden states are replicated across TP ranks; ``--hidden-glob`` overrides),
-(b) one such file, or (c) a plain ``torch.save``'d float16 tensor [n, 2560].
-Without it the rows are random N(0, --sigma), which makes the numbers
-pessimistic: random vectors have no dominant token.
+``VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_DIR`` (files ``rank*_step*.pt``, one draft
+step each: dicts with the lm_head input ``hidden`` [rows, 2560] and the
+``draft_tokens`` [rows] that step produced; the files are filtered by
+``--tp-rank``, i.e. ``rank<r>_step*.pt`` (``rank0_step*.pt`` for ``--tp-rank
+all``), because the hidden states are replicated across TP ranks;
+``--hidden-glob`` overrides), (b) one such file, or (c) a plain ``torch.save``'d
+float16 tensor [n, 2560].  Without ``--hidden-dump`` the rows are random
+N(0, --sigma), which makes the numbers pessimistic: random vectors have no
+dominant token.  If ``--hidden-dump`` is given but matches no file the script
+does NOT exit: it warns, runs the synthetic convention check and timings, and
+writes ``hidden_source: "synthetic"`` with ``disagreement_rate: null`` (no
+accuracy number is reported for rows that are not real hidden states).
+
+Dump self-validation.  When every dump file carries ``draft_tokens`` the first
+line printed is ``dump_consistency``: the fraction of rows where the FP16
+reference path (the global token with ``--tp-rank all``; with a single shard the
+shard-local winner, over the rows whose dumped token lies in that shard) equals
+the dumped token.  It must be about 1: a value below 0.99 is flagged loudly and
+means the dump captured the wrong tensor or the server ran with the NVFP4 head
+enabled.  Take the dump with ``VLLM_SM70_MTP_DRAFT_NVFP4_LM_HEAD`` UNSET (the
+FP16 head), otherwise ``draft_tokens`` are the NVFP4 head's answers and the
+check is meaningless.  The server runs with CUDA graphs ON for the dump.
 
     CUDA_VISIBLE_DEVICES=<gpu> python benchmarks/sm70_draft_nvfp4_lm_head_check.py \
         --tp-rank all --hidden-dump /data/bench/draft_hidden \
@@ -53,6 +68,7 @@ import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import NamedTuple
 
 import torch
 import vllm._C  # noqa: F401  (registers torch.ops._C.*)
@@ -60,6 +76,8 @@ import vllm._C  # noqa: F401  (registers torch.ops._C.*)
 from vllm.v1.worker.gpu.spec_decode.eagle import draft_nvfp4_lm_head as dh
 
 HIDDEN_SIZE = 2560
+# Below this fraction the dump does not match the FP16 head it claims to come from.
+DUMP_CONSISTENCY_MIN = 0.99
 RANK_EDGES = (1, 2, 4, 8, 16, 32, 64, 128)
 RANK_LABELS = ("1", "2", "3-4", "5-8", "9-16", "17-32", "33-64", "65-128", ">128")
 
@@ -120,25 +138,75 @@ def load_shard(model_dir: Path, tp_rank: int, tp_size: int) -> tuple[torch.Tenso
     return shard.to(torch.float16), start
 
 
-def load_hidden_dump(path: Path, glob: str) -> tuple[torch.Tensor, int]:
-    """Hidden states [n, 2560] float16 (CPU) from a dump directory, file or tensor."""
-    files = sorted(path.glob(glob)) if path.is_dir() else [path]
+class NoDumpFiles(Exception):
+    """No file of ``--hidden-dump`` matched the glob."""
+
+
+class HiddenRows(NamedTuple):
+    hidden: torch.Tensor  # [n, 2560] float16 on the compute device
+    source: str  # what ends up in the JSON as hidden_source
+    files: int
+    draft_tokens: torch.Tensor | None  # [n] int64 (CPU) when every file has them
+    synthetic: bool  # True: --hidden-dump matched nothing, rows are random
+    note: str | None
+
+
+def load_dump(path: Path, glob: str) -> tuple[torch.Tensor, torch.Tensor | None, int]:
+    """(hidden [n, 2560] fp16, draft_tokens [n] int64 or None, number of files).
+
+    ``draft_tokens`` is returned only when every file carries them (older dumps
+    and plain tensors have none).  Raises ``NoDumpFiles`` if nothing matches.
+    """
+    if path.is_dir():
+        files = sorted(path.glob(glob))
+    else:
+        files = [path] if path.exists() else []
     if not files:
-        raise SystemExit(
+        raise NoDumpFiles(
             f"no files matching {glob!r} in {path} (override with --hidden-glob)"
         )
-    parts = []
+    parts, token_parts, without_tokens = [], [], 0
     for file in files:
         loaded = torch.load(file, map_location="cpu")
+        tokens = None
         if isinstance(loaded, dict):
+            tokens = loaded.get("draft_tokens")
             loaded = loaded["hidden"]
-        parts.append(loaded.reshape(-1, HIDDEN_SIZE).to(torch.float16))
-    return torch.cat(parts), len(files)
+        rows = loaded.reshape(-1, HIDDEN_SIZE).to(torch.float16)
+        parts.append(rows)
+        if tokens is not None and tokens.numel() == rows.shape[0]:
+            token_parts.append(tokens.reshape(-1).to(torch.int64))
+        else:
+            without_tokens += 1
+    if without_tokens and token_parts:
+        print(
+            f"warning: {without_tokens} of {len(files)} dump file(s) have no "
+            "draft_tokens; dump_consistency is skipped",
+            file=sys.stderr,
+        )
+    tokens_all = torch.cat(token_parts) if token_parts and not without_tokens else None
+    return torch.cat(parts), tokens_all, len(files)
 
 
-def make_hidden(
-    args: argparse.Namespace, device: torch.device
-) -> tuple[torch.Tensor, str, int]:
+def load_hidden_dump(path: Path, glob: str) -> tuple[torch.Tensor, int]:
+    """Hidden states [n, 2560] float16 (CPU) from a dump directory, file or tensor."""
+    try:
+        hidden, _, files = load_dump(path, glob)
+    except NoDumpFiles as err:
+        raise SystemExit(str(err)) from err
+    return hidden, files
+
+
+def _random_rows(args: argparse.Namespace) -> torch.Tensor:
+    gen = torch.Generator(device="cpu").manual_seed(args.seed)
+    rows = torch.randn(args.num_hidden, HIDDEN_SIZE, generator=gen) * args.sigma
+    return rows.to(torch.float16)
+
+
+def make_hidden(args: argparse.Namespace, device: torch.device) -> HiddenRows:
+    tokens = None
+    synthetic = False
+    note = None
     files = 0
     if args.hidden_dump is not None:
         glob = args.hidden_glob or (
@@ -146,18 +214,25 @@ def make_hidden(
             if args.tp_rank == "all"
             else f"rank{int(args.tp_rank)}_step*.pt"
         )
-        hidden, files = load_hidden_dump(args.hidden_dump, glob)
-        source = f"dump:{args.hidden_dump} ({files} file(s))"
+        try:
+            hidden, tokens, files = load_dump(args.hidden_dump, glob)
+            source = f"dump:{args.hidden_dump} ({files} file(s))"
+        except NoDumpFiles as err:
+            note = f"{err}; falling back to synthetic rows"
+            print(f"WARNING: {note}", file=sys.stderr)
+            hidden = _random_rows(args)
+            source, synthetic = "synthetic", True
     else:
-        gen = torch.Generator(device="cpu").manual_seed(args.seed)
-        hidden = torch.randn(args.num_hidden, HIDDEN_SIZE, generator=gen) * args.sigma
-        hidden = hidden.to(torch.float16)
+        hidden = _random_rows(args)
         source = f"random_normal_sigma={args.sigma}"
     if args.max_hidden_rows > 0:
         hidden = hidden[: args.max_hidden_rows]
+        tokens = None if tokens is None else tokens[: args.max_hidden_rows]
     if hidden.shape[0] < 4:
         raise SystemExit("need at least 4 hidden-state rows")
-    return hidden.to(device).contiguous(), source, files
+    return HiddenRows(
+        hidden.to(device).contiguous(), source, files, tokens, synthetic, note
+    )
 
 
 @torch.no_grad()
@@ -316,6 +391,140 @@ def evaluate(
     }
 
 
+@torch.no_grad()
+def dump_consistency(
+    heads: list[dh.DraftNvfp4LMHead],
+    weights: list[torch.Tensor],
+    hidden: torch.Tensor,
+    tokens: torch.Tensor,
+) -> dict:
+    """Does the FP16 reference path reproduce the tokens the server dumped?
+
+    The FP16 GEMM argmax (first maximum, like the server's logits argmax) over
+    the concatenated shards is the global token.  With a single shard only the
+    shard-local winner exists, so just the rows whose dumped token lies in that
+    shard are checked: there the shard-local FP16 winner must equal the dumped
+    global token.  Mismatches on FP16 near-ties are counted separately (the
+    reference GEMM here is not the server's kernel, so a tie can break the
+    other way without anything being wrong).
+    """
+    n = heads[0].rows
+    starts = torch.tensor(
+        [h.org_vocab_start_index for h in heads], device=hidden.device
+    )
+    global_scope = len(heads) > 1
+    lo = int(starts[0])
+    tokens = tokens.to(hidden.device)
+    checked = matching = near_tie_mismatch = 0
+    for begin in range(0, hidden.shape[0], dh.MAX_ROWS):
+        h = hidden[begin : begin + dh.MAX_ROWS].contiguous()
+        t = tokens[begin : begin + dh.MAX_ROWS]
+        refs = []
+        for head, weight in zip(heads, weights):
+            ref = h @ weight.t()
+            if head.num_org_vocab_padding:  # same padding mask as the head applies
+                ref[:, n - head.num_org_vocab_padding :] = float("-inf")
+            refs.append(ref)
+        full = torch.cat(refs, dim=1)
+        index = full.argmax(dim=-1)
+        ref_token = index % n + starts[index // n]
+        top2 = full.float().topk(2, dim=-1).values
+        near_tie = (top2[:, 0] - top2[:, 1]) < f16_ulp(top2[:, 0])
+        in_scope = (
+            torch.ones_like(t, dtype=torch.bool)
+            if global_scope
+            else (t >= lo) & (t < lo + n)
+        )
+        agree = ref_token == t
+        checked += int(in_scope.sum())
+        matching += int((in_scope & agree).sum())
+        near_tie_mismatch += int((in_scope & ~agree & near_tie).sum())
+    return {
+        "value": matching / checked if checked else None,
+        "scope": "global" if global_scope else "shard",
+        "rows_total": int(hidden.shape[0]),
+        "rows_checked": checked,
+        "rows_matching": matching,
+        "mismatch_near_tie_rows": near_tie_mismatch,
+    }
+
+
+def report_dump_consistency(
+    detail: dict, minimum: float = DUMP_CONSISTENCY_MIN
+) -> bool:
+    """Print the dump self-check; False (loudly, on stderr) if it is too low."""
+    value = detail["value"]
+    if value is None:
+        print(
+            "dump_consistency=n/a: no dumped token lies in the loaded shard "
+            f"(rows={detail['rows_total']}, scope={detail['scope']})"
+        )
+        return True
+    print(
+        f"dump_consistency={value:.4f} ({detail['rows_matching']}/"
+        f"{detail['rows_checked']} rows match the FP16 reference, scope="
+        f"{detail['scope']}, {detail['mismatch_near_tie_rows']} mismatch(es) on "
+        "FP16 near-ties)"
+    )
+    if value < minimum:
+        banner = "!" * 78
+        print(
+            f"{banner}\nWARNING: dump_consistency {value:.4f} < {minimum}. The "
+            "dumped hidden states do not reproduce the dumped draft tokens "
+            "through the FP16 head: the dump captured the wrong tensor, or the "
+            "server ran with VLLM_SM70_MTP_DRAFT_NVFP4_LM_HEAD enabled (it must "
+            "be UNSET when dumping). Every disagreement number computed from "
+            f"this dump is suspect.\n{banner}",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def consistency_section(
+    heads: list[dh.DraftNvfp4LMHead], weights: list[torch.Tensor], rows: HiddenRows
+) -> dict:
+    """The dump self-check keys of the summary; prints the line first."""
+    section: dict = {
+        "dump_consistency": None,
+        "dump_consistency_detail": None,
+        "dump_consistency_ok": None,
+    }
+    if rows.draft_tokens is None:
+        if rows.files:
+            print(
+                "dump_consistency=n/a: the dump has no draft_tokens (older dump "
+                "or a plain tensor)"
+            )
+        return section
+    detail = dump_consistency(heads, weights, rows.hidden, rows.draft_tokens)
+    section["dump_consistency"] = detail["value"]
+    section["dump_consistency_detail"] = detail
+    section["dump_consistency_ok"] = report_dump_consistency(detail)
+    return section
+
+
+def accuracy_section(
+    heads: list[dh.DraftNvfp4LMHead],
+    weights: list[torch.Tensor],
+    rows: HiddenRows,
+    ranks: list[int],
+) -> dict:
+    """``accuracy`` and ``disagreement_rate``; both null for synthetic rows."""
+    if rows.synthetic:
+        print(
+            "disagreement_rate not measured: no real hidden states "
+            "(--hidden-dump matched no file), the synthetic rows would give "
+            "a misleading number",
+            file=sys.stderr,
+        )
+        return {"accuracy": None, "disagreement_rate": None}
+    accuracy = evaluate(heads, weights, rows.hidden, ranks)
+    for head in heads:
+        head.rerank_k = 64  # evaluate() leaves the last tested R behind
+    return {"accuracy": accuracy, "disagreement_rate": accuracy["disagreement_rate"]}
+
+
 def _time_events(fn, warmup: int, iters: int) -> float:
     for _ in range(warmup):
         fn()
@@ -461,8 +670,10 @@ def main() -> None:
         weights.append(weight)
         heads.append(head)
 
-    hidden, hidden_source, hidden_files = make_hidden(args, device)
-    print(f"hidden: {hidden_source} rows={hidden.shape[0]}")
+    rows = make_hidden(args, device)
+    hidden = rows.hidden
+    print(f"hidden: {rows.source} rows={hidden.shape[0]}")
+    consistency = consistency_section(heads, weights, rows)  # printed first
 
     summary: dict = {
         "device": name,
@@ -473,9 +684,11 @@ def main() -> None:
         "k": heads[0].hidden_size,
         "split_k": heads[0].split_k,
         "accumulator_chains": heads[0].accumulator_chains,
-        "hidden_source": hidden_source,
-        "hidden_files": hidden_files,
+        "hidden_source": rows.source,
+        "hidden_files": rows.files,
+        "hidden_note": rows.note,
         "num_hidden": int(hidden.shape[0]),
+        **consistency,
         "builds": builds,
         "resident_bytes": builds[0]["resident_bytes"],
         "quantize_seconds": builds[0]["quantize_seconds"],
@@ -493,17 +706,20 @@ def main() -> None:
         f"kernel-vs-dequant convention check={summary['convention_check']}"
     )
 
-    summary["accuracy"] = evaluate(heads, weights, hidden, ranks)
-    for head in heads:
-        head.rerank_k = 64  # evaluate() leaves the last tested R behind
+    summary.update(accuracy_section(heads, weights, rows, ranks))
     acc = summary["accuracy"]
-    print(f"logits rel-L2={acc['logits_rel_l2']:.4f} scope={acc['scope']}")
-    print(f"disagreement_rate per R (NVFP4+rerank vs FP16): {acc['disagreement_rate']}")
-    print(
-        f"fp16_near_tie_rate={acc['fp16_near_tie_rate']:.4f}; disagreement_rate "
-        f"excluding near ties: {acc['disagreement_rate_not_near_tie']}"
-    )
-    print(f"rank histogram of the FP16 argmax in NVFP4 logits: {acc['rank_hist']}")
+    if acc is not None:
+        print(f"logits rel-L2={acc['logits_rel_l2']:.4f} scope={acc['scope']}")
+        print(
+            "disagreement_rate per R (NVFP4+rerank vs FP16): "
+            f"{acc['disagreement_rate']}"
+        )
+        print(
+            f"fp16_near_tie_rate={acc['fp16_near_tie_rate']:.4f}; "
+            "disagreement_rate excluding near ties: "
+            f"{acc['disagreement_rate_not_near_tie']}"
+        )
+        print(f"rank histogram of the FP16 argmax in NVFP4 logits: {acc['rank_hist']}")
 
     summary["timings_us"] = timings(
         heads[0], weights[0], hidden, args.warmup, args.iters

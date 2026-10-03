@@ -8,8 +8,10 @@ selection, FP16 rerank, TP reduction, eligibility gate) is the production code.
 """
 
 import inspect
+import types
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import regex as re
 import torch
@@ -1126,47 +1128,128 @@ def test_rerank_zero_logs_the_diagnostic_mode_once(cpu_ops, caplog):
 
 # --------------------------------------------------------------------------
 # real hidden-state dump (VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_DIR)
+#
+# stage() is recorded into the FULL draft graphs from _sample_draft; dump_step()
+# runs at the eager call sites after each completed draft step.
 # --------------------------------------------------------------------------
-def _dumper(tmp_path, steps=3):
+def _dumper(tmp_path, steps=3, max_rows=4, k=8):
     from vllm.v1.worker.gpu.spec_decode.eagle.draft_hidden_dump import DraftHiddenDumper
 
-    return DraftHiddenDumper(str(tmp_path), steps)
+    return DraftHiddenDumper(
+        str(tmp_path),
+        steps,
+        max_rows=max_rows,
+        hidden_size=k,
+        dtype=torch.float16,
+        device="cpu",
+    )
 
 
-def test_dumper_saves_the_first_n_nonzero_batches(tmp_path):
+def _draft_tokens(max_rows=4, steps=4, base=1000):
+    return (
+        torch.arange(max_rows * steps, dtype=torch.int64).view(max_rows, steps) + base
+    )
+
+
+def test_dumper_stages_then_saves_the_step_batch(tmp_path):
+    dumper = _dumper(tmp_path)
+    tokens = _draft_tokens()
+    batch = _hidden(3, k=8, seed=3)
+    dumper.stage(batch)
+    dumper.dump_step(2, 3, tokens)
+    assert [p.name for p in tmp_path.iterdir()] == ["rank0_step00000.pt"]  # no .tmp
+    saved = torch.load(tmp_path / "rank0_step00000.pt")
+    assert set(saved) == {"hidden", "draft_tokens", "step", "n", "rank", "rows"}
+    assert torch.equal(saved["hidden"], batch)
+    assert saved["hidden"].dtype == torch.float16
+    assert saved["hidden"].device.type == "cpu"
+    # the tokens of draft step 2 (column 2), the first 3 rows
+    assert torch.equal(saved["draft_tokens"], tokens[:3, 2])
+    assert saved["draft_tokens"].dtype == torch.int64
+    assert (saved["step"], saved["n"], saved["rank"], saved["rows"]) == (2, 0, 0, 3)
+
+
+def test_dumper_saves_only_the_first_n_real_batches(tmp_path):
     dumper = _dumper(tmp_path, steps=3)
-    batches = [torch.zeros(2, 8).half()] + [
-        _hidden(m, k=8, seed=m) for m in (1, 4, 2, 3)
-    ]
+    tokens = _draft_tokens()
+    batches = [_hidden(m, k=8, seed=m) for m in (1, 4, 2, 3)]
+    dumper.dump_step(0, 2, tokens)  # nothing staged: a warmup/unstaged batch
     for i, batch in enumerate(batches):
-        dumper.maybe_dump(batch, torch.tensor(i % 4))
+        dumper.stage(batch)
+        dumper.dump_step(i, batch.shape[0], tokens)
     files = sorted(p.name for p in tmp_path.iterdir())
-    assert files == [f"rank0_step{n:05d}.pt" for n in range(3)]  # no .tmp left
+    assert files == [f"rank0_step{n:05d}.pt" for n in range(3)]
     assert dumper.saved == 3 and dumper.skipped_zero == 1
     first = torch.load(tmp_path / files[0])
-    assert torch.equal(first["hidden"], batches[1])
-    assert (
-        first["hidden"].dtype == torch.float16 and first["hidden"].device.type == "cpu"
-    )
-    assert (first["n"], first["rank"], first["rows"]) == (0, 0, 1)
-    assert first["current_draft_step"] == 1
-    assert torch.equal(torch.load(tmp_path / files[2])["hidden"], batches[3])
+    assert torch.equal(first["hidden"], batches[0]) and first["step"] == 0
+    assert torch.equal(torch.load(tmp_path / files[2])["hidden"], batches[2])
+
+
+def test_dumper_never_redumps_a_consumed_stage(tmp_path):
+    dumper = _dumper(tmp_path, steps=5)
+    tokens = _draft_tokens()
+    dumper.stage(_hidden(2, k=8))
+    dumper.dump_step(0, 2, tokens)
+    # a later step that stages nothing (no replay wrote it) must not repeat it
+    dumper.dump_step(1, 2, tokens)
+    assert dumper.saved == 1 and dumper.skipped_zero == 1
 
 
 def test_dumper_names_files_by_tp_rank(tmp_path, monkeypatch):
     from vllm.v1.worker.gpu.spec_decode.eagle import draft_hidden_dump as dump
 
     monkeypatch.setattr(dump, "_tp_rank", lambda: 3)
-    _dumper(tmp_path).maybe_dump(_hidden(2, k=8), 2)
+    dumper = _dumper(tmp_path)
+    dumper.stage(_hidden(2, k=8))
+    dumper.dump_step(1, 2, _draft_tokens())
     assert [p.name for p in tmp_path.iterdir()] == ["rank3_step00000.pt"]
+    assert torch.load(tmp_path / "rank3_step00000.pt")["rank"] == 3
 
 
 def test_dumper_does_nothing_during_graph_capture(tmp_path, monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     dumper = _dumper(tmp_path)
-    dumper.maybe_dump(_hidden(2, k=8), 0)
+    dumper.stage(_hidden(2, k=8))
+    dumper.dump_step(0, 2, _draft_tokens())
     assert dumper.saved == 0 and list(tmp_path.iterdir()) == []
+
+
+def test_stage_that_does_not_fit_disables_the_dump_with_a_warning(tmp_path, caplog):
+    from vllm.logger import _print_warning_once
+
+    _print_warning_once.cache_clear()
+    dumper = _dumper(tmp_path, max_rows=4, k=8)
+    with caplog.at_level("WARNING"):
+        dumper.stage(torch.ones(2, 16).half())  # wrong width (e.g. multi-stream)
+        dumper.stage(torch.ones(2, 16).half())
+    assert caplog.text.count("dump disabled") == 1
+    dumper.stage(_hidden(2, k=8))
+    dumper.dump_step(0, 2, _draft_tokens())
+    assert dumper.saved == 0 and list(tmp_path.iterdir()) == []
+    _print_warning_once.cache_clear()
+    dumper = _dumper(tmp_path, max_rows=4, k=8)
+    dumper.stage(torch.ones(5, 8).half())  # more rows than max_num_reqs
+    dumper.dump_step(0, 4, _draft_tokens())
+    assert dumper.saved == 0
+
+
+def test_stage_is_a_device_only_copy():
+    from vllm.v1.worker.gpu.spec_decode.eagle.draft_hidden_dump import DraftHiddenDumper
+
+    source = inspect.getsource(DraftHiddenDumper.stage)
+    for banned in (
+        r"\.item\(",
+        r"\.tolist\(",
+        r"\.cpu\(",
+        r"\bbool\(",
+        r"\.numpy\(",
+        r"synchronize",
+        r"\.to\(",
+        r"torch\.save",
+    ):
+        assert not re.search(banned, source), banned
+    assert "copy_" in source
 
 
 def test_dumper_env_gating(tmp_path, monkeypatch):
@@ -1174,6 +1257,12 @@ def test_dumper_env_gating(tmp_path, monkeypatch):
         maybe_create_draft_hidden_dumper,
     )
 
+    kwargs = {
+        "max_rows": 4,
+        "hidden_size": 8,
+        "dtype": torch.float16,
+        "device": "cpu",
+    }
     envs.disable_envs_cache()
     for name in (
         "VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_DIR",
@@ -1182,22 +1271,39 @@ def test_dumper_env_gating(tmp_path, monkeypatch):
         monkeypatch.delenv(name, raising=False)
     assert envs.VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_DIR is None
     assert envs.VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_STEPS == 256
-    assert maybe_create_draft_hidden_dumper() is None
+    assert maybe_create_draft_hidden_dumper(**kwargs) is None
     target = tmp_path / "dump"
     monkeypatch.setenv("VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_DIR", str(target))
     monkeypatch.setenv("VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_STEPS", "5")
-    dumper = maybe_create_draft_hidden_dumper()
+    dumper = maybe_create_draft_hidden_dumper(**kwargs)
     assert dumper is not None and dumper.max_batches == 5 and target.is_dir()
+    assert dumper._stage.shape == (4, 8) and dumper._stage.dtype == torch.float16
     monkeypatch.setenv("VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_STEPS", "0")
-    assert maybe_create_draft_hidden_dumper() is None
+    assert maybe_create_draft_hidden_dumper(**kwargs) is None
 
 
-def test_speculator_calls_the_dumper_first_and_only_when_set():
+def test_dump_envs_say_graphs_are_fine_and_one_sync_per_step():
+    for name in (
+        "VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_DIR",
+        "VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_STEPS",
+    ):
+        description = envs.environment_variables[name].metadata.description
+        assert "eager" not in description.replace("does not need eager mode", "")
+        assert "synchronization" in description
+    dir_description = envs.environment_variables[
+        "VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_DIR"
+    ].metadata.description
+    assert "CUDA graphs ON" in dir_description
+    assert "VLLM_SM70_MTP_DRAFT_NVFP4_LM_HEAD unset" in dir_description
+
+
+def test_sample_draft_stages_the_input_and_never_dumps():
     from vllm.v1.worker.gpu.spec_decode.eagle import speculator as spec
 
     order = []
     dumper = SimpleNamespace(
-        maybe_dump=lambda h, step: order.append(("dump", tuple(h.shape), step))
+        stage=lambda h: order.append(("stage", tuple(h.shape))),
+        dump_step=lambda *a: order.append("dump_step"),
     )
     head = SimpleNamespace(
         top_tokens=lambda h: order.append("head") or torch.tensor([9])
@@ -1208,13 +1314,181 @@ def test_speculator_calls_the_dumper_first_and_only_when_set():
     assert spec.EagleSpeculator._sample_draft(
         stub, hidden, None, None, step, None
     ).tolist() == [9]
-    assert order == [("dump", (3, 8), step), "head"]
-    # the dump also sees batches the NVFP4 head does not serve (> 64 rows)
+    assert order == [("stage", (3, 8)), "head"]
+    # the stage also sees batches the NVFP4 head does not serve (> 64 rows)
     order.clear()
     spec.EagleSpeculator._sample_draft(stub, torch.zeros(65, 8), None, None, step, None)
-    assert order == [("dump", (65, 8), step)]
+    assert order == [("stage", (65, 8))]
     # unset -> no dumper is consulted
     stub._draft_hidden_dump = None
     order.clear()
     spec.EagleSpeculator._sample_draft(stub, hidden, None, None, step, None)
     assert order == ["head"]
+    # the host-side dump must not live in the graph-captured function
+    source = inspect.getsource(spec.EagleSpeculator._sample_draft)
+    assert "dump_step" not in source and "maybe_dump" not in source
+
+
+def _stub_with_dumper(dumper, num_steps=4, rows=4, k=8):
+    from vllm.v1.worker.gpu.spec_decode.eagle import speculator as spec
+
+    stub = SimpleNamespace(
+        input_buffers=SimpleNamespace(
+            positions=torch.zeros(rows), query_start_loc=torch.zeros(rows + 1)
+        ),
+        idx_mapping=torch.zeros(rows, dtype=torch.int32),
+        num_speculative_steps=num_steps,
+        current_draft_step=torch.tensor(0),
+        draft_tokens=torch.zeros(rows, num_steps, dtype=torch.int64),
+        _draft_hidden_dump=dumper,
+        _dump_this_round=True,
+    )
+    stub._dump_draft_step = types.MethodType(
+        spec.EagleSpeculator._dump_draft_step, stub
+    )
+    return stub
+
+
+def test_decode_steps_dump_after_each_completed_step(tmp_path):
+    from vllm.v1.worker.gpu.spec_decode.eagle import speculator as spec
+
+    dumper = _dumper(tmp_path, steps=10)
+    stub = _stub_with_dumper(dumper)
+    log = []
+    batches = {step: _hidden(2, k=8, seed=10 + step) for step in (1, 2, 3)}
+
+    def replay(desc):
+        # What a graph replay does: device work only (the staged copy and the
+        # token write), no python hook of the speculator runs.
+        step = int(stub.current_draft_step)
+        dumper.stage(batches[step])
+        stub.draft_tokens[:2, step] = torch.tensor([100 + step, 200 + step])
+        log.append(("replay", step))
+
+    stub.decode_cudagraph_manager = SimpleNamespace(run_fullgraph=replay)
+    real_dump_step = dumper.dump_step
+
+    def spy(step, num_reqs, draft_tokens):
+        log.append(("dump", step))
+        real_dump_step(step, num_reqs, draft_tokens)
+
+    dumper.dump_step = spy
+    desc = SimpleNamespace(cg_mode=spec.CUDAGraphMode.FULL, num_tokens=2, num_reqs=2)
+    spec.EagleSpeculator.multi_step_decode(stub, 2, True, desc, None)
+
+    assert log == [
+        ("replay", 1),
+        ("dump", 1),
+        ("replay", 2),
+        ("dump", 2),
+        ("replay", 3),
+        ("dump", 3),
+    ]
+    for n, step in enumerate((1, 2, 3)):
+        saved = torch.load(tmp_path / f"rank0_step{n:05d}.pt")
+        assert saved["step"] == step and saved["rows"] == 2
+        assert torch.equal(saved["hidden"], batches[step])
+        assert saved["draft_tokens"].tolist() == [100 + step, 200 + step]
+
+
+def test_eager_decode_steps_dump_too(tmp_path):
+    from vllm.v1.worker.gpu.spec_decode.eagle import speculator as spec
+
+    dumper = _dumper(tmp_path, steps=10)
+    stub = _stub_with_dumper(dumper, num_steps=2)
+
+    def generate_draft(*args, **kwargs):  # the eager step: stage runs in python
+        dumper.stage(_hidden(1, k=8, seed=5))
+        stub.draft_tokens[0, 1] = 77
+
+    stub.generate_draft = generate_draft
+    desc = SimpleNamespace(cg_mode=spec.CUDAGraphMode.NONE, num_tokens=1, num_reqs=1)
+    spec.EagleSpeculator.multi_step_decode(stub, 1, True, desc, None)
+    saved = torch.load(tmp_path / "rank0_step00000.pt")
+    assert saved["step"] == 1 and saved["draft_tokens"].tolist() == [77]
+
+
+def test_dump_call_site_is_a_noop_unless_enabled_and_real(tmp_path):
+    from vllm.v1.worker.gpu.spec_decode.eagle import speculator as spec
+
+    calls = []
+    dumper = SimpleNamespace(dump_step=lambda *a: calls.append(a))
+    stub = _stub_with_dumper(dumper)
+    spec.EagleSpeculator._dump_draft_step(stub, 2, 3)
+    assert calls == [(2, 3, stub.draft_tokens)]
+    stub._dump_this_round = False  # dummy / profile round
+    spec.EagleSpeculator._dump_draft_step(stub, 2, 3)
+    stub._dump_this_round, stub._draft_hidden_dump = True, None  # env unset
+    spec.EagleSpeculator._dump_draft_step(stub, 2, 3)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "dummy_run, is_profile, expect_dump",
+    [(False, False, True), (True, False, False), (False, True, False)],
+)
+def test_propose_dumps_the_prefill_step_after_it_completes(
+    tmp_path, monkeypatch, dummy_run, is_profile, expect_dump
+):
+    from vllm.v1.worker.gpu.spec_decode.eagle import speculator as spec
+
+    dumper = _dumper(tmp_path, steps=5)
+    stub = _stub_with_dumper(dumper, num_steps=1)  # one step: propose returns early
+    num_reqs = 2
+    log = []
+    batch = _hidden(num_reqs, k=8, seed=42)
+
+    def replay(desc):  # draft prefill FULL graph: staged copy + token write
+        dumper.stage(batch)
+        stub.draft_tokens[:num_reqs, 0] = torch.tensor([5, 6])
+        log.append("prefill replay")
+
+    desc = SimpleNamespace(cg_mode=spec.CUDAGraphMode.FULL, num_tokens=num_reqs)
+    stub.prefill_cudagraph_manager = SimpleNamespace(run_fullgraph=replay)
+    stub.hidden_states = torch.zeros(8, 8)
+    stub.last_token_indices = torch.zeros(4, dtype=torch.int64)
+    stub.max_num_reqs = 4
+    stub.temperature = torch.zeros(4)
+    stub.seeds = torch.zeros(4, dtype=torch.int64)
+    stub.dp_size, stub.dp_rank = 1, 0
+    stub._mtp_prefill_begin = lambda: None
+    stub._mtp_prefill_end = lambda n: log.append("prefill end")
+    monkeypatch.setattr(spec, "prepare_eagle_inputs", lambda *a, **k: None)
+    monkeypatch.setattr(spec, "get_uniform_decode_token_count", lambda *a, **k: 1)
+    monkeypatch.setattr(spec, "dispatch_cg_and_sync_dp", lambda *a, **k: (desc, None))
+    real_dump_step = dumper.dump_step
+    dumper.dump_step = lambda *a: (log.append("dump"), real_dump_step(*a))
+    input_batch = SimpleNamespace(
+        num_tokens_after_padding=num_reqs,
+        num_reqs=num_reqs,
+        num_scheduled_tokens=np.array([1, 1]),
+        idx_mapping=torch.zeros(num_reqs, dtype=torch.int32),
+        is_prefilling_np=np.array([False, False]),
+        num_tokens=num_reqs,
+    )
+    result = spec.EagleSpeculator.propose(
+        stub,
+        input_batch,
+        {},
+        {},
+        torch.ones(num_reqs, 8),
+        None,
+        None,
+        None,
+        None,
+        None,
+        torch.zeros(4),
+        torch.zeros(4, dtype=torch.int64),
+        dummy_run=dummy_run,
+        is_profile=is_profile,
+    )
+    assert result.shape == (num_reqs, 1)
+    if expect_dump:
+        # dumped after the replay, before the MTP prefill epilogue
+        assert log == ["prefill replay", "dump", "prefill end"]
+        saved = torch.load(tmp_path / "rank0_step00000.pt")
+        assert saved["step"] == 0 and torch.equal(saved["hidden"], batch)
+        assert saved["draft_tokens"].tolist() == [5, 6]
+    else:
+        assert log == ["prefill replay", "prefill end"]
+        assert list(tmp_path.iterdir()) == []

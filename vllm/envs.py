@@ -6242,23 +6242,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
     ),
-    # Diagnostic dump of the hidden states fed to EagleSpeculator._sample_draft,
-    # the real inputs of the draft lm_head (see draft_hidden_dump.py).
+    # Diagnostic dump of the hidden states the draft lm_head consumes (see
+    # draft_hidden_dump.py): a staged device copy captured in the draft graphs
+    # plus a host-side write at the eager call sites after each draft step.
     "VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_DIR": env_var(
         lambda: os.getenv("VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_DIR"),
         description=(
             "Diagnostic: directory where the V2 EagleSpeculator saves the "
-            "real hidden states it feeds to _sample_draft, one file per "
-            "batch named rank{tp_rank}_step{n:05d}.pt (a dict with a CPU "
-            "float16 hidden tensor [rows, hidden] plus n, rank, rows and "
-            "current_draft_step). Unset (default) means no dumper exists and "
-            "the draft path pays one attribute check. The copy to the host "
-            "synchronizes, so use it only for diagnostics, and run it with "
-            "CUDA graphs disabled for the drafter: _sample_draft is recorded "
-            "inside the FULL draft graphs and a replay does not run it. "
-            "All-zero warmup batches are skipped and nothing is written "
-            "during graph capture. Feed the directory to benchmarks/"
-            "sm70_draft_nvfp4_lm_head_check.py --hidden-dump."
+            "real lm_head inputs of the draft steps, one file per draft step "
+            "named rank{tp_rank}_step{n:05d}.pt (a dict with a CPU float16 "
+            "hidden tensor [rows, hidden] = the single-stream lm_head input, "
+            "not the multi-stream feedback state, draft_tokens = the int64 "
+            "global token ids that step produced, step = the draft step with "
+            "0 for the draft prefill, n, rank and rows). Works with CUDA "
+            "graphs ON and does not need eager mode: when set at startup a "
+            "device-only staging copy of the lm_head input is recorded into "
+            "the draft graphs, and the host reads it right after each "
+            "completed step, so each dumped step costs one host "
+            "synchronization (two small device-to-host copies). Unset "
+            "(default) means no dumper exists, no copy is captured and the "
+            "draft path pays one attribute check. All-zero warmup and "
+            "profiling batches are skipped and nothing is written during "
+            "graph capture. Take the dump with "
+            "VLLM_SM70_MTP_DRAFT_NVFP4_LM_HEAD unset so draft_tokens are the "
+            "FP16 head's answers, then feed the directory to benchmarks/"
+            "sm70_draft_nvfp4_lm_head_check.py --hidden-dump, which "
+            "validates it with dump_consistency."
         ),
         category="debug",
         declared_default="None",
@@ -6269,11 +6278,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_STEPS": env_var(
         lambda: int(os.getenv("VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_STEPS", "256")),
         description=(
-            "Number of non-zero hidden-state batches that "
+            "Number of non-zero draft-step batches (files) that "
             "VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_DIR saves per rank before the "
             "dumper goes quiet. Each draft step of each round is one batch "
             "of at most num_reqs rows, so 256 covers about 64 rounds of a "
-            "4-step draft. Values of 0 or less disable the dump."
+            "4-step draft; each saved batch costs one host synchronization. "
+            "Values of 0 or less disable the dump."
         ),
         category="debug",
         declared_default="256",

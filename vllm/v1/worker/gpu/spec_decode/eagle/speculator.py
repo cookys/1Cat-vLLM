@@ -160,11 +160,20 @@ class EagleSpeculator:
         # Draft-only NVFP4 lm_head (VLLM_SM70_MTP_DRAFT_NVFP4_LM_HEAD); built
         # in load_model once the draft's lm_head is final.
         self._draft_nvfp4_head: DraftNvfp4LMHead | None = None
-        # Diagnostic dump of the real draft hidden states
+        # Diagnostic dump of the real draft lm_head inputs
         # (VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_DIR); None unless the env is set.
+        # The staging buffer is sized by the lm_head input (the draft hidden
+        # size WITHOUT the hc_mult widening of self.hidden_size).
         self._draft_hidden_dump: DraftHiddenDumper | None = (
-            maybe_create_draft_hidden_dumper()
+            maybe_create_draft_hidden_dumper(
+                max_rows=self.max_num_reqs,
+                hidden_size=self.draft_model_config.get_hidden_size(),
+                dtype=self.dtype,
+                device=device,
+            )
         )
+        # False for dummy/profile rounds, which must never be dumped.
+        self._dump_this_round = False
 
         self.prefill_cudagraph_manager: PrefillEagleCudaGraphManager | None = None
         self.decode_cudagraph_manager: DecodeEagleCudaGraphManager | None = None
@@ -396,7 +405,10 @@ class EagleSpeculator:
         draft_logits: torch.Tensor | None,
     ) -> torch.Tensor:
         if self._draft_hidden_dump is not None:
-            self._draft_hidden_dump.maybe_dump(hidden_states, draft_step)
+            # Device-only copy of the exact lm_head input; it is recorded into
+            # (and replayed with) the FULL draft graphs. The host-side dump runs
+            # at the eager call sites, see _dump_draft_step.
+            self._draft_hidden_dump.stage(hidden_states)
         if draft_logits is None and self._draft_nvfp4_head is not None:
             rows = hidden_states.shape[0]
             if 0 < rows <= DRAFT_NVFP4_MAX_ROWS:
@@ -430,6 +442,17 @@ class EagleSpeculator:
             return self.model.get_top_tokens(hidden_states)
         logits = self.model.compute_logits(hidden_states)
         return logits.argmax(dim=-1)
+
+    def _dump_draft_step(self, step: int, num_reqs: int) -> None:
+        """Eager hook after a completed draft step (graph replay or eager run).
+
+        Writes the staged lm_head input and the tokens this step produced when
+        VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_DIR is set (host-synchronizing; a no-op
+        otherwise, and for dummy/profile rounds).
+        """
+        dumper = self._draft_hidden_dump
+        if dumper is not None and self._dump_this_round:
+            dumper.dump_step(step, num_reqs, self.draft_tokens)
 
     def _mtp_prefill_begin(self) -> None:
         if self.share_mtp_topk_indices:
@@ -531,6 +554,8 @@ class EagleSpeculator:
                     num_tokens_across_dp=num_tokens_across_dp,
                     cudagraph_runtime_mode=batch_desc.cg_mode,
                 )
+            # The step is complete (a graph replay ran no python): dump here.
+            self._dump_draft_step(step, num_reqs)
 
     def generate_draft(
         self,
@@ -690,6 +715,7 @@ class EagleSpeculator:
         num_tokens = input_batch.num_tokens_after_padding
         num_reqs = input_batch.num_reqs
         max_query_len = input_batch.num_scheduled_tokens.max()
+        self._dump_this_round = not (dummy_run or is_profile)
 
         # NOTE(woosuk): To avoid CPU-GPU synchronization without CPU knowing the
         # number of rejected tokens, we maintain the size of eagle's input_ids and
@@ -767,6 +793,8 @@ class EagleSpeculator:
                 cudagraph_runtime_mode=prefill_batch_desc.cg_mode,
                 mm_inputs=mm_inputs,
             )
+        # Draft step 0 is complete (a graph replay ran no python): dump here.
+        self._dump_draft_step(0, num_reqs)
         self._mtp_prefill_end(num_reqs)
 
         if self.num_speculative_steps == 1:
