@@ -332,6 +332,8 @@ This is another reason to evaluate individual flags on the current base.
 ## A/B list for Claude
 
 These are instructions for the service owner; none were executed by Astra.
+Per-flag logs, kernel names and fallback caveats are in the
+[route-hit checklist](c4140_sm70_route_hits.md).
 
 1. Four-cell factorial: G; A=`aaa498b56`; Fable=`93aaabdc5` + `ca959f993`
    (+ tests `6a2a121d3`) with `VLLM_SM70_TOPK_TOPP_BRANCHFREE=1`; A+Fable.
