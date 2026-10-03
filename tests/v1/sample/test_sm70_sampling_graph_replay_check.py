@@ -176,3 +176,60 @@ def test_main_exits_2_without_a_cuda_device(chk, monkeypatch, capsys):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     assert chk.main() == 2
     assert "needs a CUDA device" in capsys.readouterr().out
+
+
+def test_first_state_difference_reports_the_field_and_indices(chk):
+    before = {
+        "output_bin_counts": torch.zeros(2, 4, dtype=torch.int32),
+        "total_len": torch.tensor([5, 6]),
+    }
+    after = {k: v.clone() for k, v in before.items()}
+    assert chk.first_state_difference(before, after) is None
+
+    # The residue the GPU run found: one bin count, flat index 5 of a 2 x 4 row set.
+    after["output_bin_counts"][1, 1] = 1
+    assert chk.first_state_difference(before, after) == {
+        "field": "output_bin_counts",
+        "first_differing_flat_indices": [5],
+        "before_capture": [0],
+        "after": [1],
+    }
+    # Fields are checked in order; the first differing one is reported.
+    after["total_len"][0] = 9
+    assert chk.first_state_difference(before, after)["field"] == "output_bin_counts"
+    del before["output_bin_counts"], after["output_bin_counts"]
+    assert chk.first_state_difference(before, after)["field"] == "total_len"
+
+
+def test_pool_budget_allows_ten_percent_over_the_accepted_pool(chk):
+    assert chk.POOL_ACCEPTED_MIB == 58.0
+    assert chk.pool_within_budget(58.0, num_reqs=1)
+    assert chk.pool_within_budget(63.79, num_reqs=1)
+    assert not chk.pool_within_budget(63.81, num_reqs=1)
+    # The budget was measured for the (1, 5) key only.
+    assert chk.pool_within_budget(500.0, num_reqs=2)
+
+
+def test_exit_status_separates_capture_residue_from_round_mismatches(chk):
+    ok = {"capture_state_residue": None, "pass": True}
+    mismatch = {"capture_state_residue": None, "pass": False}
+    residue = {"capture_state_residue": {"field": "output_bin_counts"}, "pass": False}
+    assert chk.EXIT_STATE_RESIDUE == 3
+    assert chk.compute_exit_code([ok, ok]) == 0
+    assert chk.compute_exit_code([ok, mismatch]) == 1
+    assert chk.compute_exit_code([mismatch, residue]) == 3
+    assert chk.compute_exit_code([residue, ok]) == 3
+
+
+@pytest.mark.parametrize("tail", [False, True])
+def test_the_rig_model_state_matches_what_the_manager_restores(chk, tail):
+    """The stub must expose the buffer name the manager's restore list reads."""
+    from vllm.v1.worker.gpu.sample import cudagraph as cg
+
+    accepted = torch.ones(4, dtype=torch.int32)
+    stub = chk._StubModelState(accepted, tail)
+    assert cg.model_state_postprocess_is_capture_safe(stub) is (not tail)
+    regions = cg.model_state_persistent_regions(stub, 2)
+    assert [(t.data_ptr(), r) for t, r in regions] == [
+        (accepted.data_ptr(), slice(0, 2))
+    ]
