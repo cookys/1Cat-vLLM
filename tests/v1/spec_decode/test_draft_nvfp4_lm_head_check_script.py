@@ -42,15 +42,17 @@ def cpu_ops(monkeypatch):
     monkeypatch.setattr(dh, "get_tensor_model_parallel_world_size", lambda: 1)
 
 
-def _shards(num_shards, rows=256, seed=0):
+def _shards(num_shards, rows=256, seed=0, pad=0, edit=None):
     gen = torch.Generator().manual_seed(seed)
     weights, heads = [], []
     for shard in range(num_shards):
         weight = (torch.randn(rows, K, generator=gen) * 0.02).half()
+        if edit is not None:
+            edit(weight)
         lm_head = SimpleNamespace(
             weight=weight,
             shard_indices=SimpleNamespace(
-                org_vocab_start_index=shard * rows, num_org_vocab_padding=0
+                org_vocab_start_index=shard * rows, num_org_vocab_padding=pad
             ),
         )
         weights.append(weight)
@@ -131,3 +133,76 @@ def test_single_shard_scope_and_rank_histogram(script, cpu_ops):
     assert abs(result["rank_hist"]["1"] - (70 - wrong_raw)) <= 2
     assert result["disagreement_rows"]["64"] <= wrong_raw
     assert result["fp16_top1_top2_gap_p50"] >= result["fp16_top1_top2_gap_p10"] >= 0
+
+
+def test_tp_rank_picks_the_default_dump_files(script, tmp_path):
+    torch.save({"hidden": _hidden(4, 1)}, tmp_path / "rank0_step00000.pt")
+    torch.save({"hidden": _hidden(5, 2)}, tmp_path / "rank2_step00000.pt")
+    args = SimpleNamespace(
+        hidden_dump=tmp_path,
+        hidden_glob=None,
+        tp_rank="2",
+        max_hidden_rows=0,
+        num_hidden=0,
+        sigma=1.0,
+        seed=0,
+    )
+    hidden, source, files = script.make_hidden(args, torch.device("cpu"))
+    assert hidden.shape[0] == 5 and files == 1
+    args.tp_rank = "all"
+    hidden, _, _ = script.make_hidden(args, torch.device("cpu"))
+    assert hidden.shape[0] == 4
+    args.tp_rank, args.hidden_glob = "2", "rank*_step*.pt"
+    hidden, _, files = script.make_hidden(args, torch.device("cpu"))
+    assert hidden.shape[0] == 9 and files == 2
+    args.hidden_glob, args.tp_rank = None, "1"
+    with pytest.raises(SystemExit, match="hidden-glob"):
+        script.make_hidden(args, torch.device("cpu"))
+
+
+def test_f16_ulp_matches_numpy_nextafter(script):
+    np = pytest.importorskip("numpy")
+    values = np.array(
+        [0.0, 1e-7, 3e-5, 6.2e-5, 0.1, 0.5, 1.0, 1.5, 1.9990234, 2.0, 7.3, 31.9, 100.0],
+        dtype=np.float16,
+    )
+    expected = np.nextafter(values, np.float16(np.inf)).astype(np.float64) - values
+    got = script.f16_ulp(torch.from_numpy(values.astype(np.float32)))
+    assert np.allclose(got.double().numpy(), expected, rtol=0, atol=0)
+    assert script.f16_ulp(torch.tensor(-2.0)) == script.f16_ulp(torch.tensor(2.0))
+
+
+def test_near_tie_rate_separates_fp16_ties_from_4bit_effects(script, cpu_ops):
+    def tie_rows(weight):
+        weight[6] = weight[5]  # identical rows -> identical FP16 logits
+
+    weights, heads = _shards(1, rows=256, edit=tie_rows)
+    hidden = _hidden(40, seed=6)
+    hidden[:4] = (weights[0][5].float() * 40).half()  # rows 5 and 6 tie on top
+    result = script.evaluate(heads, weights, hidden, [0, 64])
+    assert result["fp16_near_tie_rows"] >= 4
+    assert result["fp16_near_tie_rate"] == pytest.approx(
+        result["fp16_near_tie_rows"] / 40
+    )
+    assert result["fp16_exact_top1_ties"] >= 4
+    for r in ("0", "64"):
+        assert (
+            result["disagreement_rows_not_near_tie"][r]
+            <= result["disagreement_rows"][r]
+        )
+    rate = result["disagreement_rate_not_near_tie"]["64"]
+    assert rate == result["disagreement_rows_not_near_tie"]["64"] / (
+        40 - result["fp16_near_tie_rows"]
+    )
+
+
+def test_padding_rows_are_masked_in_both_paths(script, cpu_ops):
+    def plant(weight):
+        weight[-3:] = 5 * weight[0]  # would win everywhere if not masked
+
+    weights, heads = _shards(1, rows=256, pad=3, edit=plant)
+    hidden = _hidden(20, seed=8)
+    hidden[:] = (weights[0][0].float() * 30).half()
+    result = script.evaluate(heads, weights, hidden, [0, 64])
+    assert result["disagreement_rate"]["64"] == 0.0
+    assert 0.0 < result["logits_rel_l2"] < 0.2  # padding excluded, no inf/nan

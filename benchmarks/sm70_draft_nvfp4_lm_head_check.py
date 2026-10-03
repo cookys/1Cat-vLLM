@@ -18,15 +18,26 @@ production helper, runs the real QPN2 ops and the real rerank, and reports:
 Scope.  ``--tp-rank <r>`` loads one shard (about 1 GB of VRAM); the final token
 is then the shard-local winner.  ``--tp-rank all`` loads all ``--tp-size``
 shards on the one GPU (about 2 GB) and reproduces the production TP reduction,
-so the disagreement is that of the real global draft token.
+so the disagreement is that of the real global draft token.  A single-shard,
+shard-local comparison is a proxy for the TP4 global token: the global winner is
+the largest of the shard-local winners, so it can differ between the two paths
+only if some shard's local winner differs (or, rarely, when two shards' top
+values sit within one FP16 rounding step of each other).
+
+``fp16_near_tie_rate`` is the share of rows whose top-2 FP16 logits differ by
+less than one FP16 ulp of the maximum (exact ties included).  On those rows the
+FP16 argmax itself is a coin flip, so a disagreement there is FP16 rounding, not
+a 4-bit effect; ``disagreement_rate_not_near_tie`` is the disagreement over the
+remaining rows.  Padding rows of a shard are masked in both paths.
 
 Hidden states.  ``--hidden-dump`` takes (a) a directory written by
 ``VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_DIR`` (files ``rank*_step*.pt``, dicts with a
-``hidden`` tensor; ``--hidden-glob`` selects them, default ``rank0_step*.pt``
-because the hidden states are replicated across TP ranks), (b) one such file,
-or (c) a plain ``torch.save``'d float16 tensor [n, 2560].  Without it the rows
-are random N(0, --sigma), which makes the numbers pessimistic: random vectors
-have no dominant token.
+``hidden`` tensor; the files are filtered by ``--tp-rank``, i.e.
+``rank<r>_step*.pt`` (``rank0_step*.pt`` for ``--tp-rank all``), because the
+hidden states are replicated across TP ranks; ``--hidden-glob`` overrides),
+(b) one such file, or (c) a plain ``torch.save``'d float16 tensor [n, 2560].
+Without it the rows are random N(0, --sigma), which makes the numbers
+pessimistic: random vectors have no dominant token.
 
     CUDA_VISIBLE_DEVICES=<gpu> python benchmarks/sm70_draft_nvfp4_lm_head_check.py \
         --tp-rank all --hidden-dump /data/bench/draft_hidden \
@@ -72,7 +83,13 @@ def _parse_args() -> argparse.Namespace:
         help="dump directory / file from VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_DIR, or a "
         "torch.save'd float16 tensor [n, 2560]",
     )
-    parser.add_argument("--hidden-glob", type=str, default="rank0_step*.pt")
+    parser.add_argument(
+        "--hidden-glob",
+        type=str,
+        default=None,
+        help="files of a --hidden-dump directory; default rank<tp-rank>_step*.pt "
+        "(rank0_step*.pt for --tp-rank all)",
+    )
     parser.add_argument(
         "--max-hidden-rows", type=int, default=0, help="cap on rows used (0 = all)"
     )
@@ -107,7 +124,9 @@ def load_hidden_dump(path: Path, glob: str) -> tuple[torch.Tensor, int]:
     """Hidden states [n, 2560] float16 (CPU) from a dump directory, file or tensor."""
     files = sorted(path.glob(glob)) if path.is_dir() else [path]
     if not files:
-        raise SystemExit(f"no files matching {glob!r} in {path}")
+        raise SystemExit(
+            f"no files matching {glob!r} in {path} (override with --hidden-glob)"
+        )
     parts = []
     for file in files:
         loaded = torch.load(file, map_location="cpu")
@@ -122,7 +141,12 @@ def make_hidden(
 ) -> tuple[torch.Tensor, str, int]:
     files = 0
     if args.hidden_dump is not None:
-        hidden, files = load_hidden_dump(args.hidden_dump, args.hidden_glob)
+        glob = args.hidden_glob or (
+            "rank0_step*.pt"
+            if args.tp_rank == "all"
+            else f"rank{int(args.tp_rank)}_step*.pt"
+        )
+        hidden, files = load_hidden_dump(args.hidden_dump, glob)
         source = f"dump:{args.hidden_dump} ({files} file(s))"
     else:
         gen = torch.Generator(device="cpu").manual_seed(args.seed)
@@ -175,6 +199,12 @@ def weight_error(weight: torch.Tensor) -> float:
     return float((num / den).sqrt())
 
 
+def f16_ulp(value: torch.Tensor) -> torch.Tensor:
+    """FP16 spacing at ``|value|``: 2**(floor(log2|v|) - 10), 2**-24 below 2**-14."""
+    exponent = torch.floor(torch.log2(value.float().abs().clamp_min(2.0**-14)))
+    return torch.exp2(exponent - 10)
+
+
 @torch.no_grad()
 def evaluate(
     heads: list[dh.DraftNvfp4LMHead],
@@ -194,7 +224,8 @@ def evaluate(
     disagree = dict.fromkeys(ranks, 0)
     sq_err = torch.zeros((), dtype=torch.float64, device=hidden.device)
     sq_ref = torch.zeros_like(sq_err)
-    all_ranks, gaps, ties, total = [], [], 0, 0
+    far_disagree = dict.fromkeys(ranks, 0)
+    all_ranks, gaps, ties, near_ties, total = [], [], 0, 0, 0
     for begin in range(0, hidden.shape[0], dh.MAX_ROWS):
         h = hidden[begin : begin + dh.MAX_ROWS].contiguous()
         m = h.shape[0]
@@ -213,14 +244,22 @@ def evaluate(
                 head.accumulator_chains,
             )
             qs.append(q)
-        for ref, q in zip(refs, qs):
-            sq_err += ((q.float() - ref.float()) ** 2).sum().double()
-            sq_ref += (ref.float() ** 2).sum().double()
+        for head, ref, q in zip(heads, refs, qs):
+            valid = n - head.num_org_vocab_padding
+            sq_err += (
+                ((q[:, :valid].float() - ref[:, :valid].float()) ** 2).sum().double()
+            )
+            sq_ref += (ref[:, :valid].float() ** 2).sum().double()
+            if head.num_org_vocab_padding:  # same padding mask as the head applies
+                ref[:, valid:] = float("-inf")
+                q[:, valid:] = float("-inf")
 
         full = torch.cat(refs, dim=1)
         top2 = full.float().topk(2, dim=-1).values
         gaps.append((top2[:, 0] - top2[:, 1]).cpu())
         ties += int((top2[:, 0] == top2[:, 1]).sum())
+        near_tie = (top2[:, 0] - top2[:, 1]) < f16_ulp(top2[:, 0])
+        near_ties += int(near_tie.sum())
         ref_index = full.argmax(dim=-1)  # index into the concatenated shards
         ref_shard, ref_local = ref_index // n, ref_index % n
         ref_token = ref_local + starts[ref_shard]
@@ -239,7 +278,9 @@ def evaluate(
                 ids.append(token)
             winner = torch.stack(values).argmax(dim=0)
             token = torch.stack(ids).gather(0, winner[None])[0]
-            disagree[r] += int((token != ref_token).sum())
+            differs = token != ref_token
+            disagree[r] += int(differs.sum())
+            far_disagree[r] += int((differs & ~near_tie).sum())
         total += m
 
     ranks_t = torch.cat(all_ranks)
@@ -256,6 +297,15 @@ def evaluate(
         "logits_rel_l2": float((sq_err / sq_ref).sqrt()),
         "disagreement_rate": {str(r): disagree[r] / total for r in ranks},
         "disagreement_rows": {str(r): disagree[r] for r in ranks},
+        "disagreement_rate_not_near_tie": {
+            str(r): (
+                far_disagree[r] / (total - near_ties) if total > near_ties else None
+            )
+            for r in ranks
+        },
+        "disagreement_rows_not_near_tie": {str(r): far_disagree[r] for r in ranks},
+        "fp16_near_tie_rate": near_ties / total,
+        "fp16_near_tie_rows": near_ties,
         "rank_hist": dict(zip(RANK_LABELS, counts)),
         "rank_p50": float(ranks_t.float().median()),
         "rank_p99": float(ranks_t.float().quantile(0.99)),
@@ -449,6 +499,10 @@ def main() -> None:
     acc = summary["accuracy"]
     print(f"logits rel-L2={acc['logits_rel_l2']:.4f} scope={acc['scope']}")
     print(f"disagreement_rate per R (NVFP4+rerank vs FP16): {acc['disagreement_rate']}")
+    print(
+        f"fp16_near_tie_rate={acc['fp16_near_tie_rate']:.4f}; disagreement_rate "
+        f"excluding near ties: {acc['disagreement_rate_not_near_tie']}"
+    )
     print(f"rank histogram of the FP16 argmax in NVFP4 logits: {acc['rank_hist']}")
 
     summary["timings_us"] = timings(
