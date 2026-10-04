@@ -137,6 +137,12 @@ p070 的 N=8 每人 ctx：MTP4 三種皆為 0；不開 MTP 為 26,656（E4M3）�
 不開 MTP 時沒有計入回收 draft 權重的預算；Astra 的 1.247 GiB 是 p069 的估計，p070 的權重不同，未重估。
 p070 上 MTP4 在 N≥8 時 GDN state 稅就吃光預算，4-bit KV 解決不了。
 
+p070 欄反映目前 p070 的 pool，錨點是 263,538 tokens。這個 pool 比 p069 少，已識別的原因是上游 `b75d3cd0f`
+把五個 batch pack 開關的預設由 0 改為 1，可逐項核算的額外副本約 1.23 GiB 每 rank
+（llm-playground repo 的 `doc/survey/2026-10-03-c4140-p069-astra.md` §I，`:3003-3012`、`:3068-3072`）。
+Fable 在 GPU 上驗證五個開關全關後，預期 pool 回到約 411K 到 414K tokens；這是預期值，不是量測。
+本欄會在該實測 pool 出來後重算，這裡不自行估計。
+
 ## 已交付（皆 CPU）
 
 | 項目 | 位置 |
@@ -269,13 +275,35 @@ NVFP4 的末維是 144 所以被擋；`qsa_sparse_paged_attention` 對 dtype 字
 
 合計單人約 1.5 到 2 週，其中約 1 週要占 GPU。
 
+## 品質驗證：SGLang 的證據不是 1Cat 的上界
+
+fleet SGLang 的品質數字，nvfp4 對 bf16 KV 的 ΔNLL 為 +0.0042 到 +0.0096 nats/token
+（llm-playground repo 的 `engines/patches/sglang-qsa-nvfp4-kv/README.md:327-332`），**不能當 1Cat 的上界**。
+
+SGLang 的第一個 4096-token prefill chunk 內，位置從不讀 pooled KV，所以 2K 視窗在所有 KV dtype 間逐位元相同，
+較長視窗的平均 ΔNLL 也被這段零誤差的位置稀釋（同檔 `:345-346`；`notes/methodology/kv-cache-quality-probe.md` 規則三）。
+1Cat 的 QSA 在同一個 forward 內先寫後讀：`_run_qsa` 先呼叫 `do_kv_cache_update`（`qsa.py:943`），
+再呼叫 `forward_qsa`（`qsa.py:950`），讀的就是剛量化寫入的 cache。所以量化誤差從第一個 chunk 就存在。
+
+`scripts/eval/kv-logprob-probe.py` 的計畫因此要這樣訂：
+
+1. **第一個 prefill chunk 的視窗是必備的**，打分位置全落在第一個 chunk 內。保留 2K 視窗：它們在 SGLang 上沒有訊號，
+   在 1Cat 上卻是第一個 chunk 的直接量測。chunk 邊界取 1Cat 的 scheduler chunk 大小，從 serve 設定讀，不沿用 SGLang 的 4096。
+2. 第一個 chunk 的視窗、≥32K 視窗與 96K 桶分開報告，不併成一個 pooled 數字。
+3. 每個比較都含未量化 KV 的重跑組，先看重跑組的 CI，小於它的差距無法解析（規則一）。1Cat 的每個 server 行程
+   會落在兩種數值狀態之一（`notes/methodology/serving-determinism-floor.md`），所以每一組啟動後先過 12 案
+   `--no-logprobs` parity，確認落在同一個狀態，否則重跑組量到的是啟動狀態差，不是 KV 精度。
+4. 閾值沿用工具的提案規則：ΔNLL 95% CI 上界不超過 +0.005 nats 才算通過。
+5. [未驗證] 工具的說明提到 `/flush_cache` 與 `logprob_start_len`，是 SGLang 的介面；能否直接對 1Cat vLLM 抓 logprob 沒有查，
+   可能要用 vLLM 的 prompt logprobs 做 adapter。
+
 ## 未完成與開放問題
 
 1. 沒有 attention reader。`_run_qsa` 拒絕執行，page4、ops 入口、`forward_qsa` 另有三層擋下，reader 上線時要逐層放行並補明確的 `kv_cache_dtype` 守衛。
 2. Triton store 與 gather 只在直譯器跑過；sm_70 只證明能編譯、資源小，沒有在 V100 執行，沒有速度。
    store 的捨入平手無法與 SM100 的 PTX 對拍。
-3. 融合 reader 的 QK 是兩段部分和，與 gather 加 FP16 的路徑不會逐位元相同；可接受的差距要用 `kv-logprob-probe` 對 bf16 重跑組定，不能用 SWE-34。
+3. 融合 reader 的 QK 是兩段部分和，與 gather 加 FP16 的路徑不會逐位元相同；可接受的差距要用 `kv-logprob-probe` 對重跑組定，不能用 SWE-34。
 4. draft 的 scale 載入對 nvfp4 只由 `model.py` 的旗標放行，沒有 draft 實測，里程碑 2 要驗。
-5. 首個 prefill chunk 也讀量化 KV（QSA 先寫後讀），SGLang 的 ΔNLL 證據不能當上界。
+5. 首個 prefill chunk 也讀量化 KV（QSA 先寫後讀），SGLang 的 ΔNLL 證據不能當上界；驗證計畫見上一節。
 6. packed 頁在 DCP1 下與 `KVBlockZeroer`、offload 的互動沒有驗證；測試只涵蓋 member view 的寫入不碰鄰居。
 7. store 的 K、V 各一次啟動的實際成本，以及 `rows` 大時的 grid 形狀，沒有量。
