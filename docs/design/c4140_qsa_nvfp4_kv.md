@@ -412,6 +412,16 @@ cd <worktree> && CUDA_VISIBLE_DEVICES=<idle gpu> PYTHONPATH=$PWD \
 它會拿走服務的剩餘記憶體。`STORE_MATCHES_REFERENCE` 在 GPU 上為 NO 時先看差異是否只在 scale 位元組、是否在捨入平手點：
 Triton 的 fp32 除法不一定是 IEEE，參考用的是 IEEE 除法。
 
+### chain19 草稿
+
+`scripts/c4140-ab/chain19-nvfp4-m1.sh`（llm-playground，未 commit，未對伺服器執行；`bash -n` 與 shellcheck 乾淨，`C19_DRY=1` 的乾跑只印計畫）：
+操作員呼叫，檢查 `TARGET_VENV`（不得是 `1cat-m589`）、p071 tip 等於 `WANT_TIP`、視窗檔存在；記下 production 現在的 `C4140_*` 啟動環境；
+備份將被改動的 venv 檔案；同步 p071 的 Python 檔案並做 import smoke；對 nvfp4、fp8_e4m3、fp16 三種 KV 各自 settle（先 fresh compile，再重啟到
+連續兩個實例的 12 案 `--no-logprobs` parity 相同才算同一個數值狀態），量 prefill-probe（nvfp4 與 E4M3 對照）與探針（每臂加一個同實例重跑臂），
+最後 compare，並從備份還原 venv、用記下的環境 `serve restart` 回 production。全程無 MTP，同一個 `--max-model-len`。
+2026-10-04 的乾跑從執行中的服務讀到 `C4140_STACK=p070`：`TARGET_VENV` 就是 production 的 venv，鏈在 production 停機期間改它並在結束或任何
+訊號時還原；被 `kill -9` 時用 `C19_RESTORE_ONLY=<備份目錄>` 還原。標了 `# UNVERIFIED:` 的參數沒有驗證過。
+
 ## 品質驗證：SGLang 的證據不是 1Cat 的上界
 
 fleet SGLang 的品質數字，nvfp4 對 bf16 KV 的 ΔNLL 為 +0.0042 到 +0.0096 nats/token
@@ -431,8 +441,27 @@ SGLang 的第一個 4096-token prefill chunk 內，位置從不讀 pooled KV，�
    會落在兩種數值狀態之一（`notes/methodology/serving-determinism-floor.md`），所以每一組啟動後先過 12 案
    `--no-logprobs` parity，確認落在同一個狀態，否則重跑組量到的是啟動狀態差，不是 KV 精度。
 4. 閾值沿用工具的提案規則：ΔNLL 95% CI 上界不超過 +0.005 nats 才算通過。
-5. [未驗證] 工具的說明提到 `/flush_cache` 與 `logprob_start_len`，是 SGLang 的介面；能否直接對 1Cat vLLM 抓 logprob 沒有查，
-   可能要用 vLLM 的 prompt logprobs 做 adapter。
+5. 工具現在有 vLLM 後端（見下），但沒有對真的 1Cat vLLM 跑過。
+
+### 探針的 vLLM 後端
+
+llm-playground 的 `scripts/eval/kv-logprob-probe.py capture --backend vllm`，在工作樹中，由 Fable 審閱後 commit；SGLang 路徑一行未動：
+
+- 走 `/v1/completions`，`prompt_logprobs=20`、`max_tokens=1`。vLLM 對整個 prompt 都算 logprob，沒有 `logprob_start_len`，
+  所以由客戶端保留視窗的最後 N 個位置，輸出 JSON 與 SGLang 的相同，`compare` 不用改。`max_tokens=0` 只在 `echo=true` 時被伺服器接受，
+  所以一律送 1。
+- 快取：p070 的 vLLM 對要求 prompt logprobs 的請求本來就不讀 prefix cache（`sampling_params.py:480-484`）。預設再用 nonce 前綴防守：
+  每個視窗前面加 8 個由 salt 與視窗 id 決定的 token。salt 在所有臂（含重跑臂）相同，所以比較的內容相同；視窗 id 讓每個視窗的 nonce 都不同。
+  所有位置因此平移 nonce 長度，存檔的 `start`、`pos0`、`length` 仍是視窗座標，打分的仍是視窗最後 N 個位置。
+  `--flush-mode reset` 呼叫 `/reset_prefix_cache`，它只在 `VLLM_SERVER_DEV_MODE=1` 時存在，而 DEV_MODE 在 compile key 內，所以不是預設。
+  `cached_tokens` 警告仍是偵測器，伺服器要加 `--enable-prompt-tokens-details` 才會回報，而且只在非零時回報，所以缺值記成 null。
+- **探針跑的是 eager sampler**：要求 logprobs 的請求讓 1Cat 的 patch-3 sampling CUDA graph 退回 eager sampler。探針量的是 KV 品質，所以可以接受，
+  但它不是 client 取樣路徑的證據；parity 檢查用 `--no-logprobs`，也是這個原因。
+- 第一個 prefill chunk：serve 的 `--max-num-batched-tokens` 是 8192，2K 視窗加 8 個 nonce token 完全在第一個 chunk 內，所以 2K 桶就是第一個 chunk
+  的桶，報告時與 ≥32K 桶分開看。
+- 成本：每個位置 21 筆含解碼文字的 entry，約 2 KB，96K 視窗約 200 MB 的 JSON；例行臂用 2K、8K、32K，96K 要先過 smoke。
+- 驗證：CPU 上 41 個測試（18 個新），用行程內的假 vLLM 伺服器，含「與 SGLang 解析器對同一份 logprob 給出相同結果」；
+  對探針的 7 個突變都被測試抓到。
 
 ## 未完成與開放問題
 
