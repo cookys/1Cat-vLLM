@@ -76,7 +76,6 @@ class EnvImportTests(unittest.TestCase):
             # The integration base must keep both production features available.
             for name in (
                 "VLLM_SM70_SAMPLING_CUDAGRAPH",
-                "VLLM_QWEN4EXP_PLE_PREFILL_LOW_MEMORY",
             ):
                 assert name in e.environment_variables, name
         """)

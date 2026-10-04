@@ -46,14 +46,22 @@ def load_policy():
 POLICY = load_policy()
 
 
+class _SpecDefaults:
+    # Upstream KV specs report their token span through global_block_size().
+    dcp_sharded = False
+
+    def global_block_size(self, dcp_world_size=1, pcp_world_size=1):
+        return self.block_size
+
+
 @dataclasses.dataclass(frozen=True)
-class FullSpec:
+class FullSpec(_SpecDefaults):
     block_size: int
     prefix_cacheable: bool = True
 
 
 @dataclasses.dataclass(frozen=True)
-class MambaSpec:
+class MambaSpec(_SpecDefaults):
     block_size: int
     prefix_cacheable: bool = True
     mamba_cache_mode: str = "align"
@@ -62,7 +70,7 @@ class MambaSpec:
 
 
 @dataclasses.dataclass(frozen=True)
-class CircularSpec:
+class CircularSpec(_SpecDefaults):
     block_size: int
     prefix_cacheable: bool = False
 
