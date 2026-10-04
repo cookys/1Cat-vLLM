@@ -177,8 +177,8 @@ CUDA_VISIBLE_DEVICES= PYTHONPATH=$PWD uv run --no-project --python /data/venvs/1
   --with pytest -- python -m pytest --noconftest \
   tests/models/qwen4_exp/test_nvfp4_kv_{reference,admission,scale,triton,store,decode,sm70_compile}.py \
   tests/models/qwen4_exp/test_sm70_nvfp4_kv_kernel_check_cpu.py -q
-342 passed, 83 skipped   # 參考 129、准入與 spec 與 allocator 65、scale 66、編譯閘門 27、步驟 E 腳本 55；Triton gather 19、store 31、decode 32 與腳本的 1 個端到端預設略過
-TRITON_INTERPRET=1 同上   # 398 passed, 27 skipped；編譯閘門需要真的編譯器，直譯器下略過
+343 passed, 83 skipped   # 參考 129、准入與 spec 與 allocator 65、scale 66、編譯閘門 27、步驟 E 腳本 56；Triton gather 19、store 31、decode 32 與腳本的 1 個端到端預設略過
+TRITON_INTERPRET=1 同上   # 399 passed, 27 skipped；編譯閘門需要真的編譯器，直譯器下略過
 ```
 
 - 參考測試含「SM100 約定釘選」：讀 `csrc` 原始碼字串，斷言頁版面、`1/k_scale`、scale 運算順序、
@@ -211,7 +211,7 @@ TRITON_INTERPRET=1 同上   # 398 passed, 27 skipped；編譯閘門需要真的�
   內核裡 V scale 不折疊一開始沒有被抓到（31 個全過），原因是單 split 分支沒有非 1 純量的測試，補上後 2 個失敗。
 - 既有內核沒有被改動的證據：把 split-K（E4M3 與 FP16，三種 tile 與 warp 組合）與 merge（E4M3 與 FP16）共 8 個既有組態
   編到 sm_70，去掉原始碼行號資訊後的 PTX 在修改前後逐位元相同。
-- 步驟 E 腳本的 CPU 測試（56 個）：參數、從真實 config 讀出的幾何、case 與 cache 規劃、種子化的 K/V 與含非法項的 top-k
+- 步驟 E 腳本的 CPU 測試（57 個）：參數、從真實 config 讀出的幾何、case 與 cache 規劃、種子化的 K/V 與含非法項的 top-k
   （非法位置的預期與 `nvfp4_entry_validity` 逐項一致）、位元組比對、誤差與計時統計、ABBA 順序、verdict 與結束碼、
   沒有 CUDA 與 GPU 已被佔用時的快速失敗，以及自檢的邏輯（突變函式、tie 資料、誤差帶、各種失敗與跳過階段）；
   直譯器下另有一個小 case 從 store 到計時與自檢完整跑一遍，要求 `SELF_CHECK: PASS`。
