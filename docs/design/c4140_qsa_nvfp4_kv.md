@@ -226,7 +226,7 @@ TRITON_INTERPRET=1 同上   # 399 passed, 27 skipped；編譯閘門需要真的�
   改為直接跑 ruff 0.14.0 的 `check` 與 `format`、typos、markdownlint-cli2 0.21.0，以及 `tools/pre_commit` 內的
   spdx、forbidden-imports、torch-cuda、boolean-context-manager、lazy-imports、env-registration 腳本。mypy 未跑。
 
-## 編譯路徑與 reader（步驟 C，只有計畫，沒有 reader 程式碼）
+## 編譯路徑與 reader（步驟 C，只有計畫，沒有 reader 程式碼 — 2026-10-05 起有程式，見下）
 
 ### sm_70 編譯實測
 
@@ -314,6 +314,40 @@ decode 的 M5 與 M1 都在一組內；prefill 的列數大時逐組處理，預
 
 合計單人約 1.5 到 2 週，其中約 1 週要占 GPU。
 
+### 2026-10-05：融合 reader 已建（CPU）
+
+上面「只有計畫」的描述到 2026-10-05 為止；tip `e56be74f1`（`[Kernel][SM70] Fused NVFP4 reader in the QSA split-K kernel (KV_NVFP4, plan 071 step C)`）起有程式。
+**所有證據都是 CPU（直譯器與 sm_70 編譯閘門）；GPU 上沒有跑過任何一項【沒數據】。**
+
+- **內容**：`_qsa_sparse_paged_gqa_splitk_kernel`（`vllm/models/qwen4_exp/nvidia/ops/qsa.py`）加 `KV_NVFP4` constexpr 分支，不是新內核。
+  K tile 解成偶／奇兩半 `[HEAD_DIM/2, BLOCK_N]`，QK = 兩次 K=128 的 `tl.dot`；V 兩個半累加器，最後 stride 2 寫回；
+  layer scale 照 gathered 路徑折疊（k_scale 乘在分數、v_scale 在正規化後）；無效 lane 載入 byte 0 加 scale 0，所以精確為 0；merge 內核沒改。
+  解碼 helper 是 `nvfp4_kv_triton.py` 的 `_nvfp4_tile_halves`；新增的內核參數是 K／V block-scale 指標加 6 個 stride（來自 `nvfp4_side_views`）。
+- **旋鈕**：環境變數 `VLLM_SM70_QSA_NVFP4_FUSED_READER`（**預設 0 = 走 gather 路徑**；登記在 `vllm/envs.py` 與 `docs/configuration/env_var_reference.md`），
+  或 `qsa_sparse_paged_attention(..., nvfp4_fused_reader=True)`；判斷函式 `qsa_nvfp4.nvfp4_fused_reader_enabled()`。
+  fused 一律用 pre-Ampere profile（BLOCK_N 16、4 warps），並略過 two-warp partial 與 page4 兩條路由；原本的 admission 檢查都保留。
+- **sm_70 編譯閘門**（Triton ptxas，無 GPU；TOPK 2051、PAGE 2784、HEAD 256、GROUP 6、64 splits、BLOCK_N 16）：
+
+| 內核 | warps | 暫存器 | stack | shared |
+|---|---|---:|---:|---:|
+| 融合 reader（KV_NVFP4） | 4 | **255** | 0 B | 16,384 B |
+| 融合 reader（KV_NVFP4） | 2 | 255 | **1,096 B（溢出）** | 16,384 B |
+| gathered（步驟 D 的 FP16 split-K） | 4 | 166 | 0 | 24,576 B |
+| gathered（步驟 D 的 FP16 split-K） | 2 | 255 | 0 | 24,576 B |
+
+  fused 2 warps 的溢出只記為上限，不是目標。**注意：fused 4 warps 的 255 暫存器已經在上限，沒有餘裕**；occupancy 與之後任何成長會怎樣是 GPU 問題【沒數據】。
+  既有的 KV_E4M3、FP16、gathered 啟動的 PTX 不變（測試守住）；禁用指令清單乾淨。
+- **直譯器 parity**（`tests/models/qwen4_exp/test_nvfp4_kv_fused.py`）：fused 對 gather 對 FP16 內核，容差 rtol／atol 2e-3（FP16 捨入內；兩段 dot 的 QK 依設計不逐位元相同，見上方「不做 interleave」）。
+  涵蓋 layer scale ≠ 1、非法與毒化項、共用 page 與重複項、output gate、LSE、單 split 路徑、旋鈕預設 = gather、admission 檢查。
+- **步驟 E 腳本**：`benchmarks/sm70_nvfp4_kv_kernel_check.py` 多一個 `fused` arm（`--arms` 預設 `gather fused`）：
+  `FUSED_MATCHES_GATHER`（對 gather 的 rel-L2 ≤ 2e-3，加精確零）、`FUSED_VS_FP16`、`FUSED_ROUNDTRIP_US`（每次 launch 的 fused／gather 比），以及走 fused 路由的突變對照。
+- **測試數**（NVFP4 檔案：`test_nvfp4_kv_*.py`、`test_sm70_nvfp4_kv_kernel_check_cpu.py`、`test_sm70_moe_unique_experts_bench_cpu.py`）：
+  直譯器 440 passed、32 skipped；預設 377 passed、95 skipped。
+  ⚠ 不要對整個 `tests/models/qwen4_exp/` 跑 pytest：沒有 GPU 時 GPU-only 模組在收集階段就報 No CUDA；只跑上列檔案。
+- **【沒數據】（全部要 GPU 窗）**：fused 的實際 occupancy 與 decode `round_ms`（M1 的懲罰是 +0.898 ms/round，閘門 4 目標是回到約 E4M3）；prefill 對 E4M3 的比（閘門 4 要 ≥ 0.9，M1 是 0.435／0.459）；
+  `FUSED_MATCHES_GATHER`、`FUSED_ROUNDTRIP_US` 的實測；fused 路由放進 serve 後的 12 案 parity 與 `kv-logprob-probe`；M=5（MTP4 verify）。
+  環境變數的轉發：serve script 經 `scripts/fence.sh`（`systemd-run --user --scope`，前景，繼承 cwd 與 env）啟動 `vllm serve`，呼叫端 export 的 `VLLM_SM70_QSA_NVFP4_FUSED_READER=1` 會到達 server 行程（Fable 讀 fence.sh 第 20 行確認，機制同 production 的 `VLLM_SM70_SAMPLING_CUDAGRAPH=1`）；server 上的實際行為仍未跑過【沒數據】。
+
 ## 步驟 D：reader 接進稀疏注意力，先 gather 再走 FP16
 
 沒有發現設計衝突：gather 出來的 FP16 張量可以直接當成分頁 cache 餵給現成的內核而不複製；K 與 V 的 layer scale 折疊位置
@@ -355,6 +389,8 @@ decode 的 M5 與 M1 都在一組內；prefill 的列數大時逐組處理，預
   只有容差意義上的相等。
 
 ### 融合 reader：之後的最佳化，這次不建
+
+> 2026-10-05 更新：融合 reader 已在 CPU 上建好（tip `e56be74f1`），見「編譯路徑與 reader」的「2026-10-05：融合 reader 已建（CPU）」；GPU 上仍沒有數據。以下為原文。
 
 結構已在步驟 C 寫出（`KV_NVFP4` constexpr 分支、偶奇兩塊 tile、fp16 精確解碼、scale 位置同 E4M3）。相對於步驟 D 的差別：
 省掉 1 KiB/token 的暫存寫讀與十幾個 torch 運算，少一次啟動；代價是 QK 變成兩段 K=128 的部分和，與 D 的路徑不再逐位元相同，
