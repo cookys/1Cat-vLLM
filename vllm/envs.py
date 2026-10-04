@@ -959,6 +959,7 @@ if TYPE_CHECKING:
     VLLM_QWEN4EXP_PLE_HOST_GIB: float | None = None
     VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB: float | None = None
     VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB: float | None = None
+    VLLM_QWEN4EXP_PLE_EXACT_PIN: bool = True
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -6660,6 +6661,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=True,
     ),
     # Capture the post-target sampling chain of the V2 speculative-decode path
     # (temperature/min-p/top-k/top-p, rejection sampling, post_update) as one
@@ -6706,6 +6708,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=True,
     ),
     # Largest request count for which a sampling graph is captured; every
     # num_reqs in 1..MAX_REQS gets one graph per captured signature.
@@ -6727,6 +6730,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="1",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=True,
     ),
     # Draft-only NVFP4 copy of the lm_head for the SM70 MTP speculator: the
     # draft's greedy argmax screens the vocabulary with a 4-bit copy (~89 MB
@@ -6759,6 +6763,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=True,
     ),
     "VLLM_SM70_MTP_DRAFT_NVFP4_RERANK_K": env_var(
         lambda: int(
@@ -6782,6 +6787,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="64",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # Diagnostic dump of the hidden states the draft lm_head consumes (see
     # draft_hidden_dump.py): a staged device copy captured in the draft graphs
@@ -6815,6 +6821,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_STEPS": env_var(
         lambda: int(os.getenv("VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_STEPS", "256")),
@@ -6831,6 +6838,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="256",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # Diagnostic SM70 async scheduling depth override. Default 0 preserves
     # upstream behavior. Values >2 let no-PP async scheduling enqueue more real
@@ -14965,6 +14973,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=True,
+    ),
+    # Pin the hybrid PLE host table at its exact size by registering a plain
+    # allocation; 0 restores torch's power-of-two caching pinned allocator.
+    "VLLM_QWEN4EXP_PLE_EXACT_PIN": env_var(
+        lambda: os.getenv("VLLM_QWEN4EXP_PLE_EXACT_PIN", "1") != "0",
+        description=(
+            "Pin the Qwen4Exp hybrid PLE host table at its exact size by "
+            "registering an ordinary allocation with cudaHostRegister. torch's "
+            "caching host allocator rounds a pinned block up to a power of two "
+            "(an 11.92 GiB per-rank table would pin 16 GiB). Set 0 to restore "
+            "the caching-allocator path; the registration falls back to it on "
+            "its own when cudaHostRegister fails."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
     ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model
