@@ -145,6 +145,8 @@ def test_qwen4_exp_mtp_v2_uses_local_argmax_without_full_logits() -> None:
         eagle_speculator.EagleSpeculator
     )
     speculator.use_local_argmax_reduction = True
+    speculator._draft_hidden_dump = None
+    speculator._draft_nvfp4_head = None
 
     class DraftModel:
         def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:

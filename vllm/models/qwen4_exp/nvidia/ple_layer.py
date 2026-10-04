@@ -572,6 +572,12 @@ def _should_use_pinned_host_ple(config: Qwen4ExpTextConfig) -> bool:
     return capability is not None and capability.major < 8
 
 
+def _retained_vllm_config(owner):
+    """Config captured at construction; materialization can run outside its context."""
+    config = getattr(owner, "_ple_vllm_config", None)
+    return config if config is not None else get_current_vllm_config()
+
+
 # Registered host tables must outlive every UVA view; they live for the process.
 _PLE_REGISTERED_HOST_TABLES: list[torch.Tensor] = []
 
@@ -732,7 +738,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
 
     def _device_spill_bytes(self, device: torch.device, table_bytes: int) -> int:
         """Bytes of the table that do not fit beside the weights and the KV cache."""
-        vllm_config = self._ple_vllm_config
+        vllm_config = _retained_vllm_config(self)
         free_bytes, total_bytes = torch.cuda.mem_get_info(device)
         kv_bytes = kv_cache_bytes_for_max_model_len(vllm_config)
         reserve_bytes = ple_vram_reserve_bytes(total_bytes)
@@ -772,7 +778,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             return budget
         # The table lives on the first pipeline stage only, so its
         # tensor-parallel ranks are the ones sharing this host's memory.
-        parallel = self._ple_vllm_config.parallel_config
+        parallel = _retained_vllm_config(self).parallel_config
         ranks = min(parallel.tensor_parallel_size, parallel.local_world_size) * (
             parallel.data_parallel_size_local
         )

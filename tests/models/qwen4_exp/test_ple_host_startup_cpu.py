@@ -50,8 +50,14 @@ def _source_functions():
     materialize = next(
         n for n in cls.body if getattr(n, "name", "") == "materialize_tables"
     )
-    budget = next(
-        n for n in cls.body if getattr(n, "name", "") == "_resolve_host_budget"
+    retained = next(
+        n for n in tree.body if getattr(n, "name", "") == "_retained_vllm_config"
+    )
+    spill = next(
+        n for n in cls.body if getattr(n, "name", "") == "_device_spill_bytes"
+    )
+    cap = next(
+        n for n in cls.body if getattr(n, "name", "") == "_cap_derived_host_budget"
     )
     common = ast.parse((ROOT / "vllm/models/qwen4_exp/common/ple.py").read_text())
     nodes = [
@@ -63,6 +69,7 @@ def _source_functions():
             "compute_ple_shard_overlap",
             "copy_ple_embedding_shard_",
             "copy_ple_embedding_shard_split_",
+            "copy_ple_embedding_shard_tiers_",
             "PLEPlacement",
             "plan_ple_placement",
         }
@@ -85,7 +92,7 @@ def _source_functions():
             )
         ]
         + nodes
-        + [alloc, load, materialize, budget],
+        + [retained, alloc, load, materialize, spill, cap],
         type_ignores=[],
     )
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), ns)
@@ -297,10 +304,7 @@ class StartupTests(unittest.TestCase):
         ns["get_current_vllm_config"] = Mock(
             side_effect=AssertionError("no ambient model configuration")
         )
-        ns["_ple_host_budget_bytes"] = lambda: None
-        ns["available_host_bytes"] = lambda: None
-        ns["total_host_bytes"] = lambda: None
-        ns["_ple_vram_reserve_bytes"] = lambda _: 7
+        ns["ple_vram_reserve_bytes"] = lambda _: 7
         ns["kv_cache_bytes_for_max_model_len"] = Mock(return_value=16)
         ns["auto_ple_host_budget_bytes"] = Mock(return_value=20)
         ns["torch"] = SimpleNamespace(
@@ -313,10 +317,7 @@ class StartupTests(unittest.TestCase):
         owner = SimpleNamespace(
             _meta_weight_shape=(8, 4), embedding_dim=4, _ple_vllm_config=config
         )
-        for hybrid, expected in ((True, 32), (False, 20)):
-            with self.subTest(hybrid=hybrid):
-                ns["envs"] = SimpleNamespace(VLLM_SM70_QWEN38_HYBRID_PLE=hybrid)
-                self.assertEqual(ns["_resolve_host_budget"](owner, "cpu"), expected)
+        self.assertEqual(ns["_device_spill_bytes"](owner, "cpu", 32), 20)
         ns["kv_cache_bytes_for_max_model_len"].assert_called_once_with(config)
         ns["auto_ple_host_budget_bytes"].assert_called_once_with(
             table_bytes=32,
@@ -328,9 +329,33 @@ class StartupTests(unittest.TestCase):
         )
         ns["get_current_vllm_config"].assert_not_called()
 
+    def test_derived_host_cap_uses_retained_config(self):
+        ns = _source_functions()
+        ns["get_current_vllm_config"] = Mock(
+            side_effect=AssertionError("no ambient model configuration")
+        )
+        ns["available_host_bytes"] = lambda: 100
+        ns["total_host_bytes"] = lambda: 200
+        ns["ple_host_reserve_bytes"] = lambda _: 10
+        ns["cap_host_budget_bytes"] = Mock(return_value=40)
+        parallel = SimpleNamespace(
+            tensor_parallel_size=4, local_world_size=4, data_parallel_size_local=1
+        )
+        owner = SimpleNamespace(
+            _ple_vllm_config=SimpleNamespace(parallel_config=parallel)
+        )
+        with self.assertLogs(ns["logger"], level="WARNING"):
+            self.assertEqual(ns["_cap_derived_host_budget"](owner, 60), 40)
+        ns["cap_host_budget_bytes"].assert_called_once_with(
+            budget_bytes=60,
+            available_bytes=100,
+            reserve_bytes=10,
+            ranks_sharing_host=4,
+        )
+        ns["get_current_vllm_config"].assert_not_called()
+
     def test_materialization_does_not_require_ambient_model_config(self):
         ns = _source_functions()
-        ns["available_host_bytes"] = lambda: None
         ns["get_current_vllm_config"] = Mock(
             side_effect=AssertionError("no ambient model configuration")
         )
@@ -347,7 +372,9 @@ class StartupTests(unittest.TestCase):
             _meta_weight_shape=(8, 4),
             embedding_dim=4,
             _meta_weight_dtype=torch.uint8,
-            _resolve_host_budget=lambda _: 12,
+            _plan_placement=lambda _: SimpleNamespace(
+                vram_rows=5, host_rows=3, disk_rows=0, total_rows=8
+            ),
             _pin_checkpoint_model_path=None,
         )
         ns["materialize_tables"](owner)
@@ -423,6 +450,9 @@ class StartupTests(unittest.TestCase):
                             ple_host_storage=torch.empty(
                                 (12 - split, 4), dtype=torch.uint8
                             ),
+                            _device_rows=split,
+                            _host_rows=12 - split,
+                            _disk_rows=0,
                         )
                         for start in range(0, 24, 8):
                             ns["load_shard"](

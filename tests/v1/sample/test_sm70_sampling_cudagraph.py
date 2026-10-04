@@ -1305,6 +1305,11 @@ def test_rejection_sampler_call_and_the_processed_helper_agree(monkeypatch):
 
 def _bare_runner(**attrs):
     runner = object.__new__(model_runner_module.GPUModelRunner)
+    # Upstream's step timer, read at the end of every sample_tokens.
+    runner.mixed_prefill_timer = SimpleNamespace(
+        begin=lambda *_: None, finish=lambda: None
+    )
+    runner.lora_config = None
     for name, value in attrs.items():
         setattr(runner, name, value)
     return runner
@@ -1475,7 +1480,7 @@ class _SampleHarness:
             return self.sampler_output
 
         monkeypatch.setattr(
-            model_runner_module, "try_dflash2_sparse_target_rejection", lambda *a: None
+            model_runner_module, "try_dflash2_sparse_target_rejection", lambda *a, **k: None
         )
         monkeypatch.setattr(
             model_runner_module,
