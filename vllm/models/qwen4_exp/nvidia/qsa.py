@@ -90,6 +90,12 @@ _QSA_MAIN_KV_CACHE_DTYPES = (
 _QSA_SCALED_KV_CACHE_DTYPES = ("fp8", "fp8_e4m3", NVFP4_KV_CACHE_DTYPE)
 
 
+_NVFP4_DCP_UNSUPPORTED = (
+    "QSA NVFP4 KV cache: DCP-sharded caches are not implemented yet (plan 071); "
+    "run with decode_context_parallel_size 1"
+)
+
+
 def _qsa_loads_kv_scales(kv_cache_dtype: str) -> bool:
     """Does this cache dtype read per-layer K/V scalars from the checkpoint?"""
     return kv_cache_dtype in _QSA_SCALED_KV_CACHE_DTYPES
@@ -372,6 +378,15 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         if self.kv_cache_dtype in ("fp8", "fp8_e4m3"):
             if key_cache.dtype != torch.uint8 or value_cache.dtype != torch.uint8:
                 raise RuntimeError("Qwen4Exp QSA E4M3 cache must use uint8 storage")
+        elif self.kv_cache_dtype == NVFP4_KV_CACHE_DTYPE:
+            if key_cache.dtype != torch.uint8 or value_cache.dtype != torch.uint8:
+                raise RuntimeError("Qwen4Exp QSA NVFP4 cache must use uint8 storage")
+            if query.dtype != torch.float16:
+                raise NotImplementedError(
+                    "Qwen4Exp QSA NVFP4 cache requires FP16 queries"
+                )
+            if getattr(layer, "qsa_dcp_sharded", False):
+                raise NotImplementedError(_NVFP4_DCP_UNSUPPORTED)
         elif key_cache.dtype != query.dtype or value_cache.dtype != query.dtype:
             raise RuntimeError("Qwen4Exp QSA FP16/BF16 cache must match query dtype")
 
@@ -527,6 +542,25 @@ def _verify_main_kv_storage_dtype(
         )
 
 
+def _verify_nvfp4_kv_speculation(vllm_config: VllmConfig) -> None:
+    """The NVFP4 main K/V cache does not cover the MTP draft yet.
+
+    Plan 071 milestone 2 gives the draft its own NVFP4 cache; until then a
+    speculative configuration is refused at the first attention layer.
+    """
+    cache_config = vllm_config.cache_config
+    if cache_config is None or cache_config.cache_dtype != NVFP4_KV_CACHE_DTYPE:
+        return
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    if speculative_config is not None and getattr(
+        speculative_config, "num_speculative_tokens", 0
+    ):
+        raise NotImplementedError(
+            "QSA NVFP4 KV cache: the MTP draft is not implemented yet (plan 071 "
+            "milestone 2); run without speculative decoding"
+        )
+
+
 def _verify_nvfp4_kv_requirements(
     model_config: ModelConfig,
     cache_config: CacheConfig,
@@ -621,6 +655,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
         self.head_dim = int(config.head_dim or self.hidden_size // self.num_heads)
         _verify_nvfp4_kv_requirements(model_config, cache_config, self.head_dim)
+        _verify_nvfp4_kv_speculation(vllm_config)
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
@@ -892,12 +927,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             raise RuntimeError(
                 f"QSA E4M3 scales were not finalized for {self.layer_name}"
             )
-        if self.kv_cache_dtype == NVFP4_KV_CACHE_DTYPE:
-            raise NotImplementedError(
-                "QSA NVFP4 KV cache: the store and attention kernels are not "
-                "implemented yet; only the cache spec and the allocator "
-                "admit it (plan 071 stage 1)"
-            )
+        if self.kv_cache_dtype == NVFP4_KV_CACHE_DTYPE and getattr(
+            self, "qsa_dcp_sharded", False
+        ):
+            raise NotImplementedError(_NVFP4_DCP_UNSUPPORTED)
         metadata = get_forward_context().attn_metadata
         if isinstance(metadata, list):
             metadata = metadata[0]

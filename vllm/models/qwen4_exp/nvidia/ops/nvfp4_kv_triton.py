@@ -29,10 +29,15 @@ from vllm.models.deepseek_v4.common.ops.fp8_software import fp8_e4m3fn_bits_to_f
 from vllm.models.qwen4_exp.nvidia.ops.nvfp4_kv import (
     NVFP4_KV_GROUP_SIZE,
     nvfp4_kv_split_views,
+    nvfp4_side_views,
 )
 from vllm.triton_utils import tl, triton
 
-__all__ = ["gather_dequant_nvfp4_kv_triton", "store_nvfp4_kv_triton"]
+__all__ = [
+    "gather_dequant_nvfp4_kv_triton",
+    "gather_dequant_nvfp4_sides_triton",
+    "store_nvfp4_kv_triton",
+]
 
 
 @triton.jit
@@ -207,8 +212,39 @@ def gather_dequant_nvfp4_kv_triton(
     cache; ``block_table`` and ``logical_indices`` are int32. Returns
     ``(keys, values)`` of shape ``[rows, topk, heads, head_size]``.
     """
-    (k_data, v_data), (k_scales, v_scales) = nvfp4_kv_split_views(kv_cache)
-    num_blocks, _, block_size, heads, _ = kv_cache.shape
+    return gather_dequant_nvfp4_sides_triton(
+        kv_cache[:, 0],
+        kv_cache[:, 1],
+        block_table,
+        token_to_req,
+        logical_indices,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        out_dtype=out_dtype,
+    )
+
+
+def gather_dequant_nvfp4_sides_triton(
+    k_side: torch.Tensor,
+    v_side: torch.Tensor,
+    block_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    logical_indices: torch.Tensor,
+    *,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    out_dtype: torch.dtype = torch.float16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The gather for the two halves of the cache, ``kv_cache[:, 0]`` and ``[:, 1]``.
+
+    Each half is the 4-D uint8 ``(blocks, block_size, heads, row_bytes)`` view that
+    the attention owner receives from ``kv_cache.unbind(1)``.
+    """
+    k_data, k_scales = nvfp4_side_views(k_side)
+    v_data, v_scales = nvfp4_side_views(v_side)
+    num_blocks, block_size, heads, _ = k_side.shape
+    if v_side.shape != k_side.shape:
+        raise ValueError("K and V cache sides must have the same shape")
     head_size = k_data.shape[-1] * 2
     if head_size % NVFP4_KV_GROUP_SIZE:
         raise ValueError("NVFP4 KV head size must be a multiple of 16")
@@ -224,10 +260,12 @@ def gather_dequant_nvfp4_kv_triton(
         raise ValueError("block table, indices and token_to_req need unit inner stride")
     if k_data.stride(3) != 1 or k_scales.stride(3) != 1:
         raise ValueError("cache rows must be contiguous in their last dimension")
+    if v_data.stride() != k_data.stride() or v_scales.stride() != k_scales.stride():
+        raise ValueError("K and V cache sides must share their strides")
 
     rows, topk = logical_indices.shape
     keys = torch.empty(
-        (rows, topk, heads, head_size), dtype=out_dtype, device=kv_cache.device
+        (rows, topk, heads, head_size), dtype=out_dtype, device=k_side.device
     )
     values = torch.empty_like(keys)
     if keys.numel() == 0:

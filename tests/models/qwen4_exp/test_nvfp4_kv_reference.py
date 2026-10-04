@@ -925,3 +925,89 @@ def test_gather_matches_a_naive_per_entry_implementation() -> None:
             )
             assert torch.equal(keys[row, col], want_k)
             assert torch.equal(values[row, col], want_v)
+
+
+# --------------------------------------------------------------------------- #
+# The entry validity rule and the per-side views (plan 071 step D)
+# --------------------------------------------------------------------------- #
+def _validity_by_loops(indices, token_to_req, table, num_blocks, block_size):
+    """The sparse kernel's rule, one entry at a time."""
+    requests, width = table.shape
+    valid = torch.zeros(indices.shape, dtype=torch.bool)
+    for row in range(indices.shape[0]):
+        request = int(token_to_req[row])
+        for col in range(indices.shape[1]):
+            token = int(indices[row, col])
+            if request < 0 or request >= requests or token < 0:
+                continue
+            page = token // block_size
+            if page >= width:
+                continue
+            block = int(table[request, page])
+            valid[row, col] = 0 <= block < num_blocks
+    return valid
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_entry_validity_equals_the_kernel_rule_written_as_loops(seed):
+    generator = torch.Generator().manual_seed(seed)
+    block_size, num_blocks, requests, width = 16, 7, 3, 4
+    table = torch.randint(-2, num_blocks + 3, (requests, width), generator=generator)
+    table = table.int()
+    token_to_req = torch.randint(-2, requests + 2, (9,), generator=generator).int()
+    indices = torch.randint(
+        -5, width * block_size + 20, (9, 40), generator=generator
+    ).int()
+    indices[0, :4] = torch.tensor([2**30, -(2**30), 0, width * block_size - 1])
+    got = nv.nvfp4_entry_validity(indices, token_to_req, table, num_blocks, block_size)
+    expected = _validity_by_loops(indices, token_to_req, table, num_blocks, block_size)
+    assert got.dtype == torch.bool and got.shape == indices.shape
+    assert torch.equal(got, expected)
+    assert expected.any() and not expected.all()  # both outcomes occur
+
+
+def test_the_reference_gather_zero_fills_exactly_the_invalid_entries():
+    generator = torch.Generator().manual_seed(7)
+    blocks, block_size = 4, 8
+    cache = _empty_cache(blocks, block_size)
+    key, value = (
+        _rows((blocks * block_size, 1, D), seed=1),
+        _rows((blocks * block_size, 1, D), seed=2),
+    )
+    nv.reshape_and_cache_nvfp4_reference(
+        key, value, cache, torch.randperm(blocks * block_size, generator=generator)
+    )
+    table = torch.tensor([[0, 1, -1], [2, 9, 3]], dtype=torch.int32)
+    token_to_req = torch.tensor([0, 1, 1, -1], dtype=torch.int32)
+    indices = torch.randint(-3, 3 * block_size + 4, (4, 12), generator=generator).int()
+    keys, values = nv.gather_dequant_nvfp4_kv(cache, table, token_to_req, indices)
+    valid = nv.nvfp4_entry_validity(indices, token_to_req, table, blocks, block_size)
+    assert not keys[~valid].any() and not values[~valid].any()
+    assert keys[valid].abs().sum() > 0
+
+
+def test_side_views_are_the_views_of_the_five_dimensional_cache():
+    cache = _empty_cache(5, 8, heads=2)
+    cache.copy_(torch.randint(0, 256, cache.shape, dtype=torch.uint8))
+    (k_data, v_data), (k_scale, v_scale) = nv.nvfp4_kv_split_views(cache)
+    for side, data, scale in (
+        (cache[:, 0], k_data, k_scale),
+        (cache[:, 1], v_data, v_scale),
+    ):
+        got_data, got_scale = nv.nvfp4_side_views(side)
+        assert got_data.dtype == got_scale.dtype == torch.uint8
+        assert got_data.shape == data.shape and got_scale.shape == scale.shape
+        assert got_data.data_ptr() == data.data_ptr()
+        assert got_scale.data_ptr() == scale.data_ptr()
+        assert (
+            got_data.stride() == data.stride() and got_scale.stride() == scale.stride()
+        )
+        assert torch.equal(got_data, data) and torch.equal(got_scale, scale)
+
+
+def test_side_views_reject_what_is_not_one_uint8_side():
+    cache = _empty_cache(2, 4)
+    with pytest.raises(ValueError, match="must be"):
+        nv.nvfp4_side_views(cache)
+    with pytest.raises(TypeError, match="uint8"):
+        nv.nvfp4_side_views(cache[:, 0].to(torch.int16))

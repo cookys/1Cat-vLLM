@@ -337,18 +337,6 @@ def test_other_cache_dtypes_still_use_reshape_and_cache_flash(
     assert calls[0][4:] == ("slots", dtype, "k", "v")
 
 
-def test_the_real_forward_path_still_refuses_nvfp4() -> None:
-    from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAAttention
-
-    owner = object.__new__(Qwen4ExpQSAAttention)
-    torch.nn.Module.__init__(owner)
-    owner.kv_cache_dtype = "nvfp4"
-    owner._qsa_kv_scales_finalized = True
-    owner.layer_name = "model.layers.3.self_attn.attn"
-    with pytest.raises(NotImplementedError, match="NVFP4"):
-        owner._run_qsa(None, None, None, None, None, None)
-
-
 def test_a_store_with_no_tokens_is_a_noop() -> None:
     cache = _cache().to(DEVICE)
     nvt.store_nvfp4_kv_triton(

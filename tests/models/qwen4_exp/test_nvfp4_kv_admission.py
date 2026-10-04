@@ -244,13 +244,14 @@ def _bare_owner(**attributes) -> Qwen4ExpQSAAttention:
     return layer
 
 
-def test_the_owner_refuses_to_execute_nvfp4_until_the_kernels_exist() -> None:
+def test_the_owner_refuses_a_dcp_sharded_nvfp4_cache_before_doing_any_work() -> None:
     layer = _bare_owner(
         kv_cache_dtype="nvfp4",
         _qsa_kv_scales_finalized=True,
+        qsa_dcp_sharded=True,
         layer_name="model.layers.3.self_attn.attn",
     )
-    with pytest.raises(NotImplementedError, match="NVFP4.*not implemented"):
+    with pytest.raises(NotImplementedError, match="NVFP4.*DCP"):
         layer._run_qsa(None, None, None, None, None, None)
 
 

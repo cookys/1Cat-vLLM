@@ -103,6 +103,7 @@ __all__ = [
     "e4m3_encode",
     "gather_dequant_nvfp4_kv",
     "nvfp4_block_scale_range",
+    "nvfp4_entry_validity",
     "nvfp4_kv_bytes_per_token",
     "nvfp4_kv_data_bytes",
     "nvfp4_kv_page_bytes",
@@ -110,6 +111,7 @@ __all__ = [
     "nvfp4_kv_row_bytes",
     "nvfp4_kv_scale_bytes",
     "nvfp4_kv_split_views",
+    "nvfp4_side_views",
     "nvfp4_layer_scale_from_amax",
     "nvfp4_subnormal_group_fraction",
     "pack_nibbles",
@@ -378,6 +380,51 @@ def dequantize_kv_nvfp4(
 # --------------------------------------------------------------------------- #
 # Paged cache: writer and sparse gather
 # --------------------------------------------------------------------------- #
+def nvfp4_side_views(side: torch.Tensor):
+    """``(data, scale)`` uint8 views of one side of the cache.
+
+    ``side`` is ``kv_cache[:, 0]`` or ``kv_cache[:, 1]``, shape
+    ``(num_blocks, block_size, heads, row_bytes)``, the halves that
+    ``Qwen4ExpQSAFlashAttentionImpl.forward_qsa`` receives from ``unbind(1)``.
+    """
+    if side.ndim != 4:
+        raise ValueError(
+            "an NVFP4 cache side must be (num_blocks, block_size, heads, row_bytes), "
+            f"got {tuple(side.shape)}"
+        )
+    if side.dtype != torch.uint8:
+        raise TypeError(f"NVFP4 cache must be uint8, got {side.dtype}")
+    (data,), (scales,) = nvfp4_kv_cache_split_views(side)
+    return data, scales.view(torch.uint8)
+
+
+def nvfp4_entry_validity(
+    logical_indices: torch.Tensor,
+    token_to_req: torch.Tensor,
+    block_table: torch.Tensor,
+    num_blocks: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Which top-k entries the QSA sparse kernel would read: bool ``[rows, topk]``.
+
+    The rule of ``_qsa_sparse_paged_gqa_splitk_kernel``: the request is in range,
+    the logical token is non-negative, its logical page is inside the block
+    table, and the mapped physical block is in ``[0, num_blocks)``. Every other
+    entry is masked (zero probability) by the kernel.
+    """
+    num_requests, table_width = block_table.shape
+    index = logical_indices.long()
+    request = token_to_req.long().unsqueeze(1)
+    page = index.div(block_size, rounding_mode="floor")
+    valid = (index >= 0) & (request >= 0) & (request < num_requests)
+    valid &= page < table_width
+    physical = block_table.long()[
+        request.clamp(0, num_requests - 1), page.clamp(0, table_width - 1)
+    ]
+    valid &= (physical >= 0) & (physical < num_blocks)
+    return valid
+
+
 def _cache_views(kv_cache: torch.Tensor):
     """``(k_data, v_data), (k_scale, v_scale)`` of a 5-D NVFP4 cache (uint8)."""
     if kv_cache.ndim != 5 or kv_cache.shape[1] != 2:
@@ -474,13 +521,12 @@ def gather_dequant_nvfp4_kv(
     index = logical_indices.long()
     request = token_to_req.long().unsqueeze(1)
     page = index.div(block_size, rounding_mode="floor")
-
-    valid = (index >= 0) & (request >= 0) & (request < num_requests)
-    valid &= page < table_width
+    valid = nvfp4_entry_validity(
+        logical_indices, token_to_req, block_table, num_blocks, block_size
+    )
     physical = block_table.long()[
         request.clamp(0, num_requests - 1), page.clamp(0, table_width - 1)
     ]
-    valid &= (physical >= 0) & (physical < num_blocks)
 
     safe_block = physical.clamp(0, num_blocks - 1)
     offset = index.clamp_min(0) % block_size

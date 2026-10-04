@@ -389,12 +389,14 @@ def test_the_scale_check_reports_missing_names_only_for_nvfp4_as_a_set() -> None
     assert _validate_qsa_e4m3_scale_load(required, set(), "float16") == set()
 
 
-def test_an_unfinalized_nvfp4_owner_still_cannot_run() -> None:
+def test_an_unfinalized_nvfp4_owner_cannot_run_until_it_adopts_its_scales() -> None:
     owner = _owner(-1.0, -1.0)
     with pytest.raises(RuntimeError, match="were not finalized"):
         owner._run_qsa(None, None, None, None, None, None)
     owner.adopt_default_kv_scales()
-    with pytest.raises(NotImplementedError, match="NVFP4"):
+    # Finalized: the scale check passes. A DCP-sharded cache is the next refusal.
+    owner.qsa_dcp_sharded = True
+    with pytest.raises(NotImplementedError, match="DCP"):
         owner._run_qsa(None, None, None, None, None, None)
 
 

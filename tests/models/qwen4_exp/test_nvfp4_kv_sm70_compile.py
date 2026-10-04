@@ -28,6 +28,7 @@ pytestmark = pytest.mark.skipif(
 
 pytest.importorskip("triton")
 from vllm.models.qwen4_exp.nvidia.ops import nvfp4_kv_triton as kernels  # noqa: E402
+from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops  # noqa: E402
 from vllm.triton_utils import triton  # noqa: E402
 
 # The compiler entry points are not re-exported by vllm.triton_utils.
@@ -47,6 +48,13 @@ BANNED = (
     "cp.async",
     "mma.sync.aligned.m16n8",
 )
+
+# Measured with Triton 3.6.0's ptxas: the split-K kernel on the gathered FP16 rows
+# has no stack frame at 2 or 4 warps (the E4M3 kernel has 304 bytes at 2 warps).
+GATHERED_MAX_STACK = 0
+# The merge kernel keeps a [splits, head_dim] tile in registers; its 72 byte stack is
+# the same with and without scale folding.
+MERGE_MAX_STACK = 128
 
 STORE = {
     "x_ptr": "*fp16",
@@ -115,8 +123,8 @@ def _compile(kernel, signature, constexprs, num_warps):
     )
 
 
-def _usage(compiled) -> tuple[int, int] | None:
-    """(registers, local bytes) of the cubin, or None without cuobjdump."""
+def _usage(compiled) -> tuple[int, int, int] | None:
+    """(registers, stack bytes, local bytes) of the cubin, or None without cuobjdump."""
     if not CUOBJDUMP.is_file():
         return None
     with tempfile.NamedTemporaryFile(suffix=".cubin") as cubin:
@@ -128,11 +136,13 @@ def _usage(compiled) -> tuple[int, int] | None:
             text=True,
             check=True,
         ).stdout
-    match = re.search(r"REG:(\d+) STACK:\d+ SHARED:\d+ LOCAL:(\d+)", report)
-    return (int(match.group(1)), int(match.group(2))) if match else None
+    match = re.search(r"REG:(\d+) STACK:(\d+) SHARED:\d+ LOCAL:(\d+)", report)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
 
 
-def _check(compiled, max_registers=64) -> None:
+def _check(compiled, max_registers=64, max_stack=16) -> None:
     ptx = compiled.asm["ptx"]
     assert re.search(r"\.target sm_70\b", ptx)
     assert len(compiled.asm["cubin"]) > 0
@@ -140,9 +150,10 @@ def _check(compiled, max_registers=64) -> None:
         assert banned not in ptx, banned
     usage = _usage(compiled)
     if usage is not None:
-        registers, local = usage
+        registers, stack, local = usage
         assert registers <= max_registers, registers
-        assert local == 0, "the kernel spills to local memory"
+        assert local == 0, "the kernel uses local memory"
+        assert stack <= max_stack, f"stack frame of {stack} bytes"
 
 
 @pytest.mark.parametrize("head_size", [64, 128, 256])
@@ -198,3 +209,205 @@ def test_the_store_uses_no_atomic_so_it_is_deterministic() -> None:
         kernels._store_nvfp4_kernel, STORE, {"PAGE_SIZE": 2784, "GROUPS": 16}, 1
     )
     assert not re.search(r"^\s*(atom|red)\.", compiled.asm["ptx"], re.MULTILINE)
+
+
+# --------------------------------------------------------------------------- #
+# The attention kernels of the NVFP4 route (plan 071 step D)
+# --------------------------------------------------------------------------- #
+_SPLITK_RUNTIME = {
+    "q_ptr": "*fp16",
+    "k_cache_ptr": "*fp16",
+    "v_cache_ptr": "*fp16",
+    "indices_ptr": "*i32",
+    "block_table_ptr": "*i32",
+    "token_to_req_ptr": "*i32",
+    "partial_output_ptr": "*fp32",
+    "partial_lse_ptr": "*fp32",
+    "output_ptr": "*fp16",
+    "final_lse_ptr": "*fp32",
+    "output_gate_ptr": "*fp16",
+    "k_scale": "fp32",
+    "v_scale": "fp32",
+    **{
+        name: "i32"
+        for name in (
+            "stride_q_row",
+            "stride_q_head",
+            "stride_k_block",
+            "stride_k_token",
+            "stride_k_head",
+            "stride_v_block",
+            "stride_v_token",
+            "stride_v_head",
+            "stride_indices_row",
+            "stride_table_req",
+            "stride_output_row",
+            "stride_output_head",
+            "stride_output_gate_row",
+            "stride_output_gate_head",
+            "num_rows",
+            "num_cache_blocks",
+            "num_requests",
+        )
+    },
+}
+_MERGE_RUNTIME = {
+    "partial_output_ptr": "*fp32",
+    "partial_lse_ptr": "*fp32",
+    "output_ptr": "*fp16",
+    "final_lse_ptr": "*fp32",
+    "output_gate_ptr": "*fp16",
+    "v_scale": "fp32",
+    **{
+        name: "i32"
+        for name in (
+            "stride_output_row",
+            "stride_output_head",
+            "stride_output_gate_row",
+            "stride_output_gate_head",
+            "num_rows",
+        )
+    },
+}
+
+
+def _with_constexprs(kernel, runtime):
+    # Every parameter that is not a runtime value is a constexpr, so an added
+    # constexpr shows up as a compile error here instead of a silent skip.
+    return {name: runtime.get(name, "constexpr") for name in kernel.arg_names}
+
+
+def _gathered_splitk(num_warps, *, topk=2051, block_n=16, splits=64):
+    """The split-K kernel as the NVFP4 route launches it: FP16 caches, the gathered
+    rows as ``rows`` pages of ``topk`` tokens, one page per request, scales folded."""
+    kernel = qsa_ops._qsa_sparse_paged_gqa_splitk_kernel
+    constexprs = {
+        "TOPK": topk,
+        "PAGE_SIZE": topk,
+        "PAGE_TABLE_WIDTH": 1,
+        "GROUP_SIZE": 6,
+        "HEAD_DIM": 256,
+        "NUM_QUERY_HEADS": 6,
+        "NUM_SPLITS": splits,
+        "NUM_TILES": -(-topk // block_n),
+        "BLOCK_M": 8,
+        "BLOCK_N": block_n,
+        "KV_E4M3": False,
+        "FOLD_SCALES": True,
+        "RESOLVED_INDICES": False,
+    }
+    return triton.compile(
+        ASTSource(
+            fn=kernel,
+            signature=_with_constexprs(kernel, _SPLITK_RUNTIME),
+            constexprs=constexprs,
+        ),
+        target=VOLTA,
+        options={"num_warps": num_warps, "num_stages": 2},
+    )
+
+
+@pytest.mark.parametrize("num_warps", [2, 4])
+def test_the_split_k_kernel_lowers_to_sm70_for_the_gathered_nvfp4_rows(num_warps):
+    # 2 warps is the exact-TP4 decode launch (the two-warp partial), 4 the other
+    # pre-Ampere profile. The kernel has more registers than the store and gather.
+    _check(_gathered_splitk(num_warps), max_registers=255, max_stack=GATHERED_MAX_STACK)
+
+
+def test_the_gathered_kernel_is_not_larger_than_the_e4m3_kernel_it_replaces():
+    # Same tile and warps: the FP16 inputs skip the software decode, so the gathered
+    # route cannot need more registers than the E4M3 route it sits next to.
+    kernel = qsa_ops._qsa_sparse_paged_gqa_splitk_kernel
+    runtime = {**_SPLITK_RUNTIME, "k_cache_ptr": "*u8", "v_cache_ptr": "*u8"}
+    e4m3 = triton.compile(
+        ASTSource(
+            fn=kernel,
+            signature=_with_constexprs(kernel, runtime),
+            constexprs={
+                "TOPK": 2051,
+                "PAGE_SIZE": 1616,
+                "PAGE_TABLE_WIDTH": 163,
+                "GROUP_SIZE": 6,
+                "HEAD_DIM": 256,
+                "NUM_QUERY_HEADS": 6,
+                "NUM_SPLITS": 64,
+                "NUM_TILES": 129,
+                "BLOCK_M": 8,
+                "BLOCK_N": 16,
+                "KV_E4M3": True,
+                "FOLD_SCALES": True,
+                "RESOLVED_INDICES": False,
+            },
+        ),
+        target=VOLTA,
+        options={"num_warps": 4, "num_stages": 2},
+    )
+    usage_e4m3, usage_gathered = _usage(e4m3), _usage(_gathered_splitk(4))
+    if usage_e4m3 is not None and usage_gathered is not None:
+        assert usage_gathered[0] <= usage_e4m3[0]
+
+
+@pytest.mark.parametrize("fold_scales", [False, True])
+def test_the_merge_kernel_lowers_to_sm70_with_and_without_scale_folding(fold_scales):
+    kernel = qsa_ops._qsa_merge_splitk_kernel
+    compiled = triton.compile(
+        ASTSource(
+            fn=kernel,
+            signature=_with_constexprs(kernel, _MERGE_RUNTIME),
+            constexprs={
+                "HEAD_DIM": 256,
+                "NUM_QUERY_HEADS": 6,
+                "NUM_SPLITS": 64,
+                "BLOCK_SPLITS": 64,
+                "FOLD_SCALES": fold_scales,
+            },
+        ),
+        target=VOLTA,
+        options={"num_warps": 2, "num_stages": 1},
+    )
+    _check(compiled, max_registers=255, max_stack=MERGE_MAX_STACK)
+
+
+def test_scale_folding_changes_only_the_kernels_that_fold():
+    # FOLD_SCALES=False must compile to the same code whatever else is asked of the
+    # kernel: the PTX without folding has no multiply by the scale arguments that the
+    # folding one has. Compare the two PTX bodies, stripped of line info.
+    def body(compiled):
+        lines = []
+        for line in compiled.asm["ptx"].splitlines():
+            stripped = line.strip()
+            if stripped.startswith((".loc", ".file", "//")) or not stripped:
+                continue
+            lines.append(re.sub(r"\s*//.*$", "", line))
+        return "\n".join(lines).split(".section\t.debug_abbrev")[0]
+
+    kernel = qsa_ops._qsa_sparse_paged_gqa_splitk_kernel
+    constexprs = {
+        "TOPK": 64,
+        "PAGE_SIZE": 64,
+        "PAGE_TABLE_WIDTH": 1,
+        "GROUP_SIZE": 6,
+        "HEAD_DIM": 256,
+        "NUM_QUERY_HEADS": 6,
+        "NUM_SPLITS": 1,
+        "NUM_TILES": 4,
+        "BLOCK_M": 8,
+        "BLOCK_N": 16,
+        "KV_E4M3": False,
+        "RESOLVED_INDICES": False,
+    }
+
+    def build(fold):
+        return triton.compile(
+            ASTSource(
+                fn=kernel,
+                signature=_with_constexprs(kernel, _SPLITK_RUNTIME),
+                constexprs={**constexprs, "FOLD_SCALES": fold},
+            ),
+            target=VOLTA,
+            options={"num_warps": 4, "num_stages": 2},
+        )
+
+    plain, folded = body(build(False)), body(build(True))
+    assert plain != folded
+    assert plain.count("mul.f32") < folded.count("mul.f32")

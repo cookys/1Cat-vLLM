@@ -16,6 +16,10 @@ from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
     fp8_e4m3fn_bits_to_fp32_bitcast as fp8_e4m3fn_bits_to_fp32,
 )
+from vllm.models.qwen4_exp.nvidia.ops.nvfp4_kv import (
+    NVFP4_KV_CACHE_DTYPE,
+    NVFP4_KV_GROUP_SIZE,
+)
 from vllm.models.qwen4_exp.nvidia.ops.sm70_qsa_tuning import (
     SM70_QSA_TUNING,
     legacy_qsa_tuning,
@@ -26,6 +30,11 @@ from vllm.triton_utils import HAS_TRITON, tl, triton
 logger = init_logger(__name__)
 
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
+# The Triton CPU interpreter runs the sparse kernels for the CPU tests.
+_TRITON_INTERPRET = os.getenv("TRITON_INTERPRET") == "1"
+# kv_cache_dtype of the FP16 K/V that the NVFP4 route gathers and decodes (layer
+# scales not applied); see qsa_nvfp4.py. Not a cache dtype a user can configure.
+QSA_NVFP4_GATHERED_DTYPE = "nvfp4_gathered"
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
 _SM70_QSA_TOPK_LIBRARY = os.getenv("VLLM_SM70_QSA_TOPK_LIBRARY")
 if _SM70_QSA_TOPK_LIBRARY is not None:
@@ -656,6 +665,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     KV_E4M3: tl.constexpr,
+    FOLD_SCALES: tl.constexpr,
     RESOLVED_INDICES: tl.constexpr = False,
 ) -> None:
     row = tl.program_id(0)
@@ -682,9 +692,10 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     accumulator = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
     softmax_scale_log2: tl.constexpr = (HEAD_DIM**-0.5) * 1.4426950408889634
     qk_scale_log2 = softmax_scale_log2
-    if KV_E4M3:
-        # Keep the exactly decoded E4M3 values in the dot inputs and apply the
-        # scalar K dequantization factor once to the accumulated QK scores.
+    if FOLD_SCALES:
+        # Keep the exactly decoded K values (E4M3 bytes, or NVFP4 values
+        # gathered to FP16 without their layer scale) in the dot inputs and apply
+        # the scalar K dequantization factor once to the accumulated QK scores.
         qk_scale_log2 *= k_scale
 
     # Dynamic bounds avoid padded main-loop iterations for uneven splits.
@@ -772,7 +783,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
                 lse,
                 mask=head_offsets < GROUP_SIZE,
             )
-        if KV_E4M3:
+        if FOLD_SCALES:
             # V dequantization is linear, so apply its scalar after the
             # normalized FP32 accumulation instead of to every loaded value.
             normalized_output *= v_scale
@@ -844,7 +855,7 @@ def _qsa_merge_splitk_kernel(
     NUM_QUERY_HEADS: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
     BLOCK_SPLITS: tl.constexpr,
-    KV_E4M3: tl.constexpr,
+    FOLD_SCALES: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     head = tl.program_id(1)
@@ -878,7 +889,7 @@ def _qsa_merge_splitk_kernel(
     )
     merged = tl.sum(partial_output * weights[:, None], axis=0)
     merged = tl.where(denominator > 0, merged / denominator, 0.0)
-    if KV_E4M3:
+    if FOLD_SCALES:
         # Apply the V scale once after combining all independently normalized
         # splits. Scaling partials earlier would repeat this work per split.
         merged *= v_scale
@@ -2292,7 +2303,7 @@ def qsa_sparse_paged_attention(
     result. Apply output gating after the cross-rank merge, not per rank.
     """
 
-    if not q.is_cuda or not HAS_TRITON:
+    if not (q.is_cuda or _TRITON_INTERPRET) or not HAS_TRITON:
         raise RuntimeError("paged QSA sparse attention requires CUDA and Triton")
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
         raise ValueError("QSA sparse attention received invalid Q/K/V shapes")
@@ -2304,14 +2315,44 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention cache and block table must be nonempty")
     if logical_indices.shape[1] <= 0:
         raise ValueError("QSA sparse attention requires a positive selection width")
-    if q.shape[2] != k_cache.shape[3] or q.shape[1] % k_cache.shape[2]:
+    cache_head_dim = k_cache.shape[3]
+    if kv_cache_dtype == NVFP4_KV_CACHE_DTYPE:
+        # The last dimension is the packed row: 8 data bytes and 1 scale byte per
+        # group of 16 values, so head_dim * 9 / 16 bytes.
+        cache_head_dim = cache_head_dim * NVFP4_KV_GROUP_SIZE // 9
+    if q.shape[2] != cache_head_dim or q.shape[1] % k_cache.shape[2]:
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
     if q.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError("QSA sparse attention requires FP16 or BF16 queries")
     kv_e4m3 = kv_cache_dtype in ("fp8", "fp8_e4m3")
-    if kv_e4m3:
+    kv_nvfp4 = kv_cache_dtype == NVFP4_KV_CACHE_DTYPE
+    # Internal: NVFP4 rows already gathered and decoded to FP16, scales unapplied.
+    kv_gathered = kv_cache_dtype == QSA_NVFP4_GATHERED_DTYPE
+    fold_scales = kv_e4m3 or kv_gathered
+    if kv_nvfp4:
+        if q.dtype != torch.float16:
+            raise ValueError("QSA NVFP4 K/V caches require FP16 queries")
+        if k_cache.dtype != torch.uint8 or v_cache.dtype != torch.uint8:
+            raise ValueError("QSA NVFP4 K/V caches must use uint8 storage")
+        if q.shape[2] % NVFP4_KV_GROUP_SIZE:
+            raise ValueError("QSA NVFP4 head size must be a multiple of 16")
+        if (
+            not math.isfinite(k_scale)
+            or not math.isfinite(v_scale)
+            or k_scale <= 0.0
+            or v_scale <= 0.0
+        ):
+            raise ValueError("QSA NVFP4 K/V scales must be finite and positive")
+    elif kv_gathered:
+        if q.dtype != k_cache.dtype or q.dtype != v_cache.dtype:
+            raise ValueError("QSA gathered NVFP4 K/V must match the query dtype")
+        if not math.isfinite(k_scale) or not math.isfinite(v_scale):
+            raise ValueError("QSA NVFP4 K/V scales must be finite")
+        if k_scale <= 0.0 or v_scale <= 0.0:
+            raise ValueError("QSA NVFP4 K/V scales must be positive")
+    elif kv_e4m3:
         if k_cache.dtype != torch.uint8 or v_cache.dtype != torch.uint8:
             raise ValueError("QSA E4M3 K/V caches must use uint8 storage")
         if not math.isfinite(k_scale) or not math.isfinite(v_scale):
@@ -2359,15 +2400,38 @@ def qsa_sparse_paged_attention(
     if not q.shape[0]:
         return out
 
-    if lse is None and _use_sm70_qsa_xqa_page4(
-        q,
-        k_cache,
-        v_cache,
-        logical_indices,
-        block_table,
-        token_to_req,
-        query_positions,
-        sequence_lengths,
+    if kv_nvfp4:
+        # Gather and decode the selected rows to FP16, then run the FP16 kernel
+        # below unchanged. The CUDA page4 routes never see an NVFP4 cache.
+        from .qsa_nvfp4 import qsa_sparse_attention_nvfp4
+
+        return qsa_sparse_attention_nvfp4(
+            q,
+            k_cache,
+            v_cache,
+            logical_indices,
+            block_table,
+            token_to_req,
+            out,
+            output_gate_view,
+            lse,
+            k_scale,
+            v_scale,
+        )
+
+    if (
+        lse is None
+        and not kv_gathered
+        and _use_sm70_qsa_xqa_page4(
+            q,
+            k_cache,
+            v_cache,
+            logical_indices,
+            block_table,
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+        )
     ):
         assert query_positions is not None and sequence_lengths is not None
         xqa_output = _qsa_sparse_paged_attention_sm70_xqa_page4(
@@ -2489,6 +2553,7 @@ def qsa_sparse_paged_attention(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         KV_E4M3=kv_e4m3,
+        FOLD_SCALES=fold_scales,
         RESOLVED_INDICES=resolved_indices,
         num_warps=partial_warps,
         num_stages=2,
@@ -2512,7 +2577,7 @@ def qsa_sparse_paged_attention(
         NUM_QUERY_HEADS=q.shape[1],
         NUM_SPLITS=num_splits,
         BLOCK_SPLITS=triton.next_power_of_2(num_splits),
-        KV_E4M3=kv_e4m3,
+        FOLD_SCALES=fold_scales,
         num_warps=2,
         num_stages=1,
     )
