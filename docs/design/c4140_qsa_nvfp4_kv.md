@@ -389,7 +389,7 @@ ring 容量整除斷言（`qsa_cache.py:964-967`）。
 `get_max_concurrency_for_kv_cache_config`。預算＝ M94 實測的 `292×12,100,608 B = 3.2907 GiB/rank`。
 `max_model_len=262144`。「ID」指一個 block-ID（一整欄 tensor 頁）。
 
-**MTP4（K=4，13 個 owner）**
+#### MTP4（K=4，13 個 owner）
 
 | 配置 | B | owner 頁（B×slot） | Q（B/ID） | 線性 B/token | 固定 ID/請求 F | IDs | `GPU KV cache size` | 262K 等價 | 對 E4M3 |
 |---|---:|---|---:|---:|---:|---:|---:|---:|---:|
@@ -399,7 +399,7 @@ ring 容量整除斷言（`qsa_cache.py:964-967`）。
 | 混合、放大 B（無打包） | 2864 | 12×824,832 + 1×1,466,368 | — | — | 25 | 257 | 575,820 | 2.197 | 1.414× |
 | **C2** 全 13 層 NVFP4 打包 | 1616／1440 | — | — | — | — | — | **`ValueError`**：`main-KV owners do not fill whole physical pages: {465408: 1}`（B=1616）、`{414720: 1}`（B=1440）；13 為奇數，剩一個落單 | | |
 
-**MTP off（K=0，12 個 owner）**
+#### MTP off（K=0，12 個 owner）
 
 | 配置 | B | owner 頁 | Q | 線性 B/token | F | IDs | `GPU KV cache size` | 262K 等價 | 對 E4M3 |
 |---|---:|---|---:|---:|---:|---:|---:|---:|---:|
@@ -418,7 +418,7 @@ GDN 群數變 `cdiv(36, owners)` = 6，所以 7 個 mamba 群（C：7×2+1 = 15�
 
 ### 4.3 三個選項
 
-**(A) 放大 block 使 NVFP4 頁追上 state（補齊 padding）——決策：Fable**
+#### (A) 放大 block 使 NVFP4 頁追上 state（補齊 padding）——決策：Fable
 
 - 作法：什麼都不改，`--kv-cache-dtype nvfp4` 後 `_align_hybrid_block_size` 自己算出
   B=2784（off）／2864（MTP4）；`AttentionSpec` 的 NVFP4 頁數學與 `FullAttentionSpec`
@@ -430,7 +430,7 @@ GDN 群數變 `cdiv(36, owners)` = 6，所以 7 個 mamba 群（C：7×2+1 = 15�
   align 模式的 prefill chunk 在 `max_num_batched_tokens=8192` 下由 8080 縮到 5728（MTP4）
   或 5568（off）；固定 state 稅略升（+24 MiB／+8 MiB）。[unverified 實測影響]
 
-**(B) state 獨立頁池——決策：Fable（建議暫不採，高並發才有價值）**
+#### (B) state 獨立頁池——決策：Fable（建議暫不採，高並發才有價值）
 
 - 讓 GDN／PLE state 離開 attention 頁，B 可以維持 1568／1616 或更小，NVFP4 頁 451,584／465,408 B 不 pad。
 - **現有 code 沒有支援**：`KVCacheConfig.num_blocks` 是單一純量，所有群共用一個 ID 空間與一個
@@ -445,7 +445,7 @@ GDN 群數變 `cdiv(36, owners)` = 6，所以 7 個 mamba 群（C：7×2+1 = 15�
   N=16 在 A／C1 為 0，B 的上限也只有約 9K（§7.2）。
 - 結論：N≥8 才是它的戰場；為此要重寫 allocator／coordinator／scheduler，**先用 C 的 pack-n 拿一部分**（見下）。
 
-**(C) 把兩個 NVFP4 頁打包進一個實體頁——決策：Fable**
+#### (C) 把兩個 NVFP4 頁打包進一個實體頁——決策：Fable
 
 - 重用 DCP2 已上線的 `_pack_csa_linear_main_kv` + `packed_members` +
   `_reshape_kv_cache` 的 `as_strided` 成員 view（§2.2）；allocator 側 **dry-run 已通過**
