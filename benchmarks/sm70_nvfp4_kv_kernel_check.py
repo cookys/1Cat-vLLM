@@ -49,7 +49,7 @@ values at TP4 are head 256, 6 query heads, 1 KV head, top-k 2051. Block sizes ar
 the ones the allocator derives (``docs/design/c4140_qsa_nvfp4_kv.md``): 2784 and
 2864 for NVFP4 without and with MTP4, 1616 for E4M3 with MTP4 (the control).
 
-Verdict printed on stdout (exit status 0 for a clean run whatever the verdict):
+Verdict printed on stdout:
 
     STORE_MATCHES_REFERENCE: YES/NO          data and scale bytes, every NVFP4 case
     GATHER_MATCHES_REFERENCE: YES/NO         FP16 outputs equal, every NVFP4 case
@@ -64,8 +64,44 @@ Verdict printed on stdout (exit status 0 for a clean run whatever the verdict):
 ``NO`` lines carry the evidence (the count and first position of differing bytes,
 the largest difference). ``UNKNOWN`` means a case failed before it could say.
 
-Exit status: 0 a clean run; 2 no CUDA device, a GPU that already holds memory
-(unless ``--allow-busy``) or unusable arguments; 1 a case raised.
+Self-check. One command line is enough to know whether the run can be trusted. Every
+run also validates itself and ends with a verdict:
+
+    POSITIVE_CONTROL <name>: PASS/FAIL/SKIPPED
+    NEGATIVE_CONTROL <mutation> <link>: FLAGGED/MISSED/SKIPPED
+    STAGE <name>: RAN/SKIPPED
+    SELF_CHECK: PASS
+    SELF_CHECK: FAIL (<what failed>)
+
+Positive controls must PASS: ``STORE_MATCHES_REFERENCE``, ``GATHER_MATCHES_REFERENCE``,
+``ZERO_FILL_OK`` and ``DECODE_PATH_IDENTICAL`` (the four verdicts above, bit-exact),
+``TIE_STORE_MATCHES_REFERENCE`` (the GPU store on engineered round-to-nearest-even
+ties, E2M1 midpoints and E4M3 scale midpoints, equals the reference), and
+``NVFP4_ERROR_IN_BAND`` / ``E4M3_ERROR_IN_BAND``: the relative L2 error of the
+attention output measured through the harness must lie between 0.7 and 1.4 times the
+value a CPU model predicts for the same data (FP32 attention on K/V quantized by the
+reference quantizer, or by the float8_e4m3fn cast that ``reshape_and_cache_flash``
+performs). The E4M3 arm is the harness's known-answer check: if it does not reproduce
+its band the comparison itself cannot be trusted.
+
+Negative controls must be FLAGGED: three mutated arms are compared with the same
+comparisons that judge the real arm, and each comparison must report a difference.
+``nibble_order_swapped`` (the two nibbles of every data byte exchanged) and
+``scale_placement_wrong`` (the scale bytes permuted as SM100's V swizzle does, which is
+not the V100 layout) are checked at the store, gather and decode links;
+``tie_rule_removed_e2m1`` and ``tie_rule_removed_e4m3`` (round half up instead of half
+to even, in the nibble or in the scale byte) are checked on the tie store. A mutation
+that is MISSED means the data or the comparison cannot see that class of error.
+A MISSED can also follow a failed positive control: a store that is wrong in exactly
+the mutated way makes the mutated reference equal to it.
+
+Stages store, gather, zero_fill, decode, e4m3_control, tie_control, negative_controls
+and timing must all be RAN. A skipped stage is a failed self-check, so ``--no-timing``
+and ``--no-e4m3`` make ``SELF_CHECK`` FAIL by design; a case that raised does too.
+
+Exit status: 0 a clean run with ``SELF_CHECK: PASS``; 1 ``SELF_CHECK: FAIL`` (a failed
+control, a skipped stage or a case that raised); 2 no CUDA device, a GPU that already
+holds memory (unless ``--allow-busy``) or unusable arguments.
 
     cd <worktree> && CUDA_VISIBLE_DEVICES=<idle gpu> PYTHONPATH=$PWD \\
         /data/venvs/1cat-p070/bin/python benchmarks/sm70_nvfp4_kv_kernel_check.py \\
@@ -82,6 +118,7 @@ lines name the tree the kernels were imported from.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import statistics
@@ -109,6 +146,36 @@ DEFAULT_V_SCALE = 0.0404924675822258
 MAX_ABS_VALUE = 40.0
 E4M3_MAX = 448.0
 RESULT_KEYS = ("store", "gather", "zero_fill", "decode_path", "decode_quality")
+# The measured attention error must lie within this factor of the CPU model's.
+BAND_LOW, BAND_HIGH = 0.7, 1.4
+# Midpoints of the E2M1 grid (0, .5, 1, 1.5, 2, 3, 4, 6) and 6 x midpoints of E4M3
+# neighbours (1.0625, 1.3125, 1.5625, 2.125, 0.53125): fp16-exact values that sit
+# exactly on a rounding tie after the store's scaling at unit layer scale.
+E2M1_TIE_VALUES = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
+E4M3_TIE_AMAX = (6.375, 7.875, 9.375, 12.75, 3.1875)
+TIE_TOKENS = 32
+MUTATIONS = ("nibble_order_swapped", "scale_placement_wrong")
+TIE_MUTATIONS = ("tie_rule_removed_e2m1", "tie_rule_removed_e4m3")
+LINKS = ("store", "gather", "decode")
+POSITIVE_CONTROLS = (
+    "STORE_MATCHES_REFERENCE",
+    "GATHER_MATCHES_REFERENCE",
+    "ZERO_FILL_OK",
+    "DECODE_PATH_IDENTICAL",
+    "TIE_STORE_MATCHES_REFERENCE",
+    "NVFP4_ERROR_IN_BAND",
+    "E4M3_ERROR_IN_BAND",
+)
+STAGES = (
+    "store",
+    "gather",
+    "zero_fill",
+    "decode",
+    "e4m3_control",
+    "tie_control",
+    "negative_controls",
+    "timing",
+)
 # The device the cases run on; the CPU tests point it at "cpu" (Triton interpreter).
 WORKER_DEVICE = "cuda:0"
 
@@ -420,6 +487,165 @@ def abba_order(arms: Sequence[str], rounds: int) -> list[str]:
     return order
 
 
+# ------------------------------------------------------------------ controls
+
+
+@contextlib.contextmanager
+def patched(module: Any, **replacements: Any):
+    """Replace attributes of ``module`` for the duration of the block."""
+    saved = {name: getattr(module, name) for name in replacements}
+    try:
+        for name, value in replacements.items():
+            setattr(module, name, value)
+        yield
+    finally:
+        for name, value in saved.items():
+            setattr(module, name, value)
+
+
+def swap_nibbles(data: torch.Tensor) -> torch.Tensor:
+    """Every uint8 byte with its two nibbles exchanged: the order mutation."""
+    return ((data >> 4) | ((data & 0x0F) << 4)).to(torch.uint8)
+
+
+def sm100_scale_swizzle(
+    block_size: int, scale_dim: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Source and destination flat positions of SM100's V scale swizzle.
+
+    ``nvfp4_kv_cache_kernels.cu`` ``swizzle_scale_offset``: with ``g = S / 4``,
+    ``(t, s)`` moves to ``((t / 4) * 4 + s / g, (s % g) * 4 + t % 4)``. A bijection of
+    the ``block_size * scale_dim`` positions of one block and head; V100 stores scales
+    linearly, so applying it is a placement error.
+    """
+    if block_size % 4 or scale_dim % 4:
+        raise ValueError("the swizzle needs block_size and scale_dim divisible by 4")
+    t = torch.arange(block_size)[:, None]
+    s = torch.arange(scale_dim)[None, :]
+    group = scale_dim // 4
+    swizzled_t = (t // 4) * 4 + s // group
+    swizzled_s = (s % group) * 4 + t % 4
+    source = (t * scale_dim + s).reshape(-1)
+    destination = (swizzled_t * scale_dim + swizzled_s).reshape(-1)
+    return source, destination
+
+
+def swizzle_scales(scales: torch.Tensor) -> torch.Tensor:
+    """The placement mutation applied to ``(blocks, block_size, heads, scale_dim)``."""
+    blocks, block_size, heads, scale_dim = scales.shape
+    source, destination = sm100_scale_swizzle(block_size, scale_dim)
+    flat = scales.permute(0, 2, 1, 3).reshape(blocks, heads, block_size * scale_dim)
+    moved = torch.empty_like(flat)
+    moved[..., destination] = flat[..., source]
+    return moved.reshape(blocks, heads, block_size, scale_dim).permute(0, 2, 1, 3)
+
+
+def mutate_cache(
+    cache: torch.Tensor, mutation: str, split_views: Callable
+) -> torch.Tensor:
+    """A copy of a 5-D NVFP4 ``cache`` with one mutation applied to both sides."""
+    out = cache.clone()
+    (k_data, v_data), (k_scale, v_scale) = split_views(out)
+    if mutation == "nibble_order_swapped":
+        for data in (k_data, v_data):
+            data.copy_(swap_nibbles(data))
+    elif mutation == "scale_placement_wrong":
+        for scale in (k_scale, v_scale):
+            scale.copy_(swizzle_scales(scale))
+    else:
+        raise ValueError(f"unknown mutation {mutation}")
+    return out
+
+
+def e2m1_encode_half_up(x: torch.Tensor) -> torch.Tensor:
+    """E2M1 code with ties rounded up in magnitude (the nibble tie-rule mutation)."""
+    magnitude = x.float().abs()
+    code = sum(
+        (magnitude >= threshold).to(torch.uint8)
+        for threshold in (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
+    )
+    negative = (x.float() < 0) & (code != 0)
+    return code | (negative.to(torch.uint8) << 3)
+
+
+def e4m3_encode_half_up(
+    x: torch.Tensor, encode: Callable, decode: Callable
+) -> torch.Tensor:
+    """E4M3 byte with ties rounded up, from the round-to-nearest-even ``encode``.
+
+    ``encode`` and ``decode`` are the reference functions, passed in so the mutation can
+    replace them without recursing. Block scales are non-negative.
+    """
+    rne = encode(x)
+    code = rne & 0x7F
+    value = decode(code)
+    upper = decode(torch.clamp(code + 1, max=0x7E).to(torch.uint8))
+    magnitude = x.float().clamp(0.0, E4M3_MAX)
+    tie_up = (magnitude > value) & (magnitude == (value + upper) / 2)
+    return rne + tie_up.to(torch.uint8)
+
+
+def tie_group_values(token: int, group: int) -> list[float]:
+    """16 fp16-exact values of one group, on rounding ties at unit layer scale.
+
+    Even ``token + group``: amax 6 (block scale exactly 1) with every E2M1 midpoint
+    and its negative. Odd: an amax of 6 times an E4M3 midpoint, so the scale byte
+    itself is a tie, with the other values at multiples of amax / 16.
+    """
+    if (token + group) % 2 == 0:
+        return [6.0, *E2M1_TIE_VALUES, *(-v for v in E2M1_TIE_VALUES), -6.0]
+    amax = E4M3_TIE_AMAX[((token + group) // 2) % len(E4M3_TIE_AMAX)]
+    return [amax] + [amax * (-1) ** j * j / 16.0 for j in range(1, 16)]
+
+
+def make_tie_kv(
+    tokens: int, kv_heads: int, head_dim: int, shift: int = 0
+) -> torch.Tensor:
+    """fp16 ``[tokens, kv_heads, head_dim]`` whose groups sit on rounding ties."""
+    if head_dim % 16:
+        raise ValueError("head_dim must be a multiple of 16")
+    out = torch.zeros(tokens, kv_heads, head_dim)
+    for token in range(tokens):
+        for head in range(kv_heads):
+            for group in range(head_dim // 16):
+                values = tie_group_values(token + shift, group)
+                out[token, head, group * 16 : (group + 1) * 16] = torch.tensor(values)
+    return out.half()
+
+
+def model_attention(
+    q: torch.Tensor,
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    selection: Selection,
+    tokens_per_request: int,
+) -> torch.Tensor:
+    """FP32 attention, one row at a time, over each row's selected tokens.
+
+    ``keys`` and ``values`` are ``[requests * tokens_per_request, heads, d]``, request
+    major, the order ``slot_mapping`` stores them in. Illegal entries are not modelled
+    (use the clean selection).
+    """
+    rows, q_heads, head_dim = q.shape
+    group = q_heads // keys.shape[1]
+    out = torch.zeros(q.shape, dtype=torch.float32)
+    for row in range(rows):
+        request = int(selection.token_to_req[row])
+        index = selection.indices[row].long() + request * tokens_per_request
+        k = keys[index].float().repeat_interleave(group, dim=1)
+        v = values[index].float().repeat_interleave(group, dim=1)
+        scores = torch.einsum("hd,khd->hk", q[row].float(), k) * head_dim**-0.5
+        out[row] = torch.einsum("hk,khd->hd", torch.softmax(scores, dim=-1), v)
+    return out
+
+
+def error_in_band(measured: float, model: float) -> bool:
+    """Is the measured relative L2 within ``BAND_LOW..BAND_HIGH`` of the model's?"""
+    if not (model > 0 and measured > 0):  # also false for NaN
+        return False
+    return BAND_LOW <= measured / model <= BAND_HIGH
+
+
 # ------------------------------------------------------------------ verdicts
 
 
@@ -544,6 +770,159 @@ def format_verdict(
     for case, error in verdict["errors"].items():
         lines.append(f"CASE_ERROR {case}: {error}")
     return lines
+
+
+def _over(
+    cases: Sequence[dict[str, Any]],
+    get: Callable[[dict[str, Any]], Any],
+    ok: Callable[[Any], bool],
+    good: str,
+    bad: str,
+) -> str:
+    """``bad`` if any case that has the measurement fails it, else SKIPPED if a case
+    lacks it (or there is no case), else ``good``."""
+    got = [get(r) for r in cases]
+    if any(g is not None and not ok(g) for g in got):
+        return bad
+    if not cases or any(g is None for g in got):
+        return "SKIPPED"
+    return good
+
+
+def _differs(comparison: dict[str, Any], region: str) -> bool:
+    return comparison[region]["different"] > 0
+
+
+def _control_flagged(mutation: str, link: str, control: dict[str, Any]) -> bool:
+    if link == "store":
+        region = "data" if mutation == "nibble_order_swapped" else "scale"
+        return _differs(control["store"], region)
+    if link == "gather":
+        return control["gather"]["different"] > 0
+    return control["decode"]["max_abs"] > 0.0
+
+
+def compute_self_check(
+    results: Sequence[dict[str, Any]],
+    timings: dict[str, dict[str, Any]],
+    *,
+    no_timing: bool = False,
+) -> dict[str, Any]:
+    """The positive controls, negative controls and stages, and the overall verdict."""
+    nvfp4 = [r for r in results if r["kind"] == "nvfp4"]
+    e4m3 = [r for r in results if r["kind"] == "e4m3"]
+    verdict = compute_verdict(results)
+    positive: dict[str, str] = {}
+    for name in POSITIVE_CONTROLS[:4]:
+        positive[name] = {"YES": "PASS", "NO": "FAIL"}.get(verdict[name], "SKIPPED")
+
+    def band(r: dict[str, Any]) -> Any:
+        check = r.get("model_check")
+        return None if check is None else check
+
+    def in_band(check: dict[str, Any]) -> bool:
+        return error_in_band(check["measured_rel_l2"], check["model_rel_l2"])
+
+    positive["TIE_STORE_MATCHES_REFERENCE"] = _over(
+        nvfp4,
+        lambda r: r.get("tie_control"),
+        lambda t: not _differs(t["correct"], "data")
+        and not _differs(t["correct"], "scale"),
+        "PASS",
+        "FAIL",
+    )
+    positive["NVFP4_ERROR_IN_BAND"] = _over(nvfp4, band, in_band, "PASS", "FAIL")
+    positive["E4M3_ERROR_IN_BAND"] = _over(e4m3, band, in_band, "PASS", "FAIL")
+
+    negative: dict[str, str] = {}
+    for mutation in MUTATIONS:
+        for link in LINKS:
+            negative[f"{mutation} {link}"] = _over(
+                nvfp4,
+                lambda r, m=mutation: (r.get("controls") or {}).get(m),
+                lambda c, m=mutation, link=link: _control_flagged(m, link, c),
+                "FLAGGED",
+                "MISSED",
+            )
+    for mutation, key, region in (
+        ("tie_rule_removed_e2m1", "e2m1_mutant", "data"),
+        ("tie_rule_removed_e4m3", "e4m3_mutant", "scale"),
+    ):
+        negative[f"{mutation} tie_store"] = _over(
+            nvfp4,
+            lambda r, k=key: (r.get("tie_control") or {}).get(k),
+            lambda c, region=region: _differs(c, region),
+            "FLAGGED",
+            "MISSED",
+        )
+
+    def ran(cases: Sequence[dict[str, Any]], *keys: str) -> str:
+        done = bool(cases) and all(
+            all(r.get(k) is not None for k in keys) for r in cases
+        )
+        return "RAN" if done else "SKIPPED"
+
+    timing_ran = (
+        not no_timing
+        and bool(timings)
+        and all(
+            arms and all(a["median"] > 0 for a in arms.values())
+            for arms in timings.values()
+        )
+    )
+    stages = {
+        "store": ran(nvfp4, "store"),
+        "gather": ran(nvfp4, "gather"),
+        "zero_fill": ran(nvfp4, "zero_fill"),
+        "decode": ran(nvfp4, "decode_path", "decode_quality"),
+        "e4m3_control": ran(e4m3, "decode_quality", "model_check"),
+        "tie_control": ran(nvfp4, "tie_control"),
+        "negative_controls": ran(nvfp4, "controls"),
+        "timing": "RAN" if timing_ran else "SKIPPED",
+    }
+    reasons = [f"{n} {v}" for n, v in positive.items() if v != "PASS"]
+    reasons += [f"{n} {v}" for n, v in negative.items() if v != "FLAGGED"]
+    reasons += [f"stage {n} {v}" for n, v in stages.items() if v != "RAN"]
+    reasons += [f"{r['case']} raised" for r in results if r.get("error")]
+    return {
+        "positive": positive,
+        "negative": negative,
+        "stages": stages,
+        "reasons": reasons,
+        "verdict": "FAIL" if reasons else "PASS",
+    }
+
+
+def format_self_check(
+    check: dict[str, Any], results: Sequence[dict[str, Any]]
+) -> list[str]:
+    lines = []
+    for r in results:
+        m = r.get("model_check")
+        if m:
+            ratio = (
+                m["measured_rel_l2"] / m["model_rel_l2"]
+                if m["model_rel_l2"]
+                else float("nan")
+            )
+            name = "E4M3_BAND" if r["kind"] == "e4m3" else "NVFP4_BAND"
+            lines.append(
+                f"{name} {r['case']}: measured relL2 {m['measured_rel_l2']:.4g} "
+                f"model {m['model_rel_l2']:.4g} ratio {ratio:.3f} "
+                f"(band {BAND_LOW}..{BAND_HIGH})"
+            )
+    lines += [f"POSITIVE_CONTROL {n}: {v}" for n, v in check["positive"].items()]
+    lines += [f"NEGATIVE_CONTROL {n}: {v}" for n, v in check["negative"].items()]
+    lines += [f"STAGE {n}: {v}" for n, v in check["stages"].items()]
+    if check["verdict"] == "PASS":
+        lines.append("SELF_CHECK: PASS")
+    else:
+        lines.append(f"SELF_CHECK: FAIL ({'; '.join(check['reasons'])})")
+    return lines
+
+
+def exit_code_for_self_check(check: dict[str, Any]) -> int:
+    return 0 if check["verdict"] == "PASS" else 1
 
 
 # ------------------------------------------------------------------ the measurement
@@ -701,7 +1080,8 @@ class CaseRun:
         )
         _sync()
         ref_views = nv.nvfp4_kv_split_views(reference)
-        act_views = nv.nvfp4_kv_split_views(actual.cpu())
+        actual_cpu = actual.cpu()
+        act_views = nv.nvfp4_kv_split_views(actual_cpu)
         result: dict[str, Any] = {
             "store": merge_region_comparisons(
                 [
@@ -768,6 +1148,49 @@ class CaseRun:
         result["zero_fill"] = {"ok": bool(zeros_ok and empty_ok and decode_ok)}
         result["decode_path"] = error_stats(nvfp4_out, fp16_out)
 
+        # Negative controls: the same three comparisons, on mutated caches.
+        controls: dict[str, Any] = {}
+        for mutation in MUTATIONS:
+            mutated = mutate_cache(reference, mutation, nv.nvfp4_kv_split_views)
+            m_views = nv.nvfp4_kv_split_views(mutated)
+            store_cmp = merge_region_comparisons(
+                [
+                    compare_cache_regions(
+                        (m_views[0][side], m_views[1][side]),
+                        (act_views[0][side], act_views[1][side]),
+                    )
+                    for side in (0, 1)
+                ]
+            )
+            m_keys, m_values = nvt.gather_dequant_nvfp4_kv_triton(
+                self._dev(mutated),
+                self._dev(sel.table),
+                self._dev(sel.token_to_req),
+                self._dev(sel.indices),
+                k_scale=ks,
+                v_scale=vs,
+            )
+            gather_cmp = {
+                "different": int(
+                    (m_keys.cpu() != ref_keys).sum()
+                    + (m_values.cpu() != ref_values).sum()
+                )
+            }
+            m_unit = self._dev(mutate_cache(unit, mutation, nv.nvfp4_kv_split_views))
+            m_out = self._attention(
+                sel,
+                k_cache=m_unit[:, 0],
+                v_cache=m_unit[:, 1],
+                kv_cache_dtype="nvfp4",
+            ).cpu()
+            controls[mutation] = {
+                "store": store_cmp,
+                "gather": gather_cmp,
+                "decode": error_stats(m_out, fp16_out),
+            }
+        result["controls"] = controls
+        result["tie_control"] = self._tie_control(nv, nvt)
+
         # Quantization error at the realistic scales against the unquantized K/V.
         clean = self.clean
         k_orig, v_orig = self._fp16_cache(self.key, self.value)
@@ -782,6 +1205,16 @@ class CaseRun:
         ).cpu()
         result["decode_quality"] = error_stats(quantized, baseline)
         (k_data, v_data), (k_scales, v_scales) = nv.nvfp4_kv_split_views(reference)
+        heads, head_dim = g.kv_heads, g.head_dim
+        k_model = nv.dequantize_kv_nvfp4(
+            k_data, k_scales, layer_scale=ks, out_dtype=torch.float32
+        ).reshape(-1, heads, head_dim)[self.slots]
+        v_model = nv.dequantize_kv_nvfp4(
+            v_data, v_scales, layer_scale=vs, out_dtype=torch.float32
+        ).reshape(-1, heads, head_dim)[self.slots]
+        result["model_check"] = self._model_check(
+            k_model, v_model, result["decode_quality"]["rel_l2"]
+        )
         self._cache = cache
         # What the FP16 kernel alone reads once the gather is done (timing only).
         self._k_deq = self._dev(
@@ -822,7 +1255,79 @@ class CaseRun:
             v_scale=vs,
         ).cpu()
         self._e4m3 = (k_cache, v_cache, ks, vs)
-        return {"decode_quality": error_stats(e4m3, baseline)}
+        quality = error_stats(e4m3, baseline)
+        # What reshape_and_cache_flash does per element: scale, clamp, cast to E4M3.
+        k_model = (self.key.float() / ks).clamp(-E4M3_MAX, E4M3_MAX)
+        v_model = (self.value.float() / vs).clamp(-E4M3_MAX, E4M3_MAX)
+        k_model = k_model.to(torch.float8_e4m3fn).float() * ks
+        v_model = v_model.to(torch.float8_e4m3fn).float() * vs
+        return {
+            "decode_quality": quality,
+            "model_check": self._model_check(k_model, v_model, quality["rel_l2"]),
+        }
+
+    def _model_check(self, k_model, v_model, measured: float) -> dict[str, float]:
+        """The CPU model's relative L2 for these dequantized K/V, and the measured."""
+        tpr = self.layout.tokens_per_request
+        reference = model_attention(self.q, self.key, self.value, self.clean, tpr)
+        quantized = model_attention(self.q, k_model, v_model, self.clean, tpr)
+        return {
+            "model_rel_l2": error_stats(quantized, reference)["rel_l2"],
+            "measured_rel_l2": measured,
+        }
+
+    def _tie_control(self, nv, nvt) -> dict[str, Any]:
+        """The store on engineered ties against the reference and two tie mutants."""
+        g, layout = self.geometry, self.layout
+        tokens = min(TIE_TOKENS, layout.block_size)
+        shape = (
+            1,
+            2,
+            layout.block_size,
+            g.kv_heads,
+            nv.nvfp4_kv_row_bytes(g.head_dim),
+        )
+        key = make_tie_kv(tokens, g.kv_heads, g.head_dim)
+        value = make_tie_kv(tokens, g.kv_heads, g.head_dim, shift=1)
+        slots = torch.arange(tokens)
+
+        def reference_cache() -> torch.Tensor:
+            cache = torch.zeros(shape, dtype=torch.uint8)
+            nv.reshape_and_cache_nvfp4_reference(key, value, cache, slots)
+            return cache
+
+        correct = reference_cache()
+        rne_encode, decode = nv.e4m3_encode, nv.e4m3_decode
+        with patched(nv, e2m1_encode=e2m1_encode_half_up):
+            e2m1_mutant = reference_cache()
+        with patched(
+            nv, e4m3_encode=lambda x: e4m3_encode_half_up(x, rne_encode, decode)
+        ):
+            e4m3_mutant = reference_cache()
+        actual = torch.zeros(shape, dtype=torch.uint8, device=self.device)
+        nvt.store_nvfp4_kv_triton(
+            self._dev(key), self._dev(value), actual, self._dev(slots)
+        )
+        _sync()
+        act_views = nv.nvfp4_kv_split_views(actual.cpu())
+
+        def against_actual(cache: torch.Tensor) -> dict[str, Any]:
+            views = nv.nvfp4_kv_split_views(cache)
+            return merge_region_comparisons(
+                [
+                    compare_cache_regions(
+                        (views[0][side], views[1][side]),
+                        (act_views[0][side], act_views[1][side]),
+                    )
+                    for side in (0, 1)
+                ]
+            )
+
+        return {
+            "correct": against_actual(correct),
+            "e2m1_mutant": against_actual(e2m1_mutant),
+            "e4m3_mutant": against_actual(e4m3_mutant),
+        }
 
     def _e4m3_store(self, k_cache, v_cache, key, value, slots, ks, vs) -> None:
         """Write device tensors ``key`` / ``value`` at ``slots`` as E4M3 bytes."""
@@ -1058,6 +1563,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     with torch.inference_mode():
         results, timings = run_all(cases, geometry, kernels, args)
     verdict = compute_verdict(results)
+    check = compute_self_check(results, timings, no_timing=args.no_timing)
     lines = format_verdict(verdict, results)
     for group, arms in timings.items():
         for arm, summary in arms.items():
@@ -1067,6 +1573,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"(round spread {summary['round_spread_pct']:.1f}%)"
             )
     lines += decode_roundtrip_lines(timings)
+    lines += format_self_check(check, results)
     print("\n".join(lines))
     if args.out:
         report = {
@@ -1076,12 +1583,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             "cases": results,
             "timings": timings,
             "verdict": verdict,
+            "self_check": check,
             "lines": lines,
         }
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.out).write_text(json.dumps(report, indent=2, default=str))
         print(f"wrote {args.out}")
-    return exit_code_for(results)
+    return max(exit_code_for(results), exit_code_for_self_check(check))
 
 
 if __name__ == "__main__":

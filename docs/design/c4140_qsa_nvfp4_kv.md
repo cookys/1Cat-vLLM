@@ -177,8 +177,8 @@ CUDA_VISIBLE_DEVICES= PYTHONPATH=$PWD uv run --no-project --python /data/venvs/1
   --with pytest -- python -m pytest --noconftest \
   tests/models/qwen4_exp/test_nvfp4_kv_{reference,admission,scale,triton,store,decode,sm70_compile}.py \
   tests/models/qwen4_exp/test_sm70_nvfp4_kv_kernel_check_cpu.py -q
-326 passed, 83 skipped   # 參考 129、准入與 spec 與 allocator 65、scale 66、編譯閘門 27、步驟 E 腳本 39；Triton gather 19、store 31、decode 32 與腳本的 1 個端到端預設略過
-TRITON_INTERPRET=1 同上   # 382 passed, 27 skipped；編譯閘門需要真的編譯器，直譯器下略過
+342 passed, 83 skipped   # 參考 129、准入與 spec 與 allocator 65、scale 66、編譯閘門 27、步驟 E 腳本 55；Triton gather 19、store 31、decode 32 與腳本的 1 個端到端預設略過
+TRITON_INTERPRET=1 同上   # 398 passed, 27 skipped；編譯閘門需要真的編譯器，直譯器下略過
 ```
 
 - 參考測試含「SM100 約定釘選」：讀 `csrc` 原始碼字串，斷言頁版面、`1/k_scale`、scale 運算順序、
@@ -211,9 +211,10 @@ TRITON_INTERPRET=1 同上   # 382 passed, 27 skipped；編譯閘門需要真的�
   內核裡 V scale 不折疊一開始沒有被抓到（31 個全過），原因是單 split 分支沒有非 1 純量的測試，補上後 2 個失敗。
 - 既有內核沒有被改動的證據：把 split-K（E4M3 與 FP16，三種 tile 與 warp 組合）與 merge（E4M3 與 FP16）共 8 個既有組態
   編到 sm_70，去掉原始碼行號資訊後的 PTX 在修改前後逐位元相同。
-- 步驟 E 腳本的 CPU 測試（40 個）：參數、從真實 config 讀出的幾何、case 與 cache 規劃、種子化的 K/V 與含非法項的 top-k
+- 步驟 E 腳本的 CPU 測試（56 個）：參數、從真實 config 讀出的幾何、case 與 cache 規劃、種子化的 K/V 與含非法項的 top-k
   （非法位置的預期與 `nvfp4_entry_validity` 逐項一致）、位元組比對、誤差與計時統計、ABBA 順序、verdict 與結束碼、
-  沒有 CUDA 與 GPU 已被佔用時的快速失敗；直譯器下另有一個小 case 從 store 到計時完整跑一遍。
+  沒有 CUDA 與 GPU 已被佔用時的快速失敗，以及自檢的邏輯（突變函式、tie 資料、誤差帶、各種失敗與跳過階段）；
+  直譯器下另有一個小 case 從 store 到計時與自檢完整跑一遍，要求 `SELF_CHECK: PASS`。
 - worktree 內 `vllm/*.so` 與 `_version.py` 是指向 `/data/venvs/1cat-p070` 的符號連結（已被 git 忽略，沒有建置），
   讓 worktree 的原始碼能載入 `vllm._C`；沒有修改任何 venv。
 - 沒有可見 GPU 時，匯入 `qsa.py` 會因 `flash_attn.py` 向 GPU 詢問 FlashAttention 版本而失敗；
@@ -375,7 +376,28 @@ decode round-trip 裡佔多少；佔比小就不值得做。
 
 印出：`STORE_MATCHES_REFERENCE`、`GATHER_MATCHES_REFERENCE`、`ZERO_FILL_OK`、`DECODE_PATH_IDENTICAL`（YES、NO 或 UNKNOWN，NO 附證據）、
 `DECODE_VS_FP16`、`E4M3_CONTROL`、`NVFP4_VS_E4M3_REL_L2`、`TIMING_US`、`DECODE_ROUNDTRIP_US`。`--out` 寫 JSON。
-結束碼：0 乾淨跑完（不論 verdict），2 沒有 CUDA、GPU 已被佔用或參數不可用，1 有 case 丟例外。
+結束碼：0 是 `SELF_CHECK: PASS`，1 是 `SELF_CHECK: FAIL`，2 是沒有 CUDA、GPU 已被佔用或參數不可用。
+
+### 自檢
+
+一行指令就能知道這次跑可不可信，最後一行是 `SELF_CHECK: PASS` 或 `SELF_CHECK: FAIL (<原因>)`：
+
+- **正向對照必須 PASS**：上面四個逐位元的 verdict；`TIE_STORE_MATCHES_REFERENCE`，也就是 GPU store 在刻意造出的
+  捨入平手上（E2M1 的中點與 E4M3 scale 的中點，單位 layer scale）等於參考；以及 `NVFP4_ERROR_IN_BAND` 與
+  `E4M3_ERROR_IN_BAND`：經過這套 harness 量到的注意力輸出相對 L2，必須落在 CPU 模型預測值的 0.7 到 1.4 倍。
+  模型是對同一份資料做 FP32 注意力，K/V 由參考量化器，或由 `reshape_and_cache_flash` 做的 `float8_e4m3fn` 轉換量化。
+  E4M3 這一臂就是 harness 的已知答案檢查：它重現不出自己的誤差帶，比較本身就不可信。
+  在直譯器的小 case 上，兩者的比值是 1.000。
+- **負向對照必須被 FLAGGED**：三種突變拿同樣的比較去量，比較必須回報差異。`nibble_order_swapped`（每個資料位元組的兩個
+  nibble 對調）與 `scale_placement_wrong`（scale 位元組照 SM100 的 V swizzle 重排，那不是 V100 的版面）在 store、gather、
+  decode 三個環節各量一次；`tie_rule_removed_e2m1` 與 `tie_rule_removed_e4m3`（平手改成進位，分別在 nibble 與 scale 位元組）
+  在平手 store 上量。MISSED 代表資料或比較看不見那一類錯誤；也可能是正向對照已經失敗的後果，例如 store 剛好錯成
+  同一種樣子。
+- **所有階段都要 RAN**：store、gather、zero_fill、decode、e4m3_control、tie_control、negative_controls、timing。
+  跳過階段就是自檢失敗，所以 `--no-timing` 與 `--no-e4m3` 會讓 `SELF_CHECK` 變成 FAIL，case 丟例外也是。
+
+自檢本身的驗證：未突變時全部 PASS；把 Triton store 的 E2M1 編碼改成 0.25 進位，或把 nibble 順序對調，`SELF_CHECK` 都變成 FAIL，
+且 `STORE_MATCHES_REFERENCE` 與 `TIE_STORE_MATCHES_REFERENCE` 一起失敗。這些都在直譯器的小 case 上做，不是 GPU。
 
 GPU 操作員要跑的：
 

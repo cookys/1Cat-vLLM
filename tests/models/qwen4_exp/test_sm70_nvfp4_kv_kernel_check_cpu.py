@@ -490,6 +490,366 @@ def test_main_refuses_unusable_geometry_before_loading_any_kernel(
     assert "unusable arguments" in capsys.readouterr().out
 
 
+# ------------------------------------------------------------------- self-check
+def _views():
+    from vllm.models.qwen4_exp.nvidia.ops import nvfp4_kv as nv
+
+    return nv, nv.nvfp4_kv_split_views
+
+
+def _random_cache(nv, blocks=3, block_size=8, heads=1, head_dim=64, seed=0):
+    generator = torch.Generator().manual_seed(seed)
+    cache = torch.zeros(
+        (blocks, 2, block_size, heads, nv.nvfp4_kv_row_bytes(head_dim)),
+        dtype=torch.uint8,
+    )
+    key = torch.randn(blocks * block_size, heads, head_dim, generator=generator).half()
+    value = torch.randn(
+        blocks * block_size, heads, head_dim, generator=generator
+    ).half()
+    nv.reshape_and_cache_nvfp4_reference(
+        key, value, cache, torch.arange(blocks * block_size)
+    )
+    return cache
+
+
+def test_swapping_nibbles_exchanges_the_halves_of_every_byte(chk):
+    data = torch.tensor([0x00, 0xAB, 0x1F, 0xF0, 0x77], dtype=torch.uint8)
+    swapped = chk.swap_nibbles(data)
+    assert swapped.tolist() == [0x00, 0xBA, 0xF1, 0x0F, 0x77]
+    assert swapped.dtype == torch.uint8
+    assert torch.equal(chk.swap_nibbles(swapped), data)
+
+
+def test_the_sm100_swizzle_is_a_bijection_that_matches_the_kernel_formula(chk):
+    source, destination = chk.sm100_scale_swizzle(8, 16)
+    assert torch.equal(source.sort().values, torch.arange(8 * 16))
+    assert torch.equal(destination.sort().values, torch.arange(8 * 16))
+    # nvfp4_kv_cache_kernels.cu swizzle_scale_offset(t=5, s=7, scale_dim=16):
+    # group 4, swizzled_t = 4 + 1, swizzled_s = 3 * 4 + 1.
+    position = int((source == 5 * 16 + 7).nonzero())
+    assert int(destination[position]) == 5 * 16 + 13
+    assert not torch.equal(source, destination)
+    for block, dim in ((6, 16), (8, 6)):
+        with pytest.raises(ValueError, match="divisible by 4"):
+            chk.sm100_scale_swizzle(block, dim)
+
+
+def test_swizzled_scales_keep_the_bytes_and_move_them(chk):
+    scales = torch.arange(2 * 8 * 3 * 16, dtype=torch.int64).remainder(251)
+    scales = scales.reshape(2, 8, 3, 16).to(torch.uint8)
+    moved = chk.swizzle_scales(scales)
+    assert moved.shape == scales.shape
+    assert torch.equal(
+        moved.reshape(-1).sort().values, scales.reshape(-1).sort().values
+    )
+    assert not torch.equal(moved, scales)
+    # Byte (t=5, s=7) of block 1, head 2 lands at (t=5, s=13) of that block and head.
+    assert torch.equal(moved[1, 5, 2, 13], scales[1, 5, 2, 7])
+
+
+def test_each_cache_mutation_changes_only_its_own_region(chk):
+    nv, views = _views()
+    cache = _random_cache(nv)
+    before = cache.clone()
+    (k_data, v_data), (k_scale, v_scale) = views(cache)
+    original = {
+        "data": (k_data.clone(), v_data.clone()),
+        "scale": (k_scale.clone(), v_scale.clone()),
+    }
+    for mutation, changed, kept in (
+        ("nibble_order_swapped", "data", "scale"),
+        ("scale_placement_wrong", "scale", "data"),
+    ):
+        mutated = chk.mutate_cache(cache, mutation, views)
+        assert torch.equal(cache, before)  # the input is only copied
+        (m_k_data, m_v_data), (m_k_scale, m_v_scale) = views(mutated)
+        now = {"data": (m_k_data, m_v_data), "scale": (m_k_scale, m_v_scale)}
+        assert any(
+            not torch.equal(a, b) for a, b in zip(original[changed], now[changed])
+        )
+        assert all(torch.equal(a, b) for a, b in zip(original[kept], now[kept]))
+    with pytest.raises(ValueError, match="unknown mutation"):
+        chk.mutate_cache(cache, "nope", views)
+
+
+def test_half_up_encoders_differ_from_round_to_even_exactly_on_ties(chk):
+    from vllm.models.qwen4_exp.nvidia.ops import nvfp4_kv as nv
+
+    ties = torch.tensor(chk.E2M1_TIE_VALUES)
+    values = torch.cat([ties, -ties, torch.linspace(-7, 7, 2001)])
+    rne, up = nv.e2m1_encode(values), chk.e2m1_encode_half_up(values)
+    differs = rne != up
+    assert differs.any()
+    # Every difference is a tie that round-to-even sends down in magnitude and
+    # half-up sends up.
+    assert bool(
+        torch.isin(values[differs].abs(), torch.tensor([0.25, 1.25, 2.5, 5.0])).all()
+    )
+    assert bool((up[differs] > rne[differs]).all())  # a larger magnitude code
+    assert torch.equal(rne[~differs], up[~differs])
+
+    codes = torch.arange(0, 0x7E, dtype=torch.uint8)
+    grid = nv.e4m3_decode(codes)
+    midpoints = (grid[:-1] + grid[1:]) / 2
+    samples = torch.cat([midpoints, grid, torch.linspace(0, 448, 3001)])
+    rne = nv.e4m3_encode(samples)
+    up = chk.e4m3_encode_half_up(samples, nv.e4m3_encode, nv.e4m3_decode)
+    differs = rne != up
+    assert differs.any() and bool((up[differs] == rne[differs] + 1).all())
+    tie_down = nv.e4m3_decode(rne[differs]) < samples[differs]
+    assert bool(tie_down.all())  # only where round-to-even went down onto a tie
+    assert torch.equal(rne[~differs], up[~differs])
+
+
+def test_the_tie_data_sits_on_ties_and_separates_both_mutants(chk):
+    nv, views = _views()
+    key = chk.make_tie_kv(8, 1, 64)
+    value = chk.make_tie_kv(8, 1, 64, shift=1)
+    assert key.dtype == torch.float16 and key.shape == (8, 1, 64)
+    assert not torch.equal(key, value)
+    assert float(key[0, 0, :16].abs().max()) == 6.0  # an E2M1 tie group
+    assert float(key[1, 0, :16].abs().max()) in chk.E4M3_TIE_AMAX  # an E4M3 tie group
+    shape = (1, 2, 8, 1, nv.nvfp4_kv_row_bytes(64))
+
+    def store() -> torch.Tensor:
+        cache = torch.zeros(shape, dtype=torch.uint8)
+        nv.reshape_and_cache_nvfp4_reference(key, value, cache, torch.arange(8))
+        return cache
+
+    correct = store()
+    original = (nv.e2m1_encode, nv.e4m3_encode)
+    with chk.patched(nv, e2m1_encode=chk.e2m1_encode_half_up):
+        e2m1_mutant = store()
+    rne_encode, decode = nv.e4m3_encode, nv.e4m3_decode
+    with chk.patched(
+        nv, e4m3_encode=lambda x: chk.e4m3_encode_half_up(x, rne_encode, decode)
+    ):
+        e4m3_mutant = store()
+    assert (nv.e2m1_encode, nv.e4m3_encode) == original  # restored
+    (c_data, _), (c_scale, _) = views(correct)
+    (m2_data, _), (m2_scale, _) = views(e2m1_mutant)
+    (m4_data, _), (m4_scale, _) = views(e4m3_mutant)
+    assert not torch.equal(c_data, m2_data)  # the nibble mutant moves nibbles
+    assert torch.equal(c_scale, m2_scale)  # and leaves the scale bytes alone
+    assert not torch.equal(c_scale, m4_scale)  # the scale mutant moves scale bytes
+    assert m4_data.shape == c_data.shape
+
+
+def test_patched_restores_even_when_the_block_raises(chk):
+    class Holder:
+        value = 1
+
+    with pytest.raises(RuntimeError), chk.patched(Holder, value=2):
+        assert Holder.value == 2
+        raise RuntimeError
+    assert Holder.value == 1
+
+
+def test_model_attention_matches_a_hand_computation(chk):
+    layout = chk.plan_layout(8, rows=2, topk=2, context=4)
+    q = torch.tensor([[[1.0, 0.0]], [[0.0, 1.0]]]).half()
+    keys = torch.zeros(layout.requests * layout.tokens_per_request, 1, 2)
+    values = torch.zeros_like(keys)
+    keys[0], keys[1] = torch.tensor([[2.0, 0.0]]), torch.tensor([[0.0, 0.0]])
+    values[0], values[1] = torch.tensor([[10.0, 0.0]]), torch.tensor([[0.0, 20.0]])
+    keys[layout.tokens_per_request] = torch.tensor([[0.0, 3.0]])
+    values[layout.tokens_per_request] = torch.tensor([[7.0, 7.0]])
+    selection = chk.Selection(
+        indices=torch.tensor([[0, 1], [0, 0]], dtype=torch.int32),
+        table=torch.zeros((layout.requests, layout.pages), dtype=torch.int32),
+        token_to_req=torch.tensor([0, 1], dtype=torch.int32),
+        illegal=torch.zeros((2, 2), dtype=torch.bool),
+        empty_rows=(),
+    )
+    out = chk.model_attention(q, keys, values, selection, layout.tokens_per_request)
+    scale = 2**-0.5  # head_dim 2
+    weights = torch.softmax(torch.tensor([2.0, 0.0]) * scale, dim=0)
+    expected_row0 = weights[0] * torch.tensor([10.0, 0.0]) + weights[1] * torch.tensor(
+        [0.0, 20.0]
+    )
+    assert torch.allclose(out[0, 0], expected_row0, atol=1e-6)
+    # Row 1 reads request 1's token 0 twice: any weights give that value.
+    assert torch.allclose(out[1, 0], torch.tensor([7.0, 7.0]), atol=1e-6)
+
+
+def test_the_error_band_is_a_ratio_to_the_model(chk):
+    assert chk.error_in_band(1.0, 1.0)
+    assert chk.error_in_band(0.7, 1.0) and chk.error_in_band(1.4, 1.0)
+    assert not chk.error_in_band(0.69, 1.0) and not chk.error_in_band(1.41, 1.0)
+    assert chk.error_in_band(0.014, 0.01)
+    for measured, model in (
+        (0.0, 1.0),
+        (1.0, 0.0),
+        (float("nan"), 1.0),
+        (1.0, float("nan")),
+    ):
+        assert not chk.error_in_band(measured, model)
+
+
+def _region(different=0, bytes_=8):
+    return {"bytes": bytes_, "different": different, "first_index": None}
+
+
+def _comparison(data=0, scale=0):
+    return {"data": _region(data), "scale": _region(scale)}
+
+
+def _passing_nvfp4(rows=1, label=None):
+    flagged = {
+        "nibble_order_swapped": {
+            "store": _comparison(data=5),
+            "gather": {"different": 7},
+            "decode": {"max_abs": 0.5},
+        },
+        "scale_placement_wrong": {
+            "store": _comparison(scale=5),
+            "gather": {"different": 7},
+            "decode": {"max_abs": 0.5},
+        },
+    }
+    result = _ok_result(label or f"nvfp4-B32-M{rows}", rows=rows)
+    result["controls"] = flagged
+    result["tie_control"] = {
+        "correct": _comparison(),
+        "e2m1_mutant": _comparison(data=3),
+        "e4m3_mutant": _comparison(scale=2, data=1),
+    }
+    result["model_check"] = {"model_rel_l2": 0.1, "measured_rel_l2": 0.11}
+    return result
+
+
+def _passing_e4m3(rows=1):
+    result = _e4m3_result(rows)
+    result["model_check"] = {"model_rel_l2": 0.05, "measured_rel_l2": 0.049}
+    return result
+
+
+def _passing_run():
+    results = [_passing_nvfp4(1), _passing_e4m3(1)]
+    timings = {"M=1": {"decode_nvfp4_B32": {"median": 10.0}}}
+    return results, timings
+
+
+def test_a_fully_passing_run_is_a_passing_self_check(chk):
+    results, timings = _passing_run()
+    check = chk.compute_self_check(results, timings)
+    assert check["verdict"] == "PASS" and check["reasons"] == []
+    assert set(check["positive"].values()) == {"PASS"}
+    assert set(check["negative"].values()) == {"FLAGGED"}
+    assert set(check["stages"].values()) == {"RAN"}
+    assert set(check["positive"]) == set(chk.POSITIVE_CONTROLS)
+    assert set(check["stages"]) == set(chk.STAGES)
+    assert len(check["negative"]) == len(chk.MUTATIONS) * len(chk.LINKS) + len(
+        chk.TIE_MUTATIONS
+    )
+    lines = chk.format_self_check(check, results)
+    assert lines[-1] == "SELF_CHECK: PASS"
+    assert any(line.startswith("E4M3_BAND e4m3-B1616-M1:") for line in lines)
+    assert any(line.startswith("NVFP4_BAND nvfp4-B32-M1:") for line in lines)
+    assert "NEGATIVE_CONTROL nibble_order_swapped store: FLAGGED" in lines
+    assert "NEGATIVE_CONTROL tie_rule_removed_e4m3 tie_store: FLAGGED" in lines
+    assert "STAGE timing: RAN" in lines
+    assert chk.exit_code_for_self_check(check) == 0
+
+
+def _fail_reasons(chk, results, timings, **kwargs):
+    check = chk.compute_self_check(results, timings, **kwargs)
+    assert check["verdict"] == "FAIL"
+    assert chk.exit_code_for_self_check(check) == 1
+    assert chk.format_self_check(check, results)[-1].startswith("SELF_CHECK: FAIL (")
+    return check
+
+
+def test_a_positive_control_that_fails_fails_the_self_check(chk):
+    results, timings = _passing_run()
+    results[0]["store"] = {"data": _region(1), "scale": _region(0)}
+    check = _fail_reasons(chk, results, timings)
+    assert check["positive"]["STORE_MATCHES_REFERENCE"] == "FAIL"
+    results, timings = _passing_run()
+    results[0]["tie_control"]["correct"] = _comparison(scale=1)
+    assert (
+        _fail_reasons(chk, results, timings)["positive"]["TIE_STORE_MATCHES_REFERENCE"]
+        == "FAIL"
+    )
+
+
+def test_an_error_outside_the_band_fails_for_either_format(chk):
+    for index, key in ((0, "NVFP4_ERROR_IN_BAND"), (1, "E4M3_ERROR_IN_BAND")):
+        results, timings = _passing_run()
+        results[index]["model_check"]["measured_rel_l2"] *= 3
+        assert _fail_reasons(chk, results, timings)["positive"][key] == "FAIL"
+        results, timings = _passing_run()
+        results[index]["model_check"]["measured_rel_l2"] /= 3
+        assert _fail_reasons(chk, results, timings)["positive"][key] == "FAIL"
+
+
+def test_a_mutation_the_comparison_cannot_see_is_missed(chk):
+    results, timings = _passing_run()
+    results[0]["controls"]["nibble_order_swapped"]["gather"] = {"different": 0}
+    check = _fail_reasons(chk, results, timings)
+    assert check["negative"]["nibble_order_swapped gather"] == "MISSED"
+    assert check["negative"]["nibble_order_swapped store"] == "FLAGGED"
+    results, timings = _passing_run()
+    # The scale mutation must show in the scale region, not only in the data.
+    results[0]["controls"]["scale_placement_wrong"]["store"] = _comparison(data=9)
+    assert (
+        _fail_reasons(chk, results, timings)["negative"]["scale_placement_wrong store"]
+        == "MISSED"
+    )
+    results, timings = _passing_run()
+    results[0]["tie_control"]["e2m1_mutant"] = _comparison()
+    assert (
+        _fail_reasons(chk, results, timings)["negative"][
+            "tie_rule_removed_e2m1 tie_store"
+        ]
+        == "MISSED"
+    )
+    results, timings = _passing_run()
+    results[0]["controls"]["scale_placement_wrong"]["decode"] = {"max_abs": 0.0}
+    assert (
+        _fail_reasons(chk, results, timings)["negative"]["scale_placement_wrong decode"]
+        == "MISSED"
+    )
+
+
+def test_a_skipped_stage_fails_the_self_check(chk):
+    results, timings = _passing_run()
+    check = _fail_reasons(chk, results, timings, no_timing=True)
+    assert check["stages"]["timing"] == "SKIPPED"
+    assert any("stage timing SKIPPED" in r for r in check["reasons"])
+    _fail_reasons(chk, results, {})  # timing requested but nothing was timed
+    results, timings = _passing_run()
+    check = _fail_reasons(chk, [results[0]], timings)  # no E4M3 control
+    assert check["stages"]["e4m3_control"] == "SKIPPED"
+    assert check["positive"]["E4M3_ERROR_IN_BAND"] == "SKIPPED"
+    for stage_key, stage in (
+        ("tie_control", "tie_control"),
+        ("controls", "negative_controls"),
+        ("model_check", "e4m3_control"),
+    ):
+        results, timings = _passing_run()
+        target = results[1] if stage_key == "model_check" else results[0]
+        del target[stage_key]
+        assert _fail_reasons(chk, results, timings)["stages"][stage] == "SKIPPED"
+
+
+def test_a_case_that_raised_fails_the_self_check(chk):
+    results, timings = _passing_run()
+    results.append(
+        {"case": "nvfp4-B64-M5", "kind": "nvfp4", "rows": 5, "error": "RuntimeError: x"}
+    )
+    check = _fail_reasons(chk, results, timings)
+    assert "nvfp4-B64-M5 raised" in check["reasons"]
+    assert chk.exit_code_for(results) == 1
+
+
+def test_a_zero_timing_is_not_a_run_timing(chk):
+    results, _ = _passing_run()
+    check = _fail_reasons(chk, results, {"M=1": {"decode_nvfp4_B32": {"median": 0.0}}})
+    assert check["stages"]["timing"] == "SKIPPED"
+
+
 # ------------------------------------------------------- end to end, interpreter
 @pytest.mark.skipif(not INTERPRETER, reason="needs TRITON_INTERPRET=1")
 def test_one_small_case_runs_end_to_end_on_cpu_tensors(chk, monkeypatch):
@@ -542,3 +902,10 @@ def test_one_small_case_runs_end_to_end_on_cpu_tensors(chk, monkeypatch):
     assert all(t["median"] > 0 for t in timings["M=3"].values())
     roundtrip = chk.decode_roundtrip_lines(timings)
     assert any("DECODE_ROUNDTRIP_US" in line for line in roundtrip)
+    check = chk.compute_self_check(results, timings)
+    assert check["verdict"] == "PASS", chk.format_self_check(check, results)
+    lines = chk.format_self_check(check, results)
+    assert lines[-1] == "SELF_CHECK: PASS"
+    assert any(line.startswith("E4M3_BAND") for line in lines)
+    ratio = results[0]["model_check"]
+    assert chk.error_in_band(ratio["measured_rel_l2"], ratio["model_rel_l2"])
