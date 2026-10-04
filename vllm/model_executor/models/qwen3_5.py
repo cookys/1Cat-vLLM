@@ -991,6 +991,15 @@ class Qwen3_5ForCausalLMBase(
             self.lm_head, hidden_states, top_k
         )
 
+    def get_compact_target_probe_with_fallback(
+        self,
+        hidden_states: torch.Tensor,
+        top_k: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, Callable[[], torch.Tensor | None] | None]:
+        return self.logits_processor.get_compact_target_probe_with_fallback(
+            self.lm_head, hidden_states, top_k
+        )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
@@ -1182,6 +1191,15 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         top_k: int,
     ) -> tuple[torch.Tensor, torch.Tensor, Callable[[], torch.Tensor | None] | None]:
         return self.language_model.get_topk_tokens_and_logits_with_fallback(
+            hidden_states, top_k
+        )
+
+    def get_compact_target_probe_with_fallback(
+        self,
+        hidden_states: torch.Tensor,
+        top_k: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, Callable[[], torch.Tensor | None] | None]:
+        return self.language_model.get_compact_target_probe_with_fallback(
             hidden_states, top_k
         )
 
