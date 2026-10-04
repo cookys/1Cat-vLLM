@@ -101,7 +101,8 @@ and ``--no-e4m3`` make ``SELF_CHECK`` FAIL by design; a case that raised does to
 
 Exit status: 0 a clean run with ``SELF_CHECK: PASS``; 1 ``SELF_CHECK: FAIL`` (a failed
 control, a skipped stage or a case that raised); 2 no CUDA device, a GPU that already
-holds memory (unless ``--allow-busy``) or unusable arguments.
+holds memory (unless ``--allow-busy``), unusable arguments, or a ``vllm`` on
+``sys.path`` that lacks the NVFP4 modules (the p071 tree, or a venv synced to it).
 
     cd <worktree> && CUDA_VISIBLE_DEVICES=<idle gpu> PYTHONPATH=$PWD \\
         /data/venvs/1cat-p070/bin/python benchmarks/sm70_nvfp4_kv_kernel_check.py \\
@@ -1545,7 +1546,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ValueError as exc:
         print(f"unusable arguments: {exc}")
         return 2
-    kernels = load_kernels()
+    try:
+        kernels = load_kernels()
+    except ImportError as exc:
+        print(
+            f"cannot import the NVFP4 kernels ({exc}); the vllm on sys.path lacks "
+            "them: "
+            "run from a tree that has them with PYTHONPATH=<worktree>, or sync the "
+            "venv to the p071 tip first"
+        )
+        return 2
     info = device_info()
     print(
         f"device {info['name']} capability {info['capability']}, torch {info['torch']}"

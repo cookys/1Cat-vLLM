@@ -850,6 +850,21 @@ def test_a_zero_timing_is_not_a_run_timing(chk):
     assert check["stages"]["timing"] == "SKIPPED"
 
 
+def test_main_explains_a_vllm_without_the_nvfp4_modules(chk, monkeypatch, capsys):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    def missing():
+        raise ImportError("No module named 'vllm.models.qwen4_exp.nvidia.ops.nvfp4_kv'")
+
+    monkeypatch.setattr(chk, "load_kernels", missing)
+    assert chk.main(["--allow-busy"]) == 2
+    output = capsys.readouterr().out
+    assert (
+        "cannot import the NVFP4 kernels" in output
+        and "PYTHONPATH=<worktree>" in output
+    )
+
+
 # ------------------------------------------------------- end to end, interpreter
 @pytest.mark.skipif(not INTERPRETER, reason="needs TRITON_INTERPRET=1")
 def test_one_small_case_runs_end_to_end_on_cpu_tensors(chk, monkeypatch):
