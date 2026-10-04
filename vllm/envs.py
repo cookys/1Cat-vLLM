@@ -6658,6 +6658,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("MTP committed-prefix checkpoint reuse",),
+        user_visible=True,
     ),
     "VLLM_SM70_MTP_COMMITTED_PREFIX_CACHE_LOG": env_var(
         lambda: (
@@ -6676,6 +6677,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("MTP committed-prefix diagnostic telemetry",),
+        user_visible=False,
     ),
     # Remove the host-side `.any()` fence from the SM70 compact top-k/top-p
     # sampler: 0 keeps today's branch, 1 selects the reference per row on the
