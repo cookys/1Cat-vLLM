@@ -99,8 +99,9 @@ except ModuleNotFoundError as exc:
 
 
 from ..common.ple import is_ple_checkpoint_shard
+from .ops.nvfp4_kv import NVFP4_KV_CACHE_DTYPE
 from .ple_layer import Qwen4ExpPLELayer
-from .qsa import Qwen4ExpQSAAttention
+from .qsa import Qwen4ExpQSAAttention, _qsa_loads_kv_scales
 
 logger = init_logger(__name__)
 
@@ -167,6 +168,18 @@ _QWEN4_EXP_IGNORED_MISSING_SUFFIXES = [
 def _validate_qsa_e4m3_scale_load(
     required_scales: set[str], loaded: set[str], cache_dtype: str
 ) -> set[str]:
+    if cache_dtype == NVFP4_KV_CACHE_DTYPE:
+        # NVFP4 does not need a calibrated overlay: the block scales carry the
+        # range, so a layer without a checkpoint scalar uses the unit scale.
+        missing = required_scales - loaded
+        if missing:
+            logger.info_once(
+                "QSA NVFP4: %d/%d K/V scales loaded from the checkpoint; the "
+                "other layers use the unit global scale.",
+                len(required_scales) - len(missing),
+                len(required_scales),
+            )
+        return set(missing)
     if cache_dtype not in ("fp8", "fp8_e4m3"):
         return set()
     missing_scales = sorted(required_scales - loaded)
@@ -203,8 +216,10 @@ def _finalize_qsa_e4m3_scale_load(
     require_calibrated_speculative_draft: bool = False,
     require_calibrated_target: bool = False,
 ) -> None:
-    if cache_dtype not in ("fp8", "fp8_e4m3"):
+    if not _qsa_loads_kv_scales(cache_dtype):
         return
+    # E4M3 refuses to start without calibration; NVFP4 never does.
+    nvfp4 = cache_dtype == NVFP4_KV_CACHE_DTYPE
     # The dedicated PLE process builds the complete model structure on meta but
     # intentionally streams only the PLE subtree from the checkpoint. It never
     # executes QSA forward; the GPU workers own and validate the main KV cache.
@@ -219,13 +234,13 @@ def _finalize_qsa_e4m3_scale_load(
         f"{name}.{kind}_scale" for name in qsa_modules for kind in ("k", "v")
     }
     missing_scales = required_scales - loaded
-    if require_calibrated_target and missing_scales:
+    if require_calibrated_target and missing_scales and not nvfp4:
         raise ValueError(
             "Automatically selected QSA E4M3 requires complete calibrated "
             "K/V scales; refusing to start. Missing: "
             + ", ".join(sorted(missing_scales))
         )
-    if require_calibrated_speculative_draft and missing_scales:
+    if require_calibrated_speculative_draft and missing_scales and not nvfp4:
         raise ValueError(
             "QSA E4M3 speculative draft scale overlay is incomplete; refusing "
             "to use unit scales after qualification showed invalid proposals. "
@@ -238,7 +253,8 @@ def _finalize_qsa_e4m3_scale_load(
     missing_scales = _validate_qsa_e4m3_scale_load(required_scales, loaded, cache_dtype)
     if not missing_scales:
         logger.info_once(
-            "QSA E4M3 calibrated scale gate passed: loaded %d/%d K/V scales.",
+            "QSA %s calibrated scale gate passed: loaded %d/%d K/V scales.",
+            "NVFP4" if nvfp4 else "E4M3",
             len(required_scales),
             len(required_scales),
         )

@@ -69,6 +69,7 @@ from .indexer_qsa import QSAIndexer
 from .ops.nvfp4_kv import (
     NVFP4_KV_CACHE_DTYPE,
     NVFP4_KV_GROUP_SIZE,
+    check_nvfp4_layer_scale,
     nvfp4_kv_row_bytes,
 )
 
@@ -83,6 +84,15 @@ _QSA_MAIN_KV_CACHE_DTYPES = (
     "fp8_e4m3",
     NVFP4_KV_CACHE_DTYPE,
 )
+# Cache dtypes whose reader multiplies by a per-layer K and V scalar. E4M3 needs
+# a calibrated overlay; NVFP4 takes the checkpoint's scalar when there is one and
+# the unit scale otherwise, as the fleet's SGLang implementation does.
+_QSA_SCALED_KV_CACHE_DTYPES = ("fp8", "fp8_e4m3", NVFP4_KV_CACHE_DTYPE)
+
+
+def _qsa_loads_kv_scales(kv_cache_dtype: str) -> bool:
+    """Does this cache dtype read per-layer K/V scalars from the checkpoint?"""
+    return kv_cache_dtype in _QSA_SCALED_KV_CACHE_DTYPES
 
 
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
@@ -659,10 +669,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.kv_sharing_target_layer_name = None
         self.kv_cache = torch.tensor([])
         set_default_quant_scales(self, register_buffer=True)
-        self._qsa_kv_scales_finalized = self.kv_cache_dtype not in (
-            "fp8",
-            "fp8_e4m3",
-        )
+        self._qsa_kv_scales_finalized = not _qsa_loads_kv_scales(self.kv_cache_dtype)
         if not self._qsa_kv_scales_finalized:
             # Keep checkpoint loading state separate from runtime scales.
             # Negative is deliberately invalid and the slots are deleted once
@@ -751,7 +758,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self._qsa_kv_scales_finalized = True
 
     def validate_loaded_kv_scales(self) -> None:
-        if self.kv_cache_dtype not in ("fp8", "fp8_e4m3"):
+        if not _qsa_loads_kv_scales(self.kv_cache_dtype):
             return
         if self._qsa_kv_scales_finalized:
             raise RuntimeError(
@@ -776,6 +783,16 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 f"QSA E4M3 calibrated scales are required for {self.layer_name} "
                 f"(invalid: {', '.join(invalid)}). Refusing to start."
             )
+        if self.kv_cache_dtype == NVFP4_KV_CACHE_DTYPE:
+            # An NVFP4 layer scale far above the K/V magnitude would put the
+            # block scales in the E4M3 subnormal range.
+            for name, value in scales.items():
+                try:
+                    check_nvfp4_layer_scale(value)
+                except ValueError as error:
+                    raise ValueError(
+                        f"QSA NVFP4 {name} scale of {self.layer_name}: {error}"
+                    ) from error
         self._k_scale.copy_(scales["K"])
         self._v_scale.copy_(scales["V"])
         self._k_scale_float = scales["K"]

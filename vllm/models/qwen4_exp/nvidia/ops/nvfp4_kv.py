@@ -63,6 +63,8 @@ residual cannot be reproduced on V100 and is not tested.
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from vllm.utils.torch_utils import nvfp4_kv_cache_full_dim, nvfp4_kv_cache_split_views
@@ -72,6 +74,14 @@ NVFP4_KV_GROUP_SIZE = 16
 E2M1_MAX = 6.0
 E4M3_MAX = 448.0
 E4M3_MIN_SUBNORMAL = 2.0**-9
+E4M3_MIN_NORMAL = 2.0**-6
+# Largest per-layer scale the loader accepts. A group's block scale is
+# amax16 / (6 * layer_scale); below 2**-6 it is an E4M3 subnormal with fewer than
+# three mantissa bits. For a layer whose amax is at least 1 that happens for
+# layer_scale > 1 / (6 * 2**-6) = 10.67. The calibrated K/V amax of the
+# Flash-Next overlay is above 3 (its scalars times 200 or 448), so 10 leaves
+# room and still rejects a scale that was meant for another cache format.
+NVFP4_KV_LAYER_SCALE_MAX = 10.0
 E2M1_GRID = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 # fp32(1/6): what the GPU's rcp.approx.ftz(6.0f) returns when it rounds correctly.
 _ONE_SIXTH = torch.tensor(1.0 / 6.0, dtype=torch.float32)
@@ -80,15 +90,19 @@ __all__ = [
     "E2M1_GRID",
     "E2M1_MAX",
     "E4M3_MAX",
+    "E4M3_MIN_NORMAL",
     "E4M3_MIN_SUBNORMAL",
+    "NVFP4_KV_LAYER_SCALE_MAX",
     "NVFP4_KV_CACHE_DTYPE",
     "NVFP4_KV_GROUP_SIZE",
+    "check_nvfp4_layer_scale",
     "dequantize_kv_nvfp4",
     "e2m1_decode",
     "e2m1_encode",
     "e4m3_decode",
     "e4m3_encode",
     "gather_dequant_nvfp4_kv",
+    "nvfp4_block_scale_range",
     "nvfp4_kv_bytes_per_token",
     "nvfp4_kv_data_bytes",
     "nvfp4_kv_page_bytes",
@@ -96,6 +110,8 @@ __all__ = [
     "nvfp4_kv_row_bytes",
     "nvfp4_kv_scale_bytes",
     "nvfp4_kv_split_views",
+    "nvfp4_layer_scale_from_amax",
+    "nvfp4_subnormal_group_fraction",
     "pack_nibbles",
     "quantize_kv_nvfp4",
     "reshape_and_cache_nvfp4_reference",
@@ -229,6 +245,70 @@ def unpack_nibbles(packed: torch.Tensor) -> torch.Tensor:
     return torch.stack((packed & 0xF, packed >> 4), dim=-1).reshape(
         *packed.shape[:-1], -1
     )
+
+
+# --------------------------------------------------------------------------- #
+# Global (per-layer) scale
+# --------------------------------------------------------------------------- #
+def check_nvfp4_layer_scale(layer_scale: float) -> float:
+    """Validate a per-layer K or V scale and return it as a float.
+
+    It must be finite and positive, and at most ``NVFP4_KV_LAYER_SCALE_MAX``:
+    a larger scale pushes the block scales of an ordinary layer into the E4M3
+    subnormal range, where the scale loses mantissa bits.
+    """
+    value = float(layer_scale)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"NVFP4 KV layer scale must be finite and positive: {value}")
+    if value > NVFP4_KV_LAYER_SCALE_MAX:
+        raise ValueError(
+            f"NVFP4 KV layer scale {value} exceeds {NVFP4_KV_LAYER_SCALE_MAX}: "
+            "the block scales of a layer with amax near 1 would be E4M3 "
+            "subnormals"
+        )
+    return value
+
+
+def nvfp4_layer_scale_from_amax(amax: float) -> float:
+    """Layer scale that puts the layer's largest block scale at the E4M3 maximum.
+
+    ``amax / (6 * 448)``: the smallest scale that never saturates a block scale
+    for values up to ``amax``. It uses the whole normal range of the block scale
+    (``2**-6 .. 448``), at the price of no headroom above ``amax``.
+    """
+    if not math.isfinite(amax) or amax <= 0.0:
+        raise ValueError(f"amax must be finite and positive: {amax}")
+    return float(amax) / (E2M1_MAX * E4M3_MAX)
+
+
+def nvfp4_block_scale_range(layer_scale: float, amax: float) -> tuple[float, float]:
+    """``(largest block scale, smallest E4M3-normal group amax)`` of a layer.
+
+    The first is the block scale of a group whose amax is the layer's ``amax``;
+    the second is the smallest group amax whose block scale is still an E4M3
+    normal number (at least ``2**-6``).
+    """
+    scale = check_nvfp4_layer_scale(layer_scale)
+    return amax / (E2M1_MAX * scale), E2M1_MAX * scale * E4M3_MIN_NORMAL
+
+
+def nvfp4_subnormal_group_fraction(
+    x: torch.Tensor, layer_scale: float | torch.Tensor = 1.0
+) -> float:
+    """Fraction of non-zero 16-value groups whose block scale is below ``2**-6``.
+
+    Such groups store a subnormal (or flushed) E4M3 scale. A diagnostic for
+    choosing a layer scale; the quantizer itself accepts them.
+    """
+    _check_head_size(x.shape[-1])
+    groups = x.float().reshape(*x.shape[:-1], -1, NVFP4_KV_GROUP_SIZE)
+    amax = groups.abs().amax(dim=-1)
+    scale = torch.as_tensor(layer_scale, dtype=torch.float32, device=x.device)
+    block = (1.0 / scale) * (amax * _ONE_SIXTH)
+    nonzero = amax > 0
+    if not bool(nonzero.any()):
+        return 0.0
+    return float((block[nonzero] < E4M3_MIN_NORMAL).float().mean())
 
 
 # --------------------------------------------------------------------------- #
