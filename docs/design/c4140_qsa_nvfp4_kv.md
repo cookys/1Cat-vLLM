@@ -414,13 +414,26 @@ Triton 的 fp32 除法不一定是 IEEE，參考用的是 IEEE 除法。
 
 ### chain19 草稿
 
-`scripts/c4140-ab/chain19-nvfp4-m1.sh`（llm-playground，未 commit，未對伺服器執行；`bash -n` 與 shellcheck 乾淨，`C19_DRY=1` 的乾跑只印計畫）：
-操作員呼叫，檢查 `TARGET_VENV`（不得是 `1cat-m589`）、p071 tip 等於 `WANT_TIP`、視窗檔存在；記下 production 現在的 `C4140_*` 啟動環境；
-備份將被改動的 venv 檔案；同步 p071 的 Python 檔案並做 import smoke；對 nvfp4、fp8_e4m3、fp16 三種 KV 各自 settle（先 fresh compile，再重啟到
-連續兩個實例的 12 案 `--no-logprobs` parity 相同才算同一個數值狀態），量 prefill-probe（nvfp4 與 E4M3 對照）與探針（每臂加一個同實例重跑臂），
-最後 compare，並從備份還原 venv、用記下的環境 `serve restart` 回 production。全程無 MTP，同一個 `--max-model-len`。
-2026-10-04 的乾跑從執行中的服務讀到 `C4140_STACK=p070`：`TARGET_VENV` 就是 production 的 venv，鏈在 production 停機期間改它並在結束或任何
-訊號時還原；被 `kill -9` 時用 `C19_RESTORE_ONLY=<備份目錄>` 還原。標了 `# UNVERIFIED:` 的參數沒有驗證過。
+`scripts/c4140-ab/chain19-nvfp4-m1.sh`（llm-playground，未 commit，未對伺服器執行；`bash -n` 與 shellcheck 乾淨，`C19_DRY=1` 的乾跑只印計畫，
+且不碰 `/data/bench/ab` 與 venv）：
+
+- **閘門**：操作員呼叫；`TARGET_VENV` 不得是 `1cat-m589`；p071 tip 等於 `WANT_TIP`；serve script 要有 `C4140_KV_DTYPE`；視窗檔存在；沒有舊的 chain 在跑。
+- **venv 閘門**：`TARGET_VENV`（`/data/venvs/1cat-p070`，不是 production 的 venv）裡每個 `vllm/**/*.py` 都必須與 `c4140-p070` 的 git blob 逐位元組相同，
+  不得缺任何 p070 的檔案，不得有 venv 獨有的檔案（已知的打包產物除外：`_version.py`、`third_party/triton_kernels/`、兩個 `rotary.py`），
+  p071 要新增的路徑也不得已經存在。這是為了擋住 p070-packs 測試留在 venv 裡的 Astra 修正：2026-10-04 的乾跑報出
+  `sm70_fp16_gemv.py` 與 `sm70_profiles/acceleration.py` 兩個檔案不同。有任何差異就印出路徑並拒絕執行；乾跑改印結論。
+  我用拋棄式的 venv 副本測過：還原後通過，改一個檔、p071 新增檔已存在、多一個陌生檔、少一個 p070 檔，各自被擋下。
+- **流程**：備份 p071 會動到的 venv 檔案，同步並做 import smoke，對 nvfp4、fp8_e4m3、fp16 三種 KV 各自 settle（先 fresh compile，再重啟到連續兩個
+  實例的 12 案 `--no-logprobs` parity 相同才算同一個數值狀態），量 prefill-probe（nvfp4 與 E4M3 對照）與探針（每臂加一個同實例重跑臂），最後 compare。
+  全程無 MTP，同一個 `--max-model-len`（預設 131072），都帶 `--enable-prompt-tokens-details`。
+- **KV dtype 旋鈕**：每臂設 `C4140_KV_DTYPE=nvfp4|fp8_e4m3|auto`，不再追加第二個 `--kv-cache-dtype`。這是 serve script 在 `C4140_STACK=p070` 分支裡新增的旋鈕，
+  預設 `fp8_e4m3`，預設行為不變：我用一個只記錄 argv 的假 fence 比對了十種環境組合，預設、p069、p070 與 E4M3=0 的 argv 逐位元組相同，
+  nvfp4 與 auto 只差那一個值。每臂啟動後，serve log 的 `kv_cache_dtype` 行必須等於該臂的 dtype，否則 chain 結束並還原。
+- **還原**：先從備份還原 venv 並做 cmp 檢查，再把 production 寫死成 `scripts/c4140-1cat-flashnext-serve.sh restart`：沒有 `C4140_STACK`、沒有 `EXTRA_ARGS`，
+  所有 `C4140_*` 變數先清掉，production 就是 serve script 的預設（c4140-p069 @25361ff5f、`/data/venvs/1cat-m589`）。重啟後要求 12 案 `--no-logprobs` parity
+  與 `/data/bench/ab/parity-c11-P3-nolp.json` 相同；不同就再重啟一次，最多 2 次，仍不同就報 `RESTORE_PARITY_FAIL` 並讓 production 照現況跑著。
+  這段邏輯用假 serve script 測過：第一次成功、第二次成功、兩次都失敗各一個情境，子行程看到的 `C4140_*` 只剩兩個我指定的變數。
+- 被 `kill -9` 時用 `C19_RESTORE_ONLY=<備份目錄>` 還原 venv（沒有伺服器介入），在拋棄式 venv 副本上實測過。標了 `# UNVERIFIED:` 的參數沒有驗證過。
 
 ## 品質驗證：SGLang 的證據不是 1Cat 的上界
 
