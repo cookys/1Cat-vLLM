@@ -126,7 +126,9 @@ def test_backend_list_and_owner_constant_agree() -> None:
     assert set(backend) == set(_QSA_MAIN_KV_CACHE_DTYPES)
 
 
-@pytest.mark.parametrize("dtype", ["fp8_e5m2", "int8_per_token_head", "turboquant_k8v4", "nvfp5"])
+@pytest.mark.parametrize(
+    "dtype", ["fp8_e5m2", "int8_per_token_head", "turboquant_k8v4", "nvfp5"]
+)
 def test_other_cache_dtypes_stay_rejected(dtype) -> None:
     assert dtype not in _QSA_MAIN_KV_CACHE_DTYPES
     assert dtype not in Qwen4ExpQSAFlashAttentionBackend.supported_kv_cache_dtypes
@@ -162,7 +164,12 @@ def test_nvfp4_requirements_accept_fp16_on_volta(monkeypatch) -> None:
 
 @pytest.mark.parametrize(
     ("capability", "dtype"),
-    [(70, torch.bfloat16), (75, torch.bfloat16), (60, torch.float16), (80, torch.float32)],
+    [
+        (70, torch.bfloat16),
+        (75, torch.bfloat16),
+        (60, torch.float16),
+        (80, torch.float32),
+    ],
 )
 def test_nvfp4_requirements_reject_an_unsupported_operator_dtype(
     monkeypatch, capability, dtype
@@ -182,7 +189,9 @@ def test_nvfp4_requirements_accept_bf16_on_ampere(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("head_dim", [0, 8, 100, 250])
-def test_nvfp4_requirements_reject_a_head_size_off_the_group(monkeypatch, head_dim) -> None:
+def test_nvfp4_requirements_reject_a_head_size_off_the_group(
+    monkeypatch, head_dim
+) -> None:
     _volta(monkeypatch)
     with pytest.raises(NotImplementedError, match="multiple of 16"):
         _verify_nvfp4_kv_requirements(
@@ -220,7 +229,9 @@ def test_main_kv_storage_dtype_is_accepted(kv_cache_dtype, storage) -> None:
     ("kv_cache_dtype", "storage"),
     [("bfloat16", torch.bfloat16), ("float16", torch.uint8), ("auto", torch.float32)],
 )
-def test_unquantized_main_kv_must_match_the_model_dtype(kv_cache_dtype, storage) -> None:
+def test_unquantized_main_kv_must_match_the_model_dtype(
+    kv_cache_dtype, storage
+) -> None:
     with pytest.raises(NotImplementedError, match="must match the model dtype"):
         _verify_main_kv_storage_dtype(kv_cache_dtype, storage, torch.float16)
 
@@ -281,7 +292,9 @@ def test_owner_spec_page_is_288_bytes_per_token(block_size) -> None:
     assert spec.kv_quant_mode is KVQuantMode.NVFP4
     assert spec.dtype is torch.uint8
     # K row 128 data + 16 scale, V the same: head_size // 2 + head_size // 16.
-    assert spec.page_size_bytes == block_size * 2 * (D // 2 + D // 16) == block_size * 288
+    assert (
+        spec.page_size_bytes == block_size * 2 * (D // 2 + D // 16) == block_size * 288
+    )
 
 
 def test_owner_spec_matches_the_reference_byte_math() -> None:
@@ -335,7 +348,8 @@ def _views(members, block_size, blocks, monkeypatch, packed):
         kv_quant_mode=KVQuantMode.NVFP4,
     )
     raw = torch.zeros(
-        blocks * len(members if packed else [0]) * spec.page_size_bytes, dtype=torch.int8
+        blocks * len(members if packed else [0]) * spec.page_size_bytes,
+        dtype=torch.int8,
     )
     views = _reshape_kv_cache(
         attn_groups=[
@@ -346,7 +360,9 @@ def _views(members, block_size, blocks, monkeypatch, packed):
         kernel_block_sizes=[block_size],
         shared_kv_cache_layers={},
         packed_members=(
-            {name: (i, len(members)) for i, name in enumerate(members)} if packed else None
+            {name: (i, len(members)) for i, name in enumerate(members)}
+            if packed
+            else None
         ),
     )
     return raw, spec, [views[name] for name in members]
@@ -380,7 +396,9 @@ def test_packed_nvfp4_members_share_a_page_without_overlapping(monkeypatch) -> N
     raw, spec, views = _views(members, 32, 4, monkeypatch, True)
     first, second = views
     assert first.shape == second.shape == (4, 2, 32, 1, 144)
-    assert first.stride(0) == 2 * spec.page_size_bytes  # a physical block holds both pages
+    assert (
+        first.stride(0) == 2 * spec.page_size_bytes
+    )  # a physical block holds both pages
     generator = torch.Generator().manual_seed(2)
     written = []
     for view in views:
@@ -463,7 +481,9 @@ def test_the_derivation_yields_an_integer_nvfp4_block(num_spec) -> None:
 
 
 @pytest.mark.parametrize("num_spec", [0, 4])
-def test_the_derived_nvfp4_block_is_the_smallest_page_that_holds_the_state(num_spec) -> None:
+def test_the_derived_nvfp4_block_is_the_smallest_page_that_holds_the_state(
+    num_spec,
+) -> None:
     block = _derive("nvfp4", num_spec).block_size
     assert block * 288 >= GDN_STATE[num_spec] > (block - 16) * 288
 
@@ -487,7 +507,10 @@ def test_the_derived_nvfp4_block_divides_the_ring_capacity(num_spec, capacity) -
 
 def test_the_nvfp4_block_is_larger_than_e4m3_by_the_per_token_byte_ratio() -> None:
     for num_spec in (0, 4):
-        ratio = _derive("nvfp4", num_spec).block_size / _derive("fp8_e4m3", num_spec).block_size
+        ratio = (
+            _derive("nvfp4", num_spec).block_size
+            / _derive("fp8_e4m3", num_spec).block_size
+        )
         assert ratio == pytest.approx(512 / 288, rel=0.02)
 
 
@@ -503,19 +526,34 @@ def _csa_specs(num_spec: int, block: int, mode: KVQuantMode) -> dict:
     owners = [3 + 4 * i for i in range(12)] + ([48] if num_spec else [])
     for layer in owners:
         prefix = (
-            f"mtp.layers.{layer}.self_attn" if layer == 48 else f"model.layers.{layer}.self_attn"
+            f"mtp.layers.{layer}.self_attn"
+            if layer == 48
+            else f"model.layers.{layer}.self_attn"
         )
         specs[prefix + ".attn"] = FullAttentionSpec(
-            block_size=block, num_kv_heads=1, head_size=D, head_size_v=D,
-            dtype=torch.uint8, kv_quant_mode=mode, dcp_sharded=False,
+            block_size=block,
+            num_kv_heads=1,
+            head_size=D,
+            head_size_v=D,
+            dtype=torch.uint8,
+            kv_quant_mode=mode,
+            dcp_sharded=False,
         )
         specs[prefix + ".indexer.compressed"] = MLAAttentionSpec(
-            block_size=block, num_kv_heads=1, head_size=128, dtype=torch.float16,
-            compress_ratio=4, dcp_sharded=False,
+            block_size=block,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.float16,
+            compress_ratio=4,
+            dcp_sharded=False,
         )
         specs[prefix + ".indexer.raw"] = CircularBufferSpec(
-            block_size=capacity, num_kv_heads=1, head_size=140, head_size_v=0,
-            dtype=torch.float16, dcp_sharded=False,
+            block_size=capacity,
+            num_kv_heads=1,
+            head_size=140,
+            head_size_v=0,
+            dtype=torch.float16,
+            dcp_sharded=False,
         )
     gdn = MambaSpec(
         block_size=block,
@@ -529,9 +567,13 @@ def _csa_specs(num_spec: int, block: int, mode: KVQuantMode) -> dict:
         if layer % 4 != 3:
             specs[f"model.layers.{layer}.linear_attn"] = gdn
     specs["model.layers.2.ple_conv"] = MambaSpec(
-        block_size=block, shapes=((10240, 9 + num_spec),), dtypes=(torch.float16,),
-        mamba_type=MambaAttentionBackendEnum.SHORT_CONV, mamba_cache_mode="align",
-        num_speculative_blocks=num_spec, tp_replicated=True,
+        block_size=block,
+        shapes=((10240, 9 + num_spec),),
+        dtypes=(torch.float16,),
+        mamba_type=MambaAttentionBackendEnum.SHORT_CONV,
+        mamba_cache_mode="align",
+        num_speculative_blocks=num_spec,
+        tp_replicated=True,
     )
     return specs
 
@@ -560,7 +602,9 @@ def _allocate(num_spec: int, block: int, mode: KVQuantMode, budget: int):
 
 
 def test_the_allocator_reproduces_the_e4m3_mtp4_reference() -> None:
-    kv_config, reported = _allocate(4, 1616, KVQuantMode.FP8_PER_TENSOR, MTP4_E4M3_BUDGET)
+    kv_config, reported = _allocate(
+        4, 1616, KVQuantMode.FP8_PER_TENSOR, MTP4_E4M3_BUDGET
+    )
     assert kv_config.num_blocks == 292
     assert reported == 407_159  # the "GPU KV cache size" line of the M94 log
 

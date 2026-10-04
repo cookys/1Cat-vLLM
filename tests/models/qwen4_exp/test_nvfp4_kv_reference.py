@@ -309,7 +309,9 @@ def test_per_group_error_bound_heavy_tail() -> None:
 
 def test_an_outlier_group_does_not_degrade_the_other_groups() -> None:
     x = _rows((64, D), seed=13)
-    reference = nv.dequantize_kv_nvfp4(*nv.quantize_kv_nvfp4(x), out_dtype=torch.float32)
+    reference = nv.dequantize_kv_nvfp4(
+        *nv.quantize_kv_nvfp4(x), out_dtype=torch.float32
+    )
     spiked = x.clone()
     spiked[:, :16] *= 500.0  # first group only
     restored = nv.dequantize_kv_nvfp4(
@@ -318,11 +320,15 @@ def test_an_outlier_group_does_not_degrade_the_other_groups() -> None:
     assert torch.equal(restored[:, 16:], reference[:, 16:])
 
 
-@pytest.mark.parametrize(("kind", "low", "high"), [("gaussian", 0.07, 0.12), ("heavy", 0.07, 0.14)])
+@pytest.mark.parametrize(
+    ("kind", "low", "high"), [("gaussian", 0.07, 0.12), ("heavy", 0.07, 0.14)]
+)
 def test_relative_l2_error_statistics(kind, low, high) -> None:
     x = _rows((4096, D), kind, seed=21)
     restored = nv.dequantize_kv_nvfp4(*nv.quantize_kv_nvfp4(x), out_dtype=torch.float32)
-    relative = (torch.linalg.norm(restored - x.float()) / torch.linalg.norm(x.float())).item()
+    relative = (
+        torch.linalg.norm(restored - x.float()) / torch.linalg.norm(x.float())
+    ).item()
     assert low < relative < high, relative
 
 
@@ -330,13 +336,17 @@ def test_layer_scale_invariance_for_power_of_two_scales() -> None:
     x = _rows((32, D), seed=31)
     base = nv.quantize_kv_nvfp4(x)
     for scale in (0.25, 4.0, 64.0):
-        scaled = nv.quantize_kv_nvfp4((x.float() * scale).to(torch.float32), layer_scale=scale)
+        scaled = nv.quantize_kv_nvfp4(
+            (x.float() * scale).to(torch.float32), layer_scale=scale
+        )
         assert torch.equal(scaled[0], base[0])
         assert torch.equal(scaled[1].view(torch.uint8), base[1].view(torch.uint8))
 
 
 @pytest.mark.parametrize("scale", [0.01, 0.5, 7.0])
-def test_layer_scale_is_divided_out_of_the_group_scale_and_multiplied_back(scale) -> None:
+def test_layer_scale_is_divided_out_of_the_group_scale_and_multiplied_back(
+    scale,
+) -> None:
     x = _rows((64, D), seed=36)
     packed, scales = nv.quantize_kv_nvfp4(x, layer_scale=scale)
     expected = nv.e4m3_encode(_group_amax(x).squeeze(-1) / (6.0 * scale))
@@ -351,7 +361,9 @@ def test_layer_scale_is_divided_out_of_the_group_scale_and_multiplied_back(scale
     assert relative < 0.12, (scale, relative.item())
 
 
-def test_an_oversized_layer_scale_pushes_group_scales_into_the_subnormal_range() -> None:
+def test_an_oversized_layer_scale_pushes_group_scales_into_the_subnormal_range() -> (
+    None
+):
     # Documents the calibration constraint: with N(0, 1) data the group scales
     # are about amax / (6 * layer_scale); once that falls below 2**-6 the E4M3
     # scale has fewer than three mantissa bits and the error grows.
@@ -362,7 +374,9 @@ def test_an_oversized_layer_scale_pushes_group_scales_into_the_subnormal_range()
         restored = nv.dequantize_kv_nvfp4(
             packed, scales, layer_scale=scale, out_dtype=torch.float32
         )
-        return (torch.linalg.norm(restored - x.float()) / torch.linalg.norm(x.float())).item()
+        return (
+            torch.linalg.norm(restored - x.float()) / torch.linalg.norm(x.float())
+        ).item()
 
     assert relative(300.0) > 1.5 * relative(1.0)
 
@@ -370,8 +384,12 @@ def test_an_oversized_layer_scale_pushes_group_scales_into_the_subnormal_range()
 def test_a_wrong_layer_scale_at_dequantization_rescales_the_result() -> None:
     x = _rows((8, D), seed=37)
     packed, scales = nv.quantize_kv_nvfp4(x, layer_scale=2.0)
-    right = nv.dequantize_kv_nvfp4(packed, scales, layer_scale=2.0, out_dtype=torch.float32)
-    wrong = nv.dequantize_kv_nvfp4(packed, scales, layer_scale=1.0, out_dtype=torch.float32)
+    right = nv.dequantize_kv_nvfp4(
+        packed, scales, layer_scale=2.0, out_dtype=torch.float32
+    )
+    wrong = nv.dequantize_kv_nvfp4(
+        packed, scales, layer_scale=1.0, out_dtype=torch.float32
+    )
     assert torch.equal(right, wrong * 2.0)
 
 
@@ -417,7 +435,9 @@ def test_nibble_signs_follow_the_input_signs() -> None:
 @pytest.mark.parametrize("out_dtype", [torch.float16, torch.float32])
 def test_dequantize_output_dtype(out_dtype) -> None:
     packed, scales = nv.quantize_kv_nvfp4(_rows((2, D)))
-    assert nv.dequantize_kv_nvfp4(packed, scales, out_dtype=out_dtype).dtype == out_dtype
+    assert (
+        nv.dequantize_kv_nvfp4(packed, scales, out_dtype=out_dtype).dtype == out_dtype
+    )
 
 
 def test_dequantize_validates_the_row_geometry() -> None:
@@ -432,7 +452,10 @@ def test_a_nan_scale_byte_decodes_to_nan() -> None:
     poisoned[0, 3] = 0x7F
     restored = nv.dequantize_kv_nvfp4(packed, poisoned, out_dtype=torch.float32)
     assert torch.isnan(restored[0, 48:64]).all()
-    assert torch.isfinite(restored[0, :48]).all() and torch.isfinite(restored[0, 64:]).all()
+    assert (
+        torch.isfinite(restored[0, :48]).all()
+        and torch.isfinite(restored[0, 64:]).all()
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -538,9 +561,7 @@ def test_cache_write_skips_padding_slots() -> None:
     cache = _empty_cache(2, BLOCK)
     key = _rows((3, 1, D), seed=1)
     value = _rows((3, 1, D), seed=2)
-    nv.reshape_and_cache_nvfp4_reference(
-        key, value, cache, torch.tensor([-1, 5, -1])
-    )
+    nv.reshape_and_cache_nvfp4_reference(key, value, cache, torch.tensor([-1, 5, -1]))
     touched = cache.reshape(2, -1).any(dim=1)
     assert touched.tolist() == [True, False]
     (k_data, _), _ = nv.nvfp4_kv_split_views(cache)
@@ -552,14 +573,20 @@ def test_cache_write_last_writer_wins_for_a_repeated_slot() -> None:
     first = _rows((1, 1, D), seed=1)
     second = _rows((1, 1, D), seed=2)
     nv.reshape_and_cache_nvfp4_reference(
-        torch.cat([first, second]), torch.cat([first, second]), cache,
+        torch.cat([first, second]),
+        torch.cat([first, second]),
+        cache,
         torch.tensor([7, 7]),
     )
     keys, _ = nv.gather_dequant_nvfp4_kv(
-        cache, _single_request_table(1), torch.zeros(1, dtype=torch.int32),
+        cache,
+        _single_request_table(1),
+        torch.zeros(1, dtype=torch.int32),
         torch.tensor([[7]], dtype=torch.int32),
     )
-    assert torch.equal(keys[0, 0], nv.dequantize_kv_nvfp4(*nv.quantize_kv_nvfp4(second))[0])
+    assert torch.equal(
+        keys[0, 0], nv.dequantize_kv_nvfp4(*nv.quantize_kv_nvfp4(second))[0]
+    )
 
 
 def test_cache_write_only_changes_the_written_slots() -> None:
@@ -575,24 +602,38 @@ def test_cache_write_only_changes_the_written_slots() -> None:
 def test_cache_write_uses_the_layer_scales() -> None:
     cache, slots, key, value = _written_cache(4, 20, k_scale=0.5, v_scale=2.0)
     keys, values = nv.gather_dequant_nvfp4_kv(
-        cache, _single_request_table(4), torch.zeros(1, dtype=torch.int32),
-        slots.int().view(1, -1), k_scale=0.5, v_scale=2.0,
+        cache,
+        _single_request_table(4),
+        torch.zeros(1, dtype=torch.int32),
+        slots.int().view(1, -1),
+        k_scale=0.5,
+        v_scale=2.0,
     )
     assert torch.equal(
-        keys[0], nv.dequantize_kv_nvfp4(*nv.quantize_kv_nvfp4(key, layer_scale=0.5), layer_scale=0.5)
+        keys[0],
+        nv.dequantize_kv_nvfp4(
+            *nv.quantize_kv_nvfp4(key, layer_scale=0.5), layer_scale=0.5
+        ),
     )
     assert torch.equal(
-        values[0], nv.dequantize_kv_nvfp4(*nv.quantize_kv_nvfp4(value, layer_scale=2.0), layer_scale=2.0)
+        values[0],
+        nv.dequantize_kv_nvfp4(
+            *nv.quantize_kv_nvfp4(value, layer_scale=2.0), layer_scale=2.0
+        ),
     )
     # And against the original rows, independently of the codec under test.
     for restored, original in ((keys[0], key), (values[0], value)):
-        relative = torch.linalg.norm(restored.float() - original.float()) / torch.linalg.norm(original.float())
+        relative = torch.linalg.norm(
+            restored.float() - original.float()
+        ) / torch.linalg.norm(original.float())
         assert relative < 0.12
 
 
 def _gather(cache, indices, table=None, requests=None):
     table = _single_request_table(cache.shape[0]) if table is None else table
-    requests = torch.zeros(len(indices), dtype=torch.int32) if requests is None else requests
+    requests = (
+        torch.zeros(len(indices), dtype=torch.int32) if requests is None else requests
+    )
     return nv.gather_dequant_nvfp4_kv(
         cache, table, requests, torch.tensor(indices, dtype=torch.int32)
     )
@@ -641,7 +682,18 @@ def test_gather_zero_fills_interleaved_invalid_entries_only() -> None:
     num_blocks = 4
     cache, slots, _, _ = _written_cache(num_blocks, 30)
     valid = slots[:6].int().tolist()
-    indices = [valid[0], -1, valid[1], 10**6, valid[2], -5, valid[3], valid[4], -1, valid[5]]
+    indices = [
+        valid[0],
+        -1,
+        valid[1],
+        10**6,
+        valid[2],
+        -5,
+        valid[3],
+        valid[4],
+        -1,
+        valid[5],
+    ]
     keys, values = _gather(cache, [indices])
     solid, _ = _gather(cache, [valid])
     positions = [0, 2, 4, 6, 7, 9]
@@ -677,8 +729,11 @@ def test_gather_of_a_zeroed_slot_is_exactly_zero() -> None:
 def test_gather_output_dtype_and_shape() -> None:
     cache, slots, *_ = _written_cache(4, 12, heads=2)
     keys, values = nv.gather_dequant_nvfp4_kv(
-        cache, _single_request_table(4), torch.zeros(3, dtype=torch.int32),
-        torch.tensor([[1, 2, 3, 4]] * 3, dtype=torch.int32), out_dtype=torch.float32,
+        cache,
+        _single_request_table(4),
+        torch.zeros(3, dtype=torch.int32),
+        torch.tensor([[1, 2, 3, 4]] * 3, dtype=torch.int32),
+        out_dtype=torch.float32,
     )
     assert keys.shape == values.shape == (3, 4, 2, D)
     assert keys.dtype == values.dtype == torch.float32
@@ -705,7 +760,11 @@ def test_gather_matches_a_naive_per_entry_implementation() -> None:
                 _assert_positive_zero(keys[row, col])
                 _assert_positive_zero(values[row, col])
                 continue
-            want_k = nv.dequantize_kv_nvfp4(k_data[block, offset], k_scale[block, offset])
-            want_v = nv.dequantize_kv_nvfp4(v_data[block, offset], v_scale[block, offset])
+            want_k = nv.dequantize_kv_nvfp4(
+                k_data[block, offset], k_scale[block, offset]
+            )
+            want_v = nv.dequantize_kv_nvfp4(
+                v_data[block, offset], v_scale[block, offset]
+            )
             assert torch.equal(keys[row, col], want_k)
             assert torch.equal(values[row, col], want_v)
