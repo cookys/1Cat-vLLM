@@ -18,7 +18,25 @@ OUTPUT_WIDTH = 4160
 def extension():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("requires a V100 / SM70 GPU")
-    return pytest.importorskip("flash_attn_v100_cuda")
+    # Production imports the extension from inside the flash_attn_v100 package
+    # (vllm/models/qwen4_exp/nvidia/ops/qsa.py); the venvs and wheels carry it
+    # there and no top-level flash_attn_v100_cuda module exists. The bare name
+    # is only a fallback for a loose build tree.
+    try:
+        from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda
+
+        return flash_attn_v100_cuda
+    except ImportError as packaged_error:
+        try:
+            import flash_attn_v100_cuda
+        except ImportError:
+            pytest.skip(
+                "Flash-V100 CUDA extension is not importable: "
+                "`from flash_attn_v100.flash_attn_interface import "
+                f"flash_attn_v100_cuda` failed with {packaged_error!r} and there "
+                "is no top-level `flash_attn_v100_cuda` module either"
+            )
+        return flash_attn_v100_cuda
 
 
 def make_case(kind="mixed", page_size=16, permute_selection=False):
