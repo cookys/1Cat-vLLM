@@ -408,23 +408,30 @@ def reshape_and_cache_nvfp4_reference(
 ) -> None:
     """Quantize ``key``/``value`` ``[T, heads, head_size]`` into the cache.
 
-    ``slot = block * block_size + offset``. Negative slots (padding) are
-    skipped. If a slot repeats, the *last* token wins, which is how a rejected
-    draft row is overwritten by the accepted one.
+    The store contract of the QSA owner (``do_kv_cache_update``):
+
+    * ``slot = block * block_size + offset``; only the first
+      ``slot_mapping.numel()`` rows of ``key`` and ``value`` are written (the
+      forward pass pads them for CUDA graphs, the slot mapping is not padded);
+    * a negative slot (padding, or a token another DCP rank owns) is skipped, and
+      so is a slot past ``num_blocks * block_size`` (upstream's SM100 store does
+      not bound-check it);
+    * if a slot repeats the *last* token wins, which is how an accepted row
+      replaces a rejected draft row. A real kernel leaves repeated slots
+      unordered; the engine never repeats a slot inside one call.
     """
     (k_data, v_data), (k_scales, v_scales) = _cache_views(kv_cache)
     block_size = kv_cache.shape[2]
+    capacity = kv_cache.shape[0] * block_size
     num_tokens = slot_mapping.numel()
     key, value = key[:num_tokens], value[:num_tokens]
 
-    live = slot_mapping >= 0
+    live = (slot_mapping >= 0) & (slot_mapping < capacity)
     order = torch.arange(num_tokens, device=slot_mapping.device)
     # For each distinct slot keep the largest token index (the last writer).
-    last = torch.full(
-        (kv_cache.shape[0] * block_size,), -1, dtype=torch.long, device=order.device
-    )
+    last = torch.full((capacity,), -1, dtype=torch.long, device=order.device)
     last.scatter_reduce_(0, slot_mapping[live].long(), order[live], "amax")
-    winners = live & (last[slot_mapping.clamp_min(0).long()] == order)
+    winners = live & (last[slot_mapping.clamp(0, capacity - 1).long()] == order)
     slots = slot_mapping[winners].long()
     block, offset = slots // block_size, slots % block_size
 

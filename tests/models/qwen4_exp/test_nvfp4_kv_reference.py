@@ -710,6 +710,21 @@ def test_cache_write_skips_padding_slots() -> None:
     assert k_data[0, 5].any() and not k_data[0, 4].any() and not k_data[0, 6].any()
 
 
+def test_cache_write_skips_slots_past_the_cache_and_surplus_rows() -> None:
+    # The store contract: a slot at or past num_blocks * block_size is skipped
+    # (upstream's SM100 store does not bound-check it) and rows beyond the slot
+    # mapping are padding.
+    cache = _empty_cache(2, BLOCK)
+    key = _rows((6, 1, D), seed=1)
+    value = _rows((6, 1, D), seed=2)
+    nv.reshape_and_cache_nvfp4_reference(
+        key, value, cache, torch.tensor([3, 2 * BLOCK, 10**6, -1])
+    )
+    (k_data, _), _ = nv.nvfp4_kv_split_views(cache)
+    touched = k_data.reshape(2 * BLOCK, -1).any(dim=1)
+    assert touched.nonzero().flatten().tolist() == [3]
+
+
 def test_cache_write_last_writer_wins_for_a_repeated_slot() -> None:
     cache = _empty_cache(1, BLOCK)
     first = _rows((1, 1, D), seed=1)

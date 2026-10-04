@@ -287,6 +287,47 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             )
         self.supports_quant_query_input = False
 
+    def do_kv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Write this forward pass's K/V rows into the cache.
+
+        The NVFP4 contract, called from ``Qwen4ExpQSAAttention._run_qsa`` for
+        prefill, decode and the draft alike:
+
+        * ``key``/``value``: ``[rows, num_kv_heads, head_dim]`` fp16, after RoPE
+          and the q/k norm; ``rows`` may exceed ``slot_mapping.numel()`` (CUDA
+          graph padding) and ``value`` is a strided slice of the QKV output, so
+          only the last dimension has to be contiguous;
+        * ``slot_mapping``: int64 ``[num_actual_tokens]``, ``block * block_size +
+          offset``, negative for padding or a token another DCP rank owns;
+        * ``kv_cache``: ``self.kv_cache``, the uint8
+          ``(num_blocks, 2, block_size, num_kv_heads, 144)`` view the worker
+          builds (a packed member view has a larger block stride);
+        * ``layer._k_scale``/``layer._v_scale``: the finalized per-layer device
+          scalars.
+
+        Every other cache dtype goes through ``reshape_and_cache_flash``.
+        """
+        if self.kv_cache_dtype != NVFP4_KV_CACHE_DTYPE:
+            super().do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)
+            return
+        from .ops.nvfp4_kv_triton import store_nvfp4_kv_triton
+
+        store_nvfp4_kv_triton(
+            key,
+            value,
+            kv_cache,
+            slot_mapping,
+            k_scale=layer._k_scale,
+            v_scale=layer._v_scale,
+        )
+
     def forward_qsa(
         self,
         layer: torch.nn.Module,
