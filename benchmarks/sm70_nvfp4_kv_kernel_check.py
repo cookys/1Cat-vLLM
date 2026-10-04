@@ -1,0 +1,1088 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Do the SM70 NVFP4 KV kernels store, gather and decode what the reference says,
+and what do they cost next to the E4M3 kernels?
+
+Question under test (plan 071). The CPU tests prove the Triton store, the Triton
+gather and the NVFP4 decode route equal their torch references in the Triton
+interpreter. They prove nothing about the compiled kernels on a V100: a different
+division, a different fused multiply, a launch configuration the interpreter never
+sees. This script runs the same chain on one GPU on real-geometry random K/V and
+says which links hold, how large the NVFP4 attention error is next to the E4M3
+error it is meant to replace, and how long each kernel takes.
+
+The chain, per case (one NVFP4 or E4M3 block size and one row count):
+
+1. Store. Random K and V ``[tokens, kv_heads, head_dim]`` (seeded on the CPU, so
+   every run builds the same bytes) are written with ``store_nvfp4_kv_triton`` into
+   a cache on the GPU and with ``reshape_and_cache_nvfp4_reference`` into a cache on
+   the CPU; the two caches are compared byte for byte, separately for the data
+   bytes and the scale bytes. For the E4M3 control the same K/V go through
+   ``reshape_and_cache_flash`` with per-tensor scales ``amax / 448``.
+2. Gather. ``gather_dequant_nvfp4_kv_triton`` on the reference cache bytes (so a
+   store mismatch cannot hide here) against ``gather_dequant_nvfp4_kv`` on the CPU,
+   with illegal top-k entries in the selection: negative, past the block table, on
+   an unmapped page, on a physical block past the cache, and one row whose request
+   does not exist. Every illegal entry must come out as exact zeros.
+3. Decode. ``qsa_sparse_paged_attention(kv_cache_dtype="nvfp4")``, the production
+   route: gather and decode the selected rows to FP16, then the FP16 split-K kernel
+   with the layer scales folded in FP32. Three comparisons:
+
+   - path identity: at unit layer scales the NVFP4 route against the same FP16
+     kernel on a plain FP16 paged cache of the dequantized values. The two run the
+     same arithmetic on the same operands, so the outputs must be equal bit for bit;
+   - quantization error: at the realistic layer scales against the FP16 kernel on
+     the original, unquantized K/V (max |diff|, mean |diff| and relative L2);
+   - E4M3 control: the same harness on the E4M3 cache against the same FP16
+     baseline, for the error NVFP4 has to be read against.
+
+4. Timings, CUDA events, median of ``--iters`` calls per round, ABBA rounds across
+   the arms so a drift in clocks or neighbours moves every arm: store (NVFP4 and
+   E4M3), gather, the whole NVFP4 decode, the FP16 kernel alone on the dequantized
+   cache, and the E4M3 decode, for each row count (default 1 and 5, the decode
+   steps of a plain and an MTP4 target).
+
+Geometry. Read from ``--config`` for ``--tp`` ranks, as the engine builds it: head
+size, query heads per rank, KV heads per rank (replicated below the TP size),
+selection width ``indexer_budget + indexer_compress_ratio - 1``. The production
+values at TP4 are head 256, 6 query heads, 1 KV head, top-k 2051. Block sizes are
+the ones the allocator derives (``docs/design/c4140_qsa_nvfp4_kv.md``): 2784 and
+2864 for NVFP4 without and with MTP4, 1616 for E4M3 with MTP4 (the control).
+
+Verdict printed on stdout (exit status 0 for a clean run whatever the verdict):
+
+    STORE_MATCHES_REFERENCE: YES/NO          data and scale bytes, every NVFP4 case
+    GATHER_MATCHES_REFERENCE: YES/NO         FP16 outputs equal, every NVFP4 case
+    ZERO_FILL_OK: YES/NO                     illegal entries are exact zeros
+    DECODE_PATH_IDENTICAL: YES/NO            unit scales: NVFP4 route == FP16 kernel
+    DECODE_VS_FP16 <case>: max|d| .. mean|d| .. relL2 ..
+    E4M3_CONTROL <case>: max|d| .. mean|d| .. relL2 ..
+    NVFP4_VS_E4M3_REL_L2 M=<rows>: <ratio>   NVFP4 error over E4M3 error
+    TIMING_US <case> <kernel>: median .. p10 .. p90 .. (round spread ..%)
+    DECODE_ROUNDTRIP_US M=<rows>: nvfp4 .. e4m3 .. ratio ..
+
+``NO`` lines carry the evidence (the count and first position of differing bytes,
+the largest difference). ``UNKNOWN`` means a case failed before it could say.
+
+Exit status: 0 a clean run; 2 no CUDA device, a GPU that already holds memory
+(unless ``--allow-busy``) or unusable arguments; 1 a case raised.
+
+    cd <worktree> && CUDA_VISIBLE_DEVICES=<idle gpu> PYTHONPATH=$PWD \\
+        /data/venvs/1cat-p070/bin/python benchmarks/sm70_nvfp4_kv_kernel_check.py \\
+        --out /data/bench/nvfp4_kv_kernel_check.json
+
+Use one idle GPU and never one a server holds: the script allocates a few hundred
+MiB, and any other process on the device moves the timings. Without ``--allow-busy``
+it refuses a GPU that already holds more than ``--max-used-mib`` (1024). The first
+call of every Triton kernel compiles it, so the run starts with warmups; with the
+defaults it takes a few minutes, most of it compilation. The printed ``SOURCE``
+lines name the tree the kernels were imported from.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import statistics
+import sys
+import time
+from collections.abc import Callable, Sequence
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+import torch
+
+DEFAULT_CONFIG = "/data/models/Qwen3.8-Flash-Next-NVFP4/config.json"
+# Production values at TP4, used when the config cannot be read.
+PRODUCTION_GEOMETRY = {"head_dim": 256, "q_heads": 6, "kv_heads": 1, "topk": 2051}
+DEFAULT_NVFP4_BLOCKS = (2784, 2864)
+DEFAULT_E4M3_BLOCK = 1616
+DEFAULT_ROWS = (1, 5)
+# Overlay-like layer scales (the Flash-Next overlay holds K 0.0186..0.0367 and
+# V 0.0171..0.0841); powers of two would hide a scale folded on the wrong side.
+DEFAULT_K_SCALE = 0.0213623046875
+DEFAULT_V_SCALE = 0.0404924675822258
+# Largest |value| of the random K/V: with these scales the block scales stay below
+# the E4M3 maximum (amax / 6 / layer_scale <= 448 needs amax <= 53.7).
+MAX_ABS_VALUE = 40.0
+E4M3_MAX = 448.0
+RESULT_KEYS = ("store", "gather", "zero_fill", "decode_path", "decode_quality")
+# The device the cases run on; the CPU tests point it at "cpu" (Triton interpreter).
+WORKER_DEVICE = "cuda:0"
+
+
+# ------------------------------------------------------------------ geometry
+
+
+@dataclass(frozen=True)
+class Geometry:
+    head_dim: int
+    q_heads: int
+    kv_heads: int
+    topk: int
+    source: str
+
+    @property
+    def group(self) -> int:
+        return self.q_heads // self.kv_heads
+
+
+def read_geometry_from_config(path: str | Path, tp: int) -> dict[str, int] | None:
+    """Per-rank attention geometry from a model config, or None if unreadable."""
+    try:
+        config = json.loads(Path(path).read_text())
+        text = config.get("text_config", config)
+        heads = int(text["num_attention_heads"])
+        kv_heads = int(text["num_key_value_heads"])
+        head_dim = int(text["head_dim"])
+        topk = int(text["indexer_budget"]) + int(text["indexer_compress_ratio"]) - 1
+    except (OSError, KeyError, TypeError, ValueError):
+        return None
+    if tp <= 0 or heads % tp or head_dim <= 0 or head_dim % 16 or topk <= 0:
+        return None
+    return {
+        "head_dim": head_dim,
+        "q_heads": heads // tp,
+        "kv_heads": max(1, kv_heads // tp),
+        "topk": topk,
+    }
+
+
+def resolve_geometry(args: argparse.Namespace) -> Geometry:
+    found = read_geometry_from_config(args.config, args.tp)
+    values = dict(found) if found else dict(PRODUCTION_GEOMETRY)
+    source = f"config {args.config} tp={args.tp}" if found else "production defaults"
+    for key in ("head_dim", "q_heads", "kv_heads", "topk"):
+        override = getattr(args, key)
+        if override is not None:
+            values[key] = override
+            source += f" (+{key} override)"
+    if values["q_heads"] % values["kv_heads"]:
+        raise ValueError("q_heads must be a multiple of kv_heads")
+    return Geometry(source=source, **values)
+
+
+# ------------------------------------------------------------------ planning
+
+
+@dataclass(frozen=True)
+class Case:
+    kind: str  # "nvfp4" or "e4m3"
+    block_size: int
+    rows: int
+
+    @property
+    def label(self) -> str:
+        return f"{self.kind}-B{self.block_size}-M{self.rows}"
+
+
+def plan_cases(
+    nvfp4_blocks: Sequence[int],
+    e4m3_block: int | None,
+    rows: Sequence[int],
+) -> list[Case]:
+    """Every NVFP4 block size and, if given, the E4M3 control, per row count."""
+    if not rows or any(r <= 0 for r in rows):
+        raise ValueError("row counts must be positive")
+    if any(b <= 0 or b % 4 for b in nvfp4_blocks) or (
+        e4m3_block is not None and (e4m3_block <= 0 or e4m3_block % 4)
+    ):
+        raise ValueError("block sizes must be positive multiples of 4")
+    cases = [Case("nvfp4", b, r) for r in rows for b in nvfp4_blocks]
+    if e4m3_block is not None:
+        cases += [Case("e4m3", e4m3_block, r) for r in rows]
+    if not cases:
+        raise ValueError("nothing to run")
+    return cases
+
+
+@dataclass(frozen=True)
+class Layout:
+    block_size: int
+    pages: int  # logical pages per request
+    requests: int
+    num_blocks: int  # physical blocks of the cache, two of them never mapped
+    tokens_per_request: int
+
+
+def plan_layout(block_size: int, rows: int, topk: int, context: int) -> Layout:
+    """Cache geometry for a batch of ``rows`` rows over one or two requests."""
+    tokens = max(context, topk + 1)
+    pages = -(-tokens // block_size)
+    requests = 1 if rows == 1 else 2
+    return Layout(
+        block_size=block_size,
+        pages=pages,
+        requests=requests,
+        num_blocks=requests * pages + 2,
+        tokens_per_request=tokens,
+    )
+
+
+def make_block_table(layout: Layout, seed: int) -> torch.Tensor:
+    """Distinct physical blocks per logical page, int32 ``[requests, pages]``."""
+    generator = torch.Generator().manual_seed(seed)
+    order = torch.randperm(layout.num_blocks, generator=generator)
+    mapped = order[: layout.requests * layout.pages]
+    return mapped.reshape(layout.requests, layout.pages).to(torch.int32)
+
+
+def slot_mapping(table: torch.Tensor, layout: Layout) -> torch.Tensor:
+    """Slot of every token of every request, request-major, int64."""
+    tokens = torch.arange(layout.tokens_per_request)
+    pages = (tokens // layout.block_size).long()
+    offsets = tokens % layout.block_size
+    slots = table.long()[:, pages] * layout.block_size + offsets
+    return slots.reshape(-1)
+
+
+def make_kv(
+    tokens: int, kv_heads: int, head_dim: int, seed: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Random K and V with the spread of real activations, fp16 ``[t, h, d]``.
+
+    A normal draw times a per-token log-uniform magnitude (three decades) with a
+    few heavy-tailed outliers, clamped to ``MAX_ABS_VALUE``.
+    """
+    generator = torch.Generator().manual_seed(seed)
+
+    def one() -> torch.Tensor:
+        base = torch.randn(tokens, kv_heads, head_dim, generator=generator)
+        magnitude = 10.0 ** (
+            torch.rand(tokens, kv_heads, 1, generator=generator) * 2 - 1
+        )
+        outliers = torch.randn(tokens, kv_heads, head_dim, generator=generator)
+        outlier_mask = (
+            torch.rand(tokens, kv_heads, head_dim, generator=generator) < 0.01
+        )
+        x = base * magnitude + outlier_mask * outliers * 8.0
+        return x.clamp(-MAX_ABS_VALUE, MAX_ABS_VALUE).half()
+
+    return one(), one()
+
+
+@dataclass(frozen=True)
+class Selection:
+    indices: torch.Tensor  # int32 [rows, topk]
+    table: torch.Tensor  # int32 [requests, pages]
+    token_to_req: torch.Tensor  # int32 [rows]
+    illegal: torch.Tensor  # bool [rows, topk], the independent expectation
+    empty_rows: tuple[int, ...]  # rows whose every entry is illegal
+
+
+def build_selection(
+    layout: Layout,
+    table: torch.Tensor,
+    rows: int,
+    topk: int,
+    seed: int,
+    *,
+    inject_illegal: bool,
+) -> Selection:
+    """Top-k selections: distinct legal tokens per row, optionally with illegal ones.
+
+    Rows alternate over the requests. With ``inject_illegal`` the first row gets a
+    negative entry, an entry past the block table and a huge entry; an unmapped
+    page of request 0 and a physical block past the cache of request 1 (when there
+    is one) are placed under selected tokens; and, with three or more rows, the
+    last row belongs to a request that does not exist. ``illegal`` is computed here
+    by the rule's definition, independently of ``nvfp4_entry_validity``.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    table = table.clone()
+    token_to_req = (torch.arange(rows) % layout.requests).to(torch.int32)
+    span = layout.pages * layout.block_size
+    indices = torch.empty((rows, topk), dtype=torch.int32)
+    for row in range(rows):
+        indices[row] = torch.randperm(layout.tokens_per_request, generator=generator)[
+            :topk
+        ].to(torch.int32)
+    empty: list[int] = []
+    if inject_illegal:
+        if topk < 8:
+            raise ValueError("illegal injection needs a selection width of 8 or more")
+        indices[0, 0] = -1
+        indices[0, 1] = span  # first token past the block table
+        indices[0, 2] = 2**30
+        if layout.pages > 1:
+            table[0, 1] = -1  # request 0 never got its second page
+            indices[0, 3] = layout.block_size + 1  # a token on that page
+        if layout.requests > 1:
+            table[1, 0] = layout.num_blocks + 5  # past the cache
+            indices[1, 3] = 2
+            indices[1, 4] = -7
+        if rows >= 3:
+            token_to_req[rows - 1] = -1
+            empty.append(rows - 1)
+    illegal = torch.zeros((rows, topk), dtype=torch.bool)
+    for row in range(rows):
+        request = int(token_to_req[row])
+        for col in range(topk):
+            token = int(indices[row, col])
+            bad = request < 0 or request >= layout.requests or token < 0
+            if not bad:
+                page = token // layout.block_size
+                bad = page >= layout.pages
+                if not bad:
+                    block = int(table[request, page])
+                    bad = block < 0 or block >= layout.num_blocks
+            illegal[row, col] = bad
+    return Selection(indices, table, token_to_req, illegal, tuple(empty))
+
+
+# ------------------------------------------------------------------ statistics
+
+
+def compare_bytes(reference: torch.Tensor, actual: torch.Tensor) -> dict[str, Any]:
+    """Byte-level comparison of two uint8 tensors of the same shape."""
+    if reference.shape != actual.shape:
+        raise ValueError(
+            f"shape mismatch {tuple(reference.shape)} {tuple(actual.shape)}"
+        )
+    different = reference != actual
+    count = int(different.sum())
+    first = None
+    if count:
+        first = [int(i) for i in different.nonzero()[0]]
+    return {"bytes": reference.numel(), "different": count, "first_index": first}
+
+
+def compare_cache_regions(
+    reference_views: tuple[torch.Tensor, torch.Tensor],
+    actual_views: tuple[torch.Tensor, torch.Tensor],
+) -> dict[str, Any]:
+    """Compare the (data, scale) views of one cache side, region by region."""
+    return {
+        "data": compare_bytes(reference_views[0], actual_views[0]),
+        "scale": compare_bytes(reference_views[1], actual_views[1]),
+    }
+
+
+def merge_region_comparisons(sides: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Add up the per-side ``compare_cache_regions`` results (K then V)."""
+    merged: dict[str, Any] = {}
+    for part in ("data", "scale"):
+        parts = [side[part] for side in sides]
+        merged[part] = {
+            "bytes": sum(p["bytes"] for p in parts),
+            "different": sum(p["different"] for p in parts),
+            "first_index": next(
+                (p["first_index"] for p in parts if p["different"]), None
+            ),
+        }
+    return merged
+
+
+def error_stats(actual: torch.Tensor, reference: torch.Tensor) -> dict[str, float]:
+    """max |d|, mean |d| and relative L2 of ``actual`` against ``reference``."""
+    a, r = actual.double(), reference.double()
+    diff = (a - r).abs()
+    norm = float(r.norm())
+    return {
+        "max_abs": float(diff.max()) if diff.numel() else 0.0,
+        "mean_abs": float(diff.mean()) if diff.numel() else 0.0,
+        "rel_l2": float((a - r).norm()) / norm if norm > 0 else float("nan"),
+        "reference_norm": norm,
+    }
+
+
+def summarize_timing(rounds: Sequence[Sequence[float]]) -> dict[str, float]:
+    """Median, p10, p90 of all samples and the spread of the per-round medians."""
+    samples = sorted(x for r in rounds for x in r)
+    if not samples:
+        raise ValueError("no samples")
+
+    def percentile(p: float) -> float:
+        k = (len(samples) - 1) * p
+        lo, hi = math.floor(k), math.ceil(k)
+        return samples[lo] + (samples[hi] - samples[lo]) * (k - lo)
+
+    medians = [statistics.median(r) for r in rounds if len(r)]
+    center = statistics.median(medians)
+    spread = (max(medians) - min(medians)) / center * 100 if center > 0 else 0.0
+    return {
+        "median": statistics.median(samples),
+        "p10": percentile(0.1),
+        "p90": percentile(0.9),
+        "round_spread_pct": spread,
+        "samples": len(samples),
+    }
+
+
+def abba_order(arms: Sequence[str], rounds: int) -> list[str]:
+    """A B ... B A per round, reversed on every other round, so no arm always
+    runs first or last."""
+    order: list[str] = []
+    for index in range(rounds):
+        order += list(arms) if index % 2 == 0 else list(reversed(arms))
+    return order
+
+
+# ------------------------------------------------------------------ verdicts
+
+
+def _yes_no(flag: bool) -> str:
+    return "YES" if flag else "NO"
+
+
+def compute_verdict(results: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Verdict lines from the per-case results.
+
+    A result is ``{"case": label, "kind": ..., "rows": ..., "error": str | None,
+    "store": ..., "gather": ..., "zero_fill": ..., "decode_path": ...,
+    "decode_quality": ...}``; keys a case did not reach are absent or None. A line is
+    UNKNOWN when no NVFP4 case produced its measurement.
+    """
+    nvfp4 = [r for r in results if r["kind"] == "nvfp4"]
+    verdict: dict[str, Any] = {}
+
+    def over(key: str, ok: Callable[[Any], bool]) -> str:
+        """NO if any case that got there failed, else UNKNOWN if any case did not
+        get there (or none exists), else YES."""
+        reached = [r for r in nvfp4 if r.get(key) is not None]
+        if any(not ok(r[key]) for r in reached):
+            return "NO"
+        if not nvfp4 or len(reached) < len(nvfp4):
+            return "UNKNOWN"
+        return "YES"
+
+    verdict["STORE_MATCHES_REFERENCE"] = over(
+        "store",
+        lambda s: s["data"]["different"] == 0 and s["scale"]["different"] == 0,
+    )
+    verdict["GATHER_MATCHES_REFERENCE"] = over("gather", lambda g: g["different"] == 0)
+    verdict["ZERO_FILL_OK"] = over("zero_fill", lambda z: z["ok"])
+    verdict["DECODE_PATH_IDENTICAL"] = over(
+        "decode_path", lambda d: d["max_abs"] == 0.0
+    )
+    verdict["errors"] = {r["case"]: r["error"] for r in results if r.get("error")}
+    ratios: dict[str, float] = {}
+    for rows in sorted({r["rows"] for r in results}):
+        fp4 = [
+            r["decode_quality"]["rel_l2"]
+            for r in nvfp4
+            if r["rows"] == rows and r.get("decode_quality")
+        ]
+        e4 = [
+            r["decode_quality"]["rel_l2"]
+            for r in results
+            if r["kind"] == "e4m3" and r["rows"] == rows and r.get("decode_quality")
+        ]
+        if fp4 and e4 and e4[0] > 0:
+            ratios[f"M={rows}"] = max(fp4) / e4[0]
+    verdict["NVFP4_VS_E4M3_REL_L2"] = ratios
+    return verdict
+
+
+def decode_roundtrip_lines(timings: dict[str, dict[str, Any]]) -> list[str]:
+    """``DECODE_ROUNDTRIP_US`` lines from ``timings[<group>][<arm>]`` summaries."""
+    lines = []
+    for group, arms in timings.items():
+        fp4 = [v["median"] for k, v in arms.items() if k.startswith("decode_nvfp4")]
+        e4_arms = [v for k, v in arms.items() if k.startswith("decode_e4m3")]
+        e4 = e4_arms[0] if e4_arms else None
+        if fp4 and e4:
+            lines.append(
+                f"DECODE_ROUNDTRIP_US {group}: nvfp4 "
+                + "/".join(f"{x:.1f}" for x in fp4)
+                + f" e4m3 {e4['median']:.1f} ratio "
+                + "/".join(f"{x / e4['median']:.2f}" for x in fp4)
+            )
+    return lines
+
+
+def exit_code_for(results: Sequence[dict[str, Any]]) -> int:
+    return 1 if any(r.get("error") for r in results) else 0
+
+
+def format_verdict(
+    verdict: dict[str, Any], results: Sequence[dict[str, Any]]
+) -> list[str]:
+    lines = []
+    for key in (
+        "STORE_MATCHES_REFERENCE",
+        "GATHER_MATCHES_REFERENCE",
+        "ZERO_FILL_OK",
+        "DECODE_PATH_IDENTICAL",
+    ):
+        lines.append(f"{key}: {verdict[key]}")
+    for r in results:
+        if (
+            r.get("store")
+            and r["store"]["data"]["different"] + r["store"]["scale"]["different"]
+        ):
+            d, sc = r["store"]["data"], r["store"]["scale"]
+            lines.append(
+                f"STORE_DIFF {r['case']}: data {d['different']}/{d['bytes']} "
+                f"first {d['first_index']}, scale {sc['different']}/{sc['bytes']} "
+                f"first {sc['first_index']}"
+            )
+        if r.get("gather") and r["gather"]["different"]:
+            lines.append(
+                f"GATHER_DIFF {r['case']}: {r['gather']['different']} of "
+                f"{r['gather']['elements']} elements, "
+                f"max|d| {r['gather']['max_abs']:.3g}"
+            )
+        if r.get("decode_path") and r["decode_path"]["max_abs"] != 0.0:
+            lines.append(
+                f"DECODE_PATH_DIFF {r['case']}: "
+                f"max|d| {r['decode_path']['max_abs']:.3g}"
+            )
+    for r in results:
+        q = r.get("decode_quality")
+        if not q:
+            continue
+        name = "E4M3_CONTROL" if r["kind"] == "e4m3" else "DECODE_VS_FP16"
+        lines.append(
+            f"{name} {r['case']}: max|d| {q['max_abs']:.4g} mean|d| {q['mean_abs']:.4g}"
+            f" relL2 {q['rel_l2']:.4g}"
+        )
+    for group, ratio in verdict["NVFP4_VS_E4M3_REL_L2"].items():
+        lines.append(f"NVFP4_VS_E4M3_REL_L2 {group}: {ratio:.2f}")
+    for case, error in verdict["errors"].items():
+        lines.append(f"CASE_ERROR {case}: {error}")
+    return lines
+
+
+# ------------------------------------------------------------------ the measurement
+
+
+def load_kernels() -> dict[str, Any]:
+    """Import the kernels lazily: planning and verdict code needs no vLLM."""
+    from vllm import _custom_ops as ops
+    from vllm.models.qwen4_exp.nvidia.ops import nvfp4_kv as nv
+    from vllm.models.qwen4_exp.nvidia.ops import nvfp4_kv_triton as nvt
+    from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
+
+    return {"ops": ops, "nv": nv, "nvt": nvt, "qsa": qsa_ops}
+
+
+def _sync() -> None:
+    if WORKER_DEVICE.startswith("cuda"):
+        torch.accelerator.synchronize()
+
+
+def time_arms(
+    arms: dict[str, Callable[[], Any]], *, rounds: int, iters: int, warmup: int
+) -> dict[str, dict[str, float]]:
+    """Time each arm; CUDA events on a GPU, ``perf_counter`` on the CPU tests.
+
+    Arms are interleaved A B B A across ``rounds`` rounds (``abba_order``), each
+    turn running ``iters`` calls and recording the median call time of that turn.
+    """
+    for fn in arms.values():
+        for _ in range(warmup):
+            fn()
+    _sync()
+    use_events = WORKER_DEVICE.startswith("cuda")
+    per_arm: dict[str, list[list[float]]] = {name: [] for name in arms}
+    for name in abba_order(list(arms), rounds):
+        fn = arms[name]
+        samples: list[float] = []
+        for _ in range(iters):
+            if use_events:
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                fn()
+                end.record()
+                end.synchronize()
+                samples.append(start.elapsed_time(end) * 1000.0)
+            else:
+                t0 = time.perf_counter()
+                fn()
+                samples.append((time.perf_counter() - t0) * 1e6)
+        per_arm[name].append(samples)
+    return {name: summarize_timing(r) for name, r in per_arm.items()}
+
+
+class CaseRun:
+    """One case: build the caches, verify the kernels, expose timing closures."""
+
+    def __init__(
+        self,
+        case: Case,
+        geometry: Geometry,
+        kernels: dict[str, Any],
+        *,
+        seed: int,
+        context: int,
+        k_scale: float,
+        v_scale: float,
+    ) -> None:
+        self.case, self.geometry, self.k = case, geometry, kernels
+        self.seed, self.k_scale, self.v_scale = seed, k_scale, v_scale
+        self.device = torch.device(WORKER_DEVICE)
+        self.layout = plan_layout(case.block_size, case.rows, geometry.topk, context)
+        self.table = make_block_table(self.layout, seed)
+        self.slots = slot_mapping(self.table, self.layout)
+        total = self.layout.requests * self.layout.tokens_per_request
+        self.key, self.value = make_kv(
+            total, geometry.kv_heads, geometry.head_dim, seed
+        )
+        generator = torch.Generator().manual_seed(seed + 1)
+        self.q = torch.randn(
+            case.rows, geometry.q_heads, geometry.head_dim, generator=generator
+        ).half()
+        self.clean = build_selection(
+            self.layout,
+            self.table,
+            case.rows,
+            geometry.topk,
+            seed + 2,
+            inject_illegal=False,
+        )
+        self.dirty = build_selection(
+            self.layout,
+            self.table,
+            case.rows,
+            geometry.topk,
+            seed + 3,
+            inject_illegal=True,
+        )
+
+    # -- helpers ---------------------------------------------------------
+    def _dev(self, x: torch.Tensor) -> torch.Tensor:
+        return x.to(self.device)
+
+    def _fp16_cache(self, key: torch.Tensor, value: torch.Tensor):
+        """A plain FP16 paged cache holding ``key`` / ``value`` at the stored slots."""
+        shape = (
+            self.layout.num_blocks,
+            self.layout.block_size,
+            self.geometry.kv_heads,
+            self.geometry.head_dim,
+        )
+        k16 = torch.zeros(shape, dtype=torch.float16)
+        v16 = torch.zeros(shape, dtype=torch.float16)
+        flat_k = k16.view(-1, self.geometry.kv_heads, self.geometry.head_dim)
+        flat_v = v16.view(-1, self.geometry.kv_heads, self.geometry.head_dim)
+        flat_k[self.slots] = key
+        flat_v[self.slots] = value
+        return self._dev(k16), self._dev(v16)
+
+    def _attention(self, selection: Selection, **kwargs):
+        return self.k["qsa"].qsa_sparse_paged_attention(
+            self._dev(self.q),
+            kwargs.pop("k_cache"),
+            kwargs.pop("v_cache"),
+            self._dev(selection.indices),
+            self._dev(selection.table),
+            self._dev(selection.token_to_req),
+            **kwargs,
+        )
+
+    # -- the NVFP4 case --------------------------------------------------
+    def run_nvfp4(self) -> dict[str, Any]:
+        nv, nvt = self.k["nv"], self.k["nvt"]
+        g, layout = self.geometry, self.layout
+        shape = (
+            layout.num_blocks,
+            2,
+            layout.block_size,
+            g.kv_heads,
+            nv.nvfp4_kv_row_bytes(g.head_dim),
+        )
+        ks, vs = self.k_scale, self.v_scale
+        reference = torch.zeros(shape, dtype=torch.uint8)
+        nv.reshape_and_cache_nvfp4_reference(
+            self.key, self.value, reference, self.slots, k_scale=ks, v_scale=vs
+        )
+        actual = torch.zeros(shape, dtype=torch.uint8, device=self.device)
+        nvt.store_nvfp4_kv_triton(
+            self._dev(self.key),
+            self._dev(self.value),
+            actual,
+            self._dev(self.slots),
+            k_scale=torch.tensor(ks, device=self.device),
+            v_scale=torch.tensor(vs, device=self.device),
+        )
+        _sync()
+        ref_views = nv.nvfp4_kv_split_views(reference)
+        act_views = nv.nvfp4_kv_split_views(actual.cpu())
+        result: dict[str, Any] = {
+            "store": merge_region_comparisons(
+                [
+                    compare_cache_regions(
+                        (ref_views[0][side], ref_views[1][side]),
+                        (act_views[0][side], act_views[1][side]),
+                    )
+                    for side in (0, 1)
+                ]
+            )
+        }
+
+        cache = self._dev(reference)  # the reference bytes: gather and decode are
+        # tested on them, so a store mismatch cannot hide behind a later one.
+        sel = self.dirty
+        keys, values = nvt.gather_dequant_nvfp4_kv_triton(
+            cache,
+            self._dev(sel.table),
+            self._dev(sel.token_to_req),
+            self._dev(sel.indices),
+            k_scale=ks,
+            v_scale=vs,
+        )
+        ref_keys, ref_values = nv.gather_dequant_nvfp4_kv(
+            reference, sel.table, sel.token_to_req, sel.indices, k_scale=ks, v_scale=vs
+        )
+        keys, values = keys.cpu(), values.cpu()
+        different = int((keys != ref_keys).sum() + (values != ref_values).sum())
+        elements = keys.numel() + values.numel()
+        max_abs = float(
+            max(
+                (keys.float() - ref_keys.float()).abs().max(),
+                (values.float() - ref_values.float()).abs().max(),
+            )
+        )
+        result["gather"] = {
+            "different": different,
+            "elements": elements,
+            "max_abs": max_abs,
+        }
+        illegal = sel.illegal[..., None, None].expand_as(keys)
+        zeros_ok = bool((keys[illegal] == 0).all() and (values[illegal] == 0).all())
+
+        # Path identity: a cache stored at unit layer scales, decoded at unit scales,
+        # against the FP16 kernel on the dequantized values of that same cache.
+        unit = torch.zeros(shape, dtype=torch.uint8)
+        nv.reshape_and_cache_nvfp4_reference(self.key, self.value, unit, self.slots)
+        (u_k, u_v), (u_ks, u_vs) = nv.nvfp4_kv_split_views(unit)
+        unit_cache = self._dev(unit)
+        nvfp4_out = self._attention(
+            sel,
+            k_cache=unit_cache[:, 0],
+            v_cache=unit_cache[:, 1],
+            kv_cache_dtype="nvfp4",
+        )
+        fp16_out = self._attention(
+            sel,
+            k_cache=self._dev(nv.dequantize_kv_nvfp4(u_k, u_ks)),
+            v_cache=self._dev(nv.dequantize_kv_nvfp4(u_v, u_vs)),
+        )
+        nvfp4_out, fp16_out = nvfp4_out.cpu(), fp16_out.cpu()
+        decode_ok = bool(torch.equal(nvfp4_out, fp16_out))
+        empty_ok = all(not nvfp4_out[row].any() for row in sel.empty_rows)
+        result["zero_fill"] = {"ok": bool(zeros_ok and empty_ok and decode_ok)}
+        result["decode_path"] = error_stats(nvfp4_out, fp16_out)
+
+        # Quantization error at the realistic scales against the unquantized K/V.
+        clean = self.clean
+        k_orig, v_orig = self._fp16_cache(self.key, self.value)
+        baseline = self._attention(clean, k_cache=k_orig, v_cache=v_orig).cpu()
+        quantized = self._attention(
+            clean,
+            k_cache=cache[:, 0],
+            v_cache=cache[:, 1],
+            kv_cache_dtype="nvfp4",
+            k_scale=ks,
+            v_scale=vs,
+        ).cpu()
+        result["decode_quality"] = error_stats(quantized, baseline)
+        (k_data, v_data), (k_scales, v_scales) = nv.nvfp4_kv_split_views(reference)
+        self._cache = cache
+        # What the FP16 kernel alone reads once the gather is done (timing only).
+        self._k_deq = self._dev(
+            nv.dequantize_kv_nvfp4(k_data, k_scales, layer_scale=ks)
+        )
+        self._v_deq = self._dev(
+            nv.dequantize_kv_nvfp4(v_data, v_scales, layer_scale=vs)
+        )
+        return result
+
+    # -- the E4M3 control ------------------------------------------------
+    def run_e4m3(self) -> dict[str, Any]:
+        g, layout = self.geometry, self.layout
+        shape = (layout.num_blocks, layout.block_size, g.kv_heads, g.head_dim)
+        ks = float(self.key.abs().max()) / E4M3_MAX
+        vs = float(self.value.abs().max()) / E4M3_MAX
+        k_cache = torch.zeros(shape, dtype=torch.uint8, device=self.device)
+        v_cache = torch.zeros_like(k_cache)
+        self._e4m3_store(
+            k_cache,
+            v_cache,
+            self._dev(self.key),
+            self._dev(self.value),
+            self._dev(self.slots),
+            torch.tensor(ks, device=self.device),
+            torch.tensor(vs, device=self.device),
+        )
+        _sync()
+        clean = self.clean
+        k_orig, v_orig = self._fp16_cache(self.key, self.value)
+        baseline = self._attention(clean, k_cache=k_orig, v_cache=v_orig).cpu()
+        e4m3 = self._attention(
+            clean,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            kv_cache_dtype="fp8_e4m3",
+            k_scale=ks,
+            v_scale=vs,
+        ).cpu()
+        self._e4m3 = (k_cache, v_cache, ks, vs)
+        return {"decode_quality": error_stats(e4m3, baseline)}
+
+    def _e4m3_store(self, k_cache, v_cache, key, value, slots, ks, vs) -> None:
+        """Write device tensors ``key`` / ``value`` at ``slots`` as E4M3 bytes."""
+        if self.device.type == "cuda":
+            self.k["ops"].reshape_and_cache_flash(
+                key, value, k_cache, v_cache, slots, "fp8_e4m3", ks, vs
+            )
+            return
+        # CPU (the tests): the same conversion the CUDA kernel performs.
+        flat_k = k_cache.view(-1, *k_cache.shape[2:])
+        flat_v = v_cache.view(-1, *v_cache.shape[2:])
+        flat_k[slots] = (
+            (key.float() / float(ks)).to(torch.float8_e4m3fn).view(torch.uint8)
+        )
+        flat_v[slots] = (
+            (value.float() / float(vs)).to(torch.float8_e4m3fn).view(torch.uint8)
+        )
+
+    # -- timing closures ---------------------------------------------------
+    def timing_arms(self) -> dict[str, Callable[[], Any]]:
+        """Closures to time; the case must have been verified (caches are built).
+
+        Every tensor is moved to the device once, so a timed call is the kernel.
+        """
+        rows = self.case.rows
+        label = f"B{self.case.block_size}"
+        arms: dict[str, Callable[[], Any]] = {}
+        sel = self.clean
+        indices = self._dev(sel.indices)
+        table = self._dev(sel.table)
+        token_to_req = self._dev(sel.token_to_req)
+        q = self._dev(self.q)
+        slots = self._dev(self.slots[:rows])
+        key = self._dev(self.key[:rows])
+        value = self._dev(self.value[:rows])
+        attention = self.k["qsa"].qsa_sparse_paged_attention
+        if self.case.kind == "nvfp4":
+            nvt = self.k["nvt"]
+            cache = self._cache
+            scratch = torch.zeros_like(cache)
+            ks_t = torch.tensor(self.k_scale, device=self.device)
+            vs_t = torch.tensor(self.v_scale, device=self.device)
+            ks, vs = self.k_scale, self.v_scale
+            k16, v16 = self._k_deq, self._v_deq
+            arms[f"store_nvfp4_{label}"] = lambda: nvt.store_nvfp4_kv_triton(
+                key, value, scratch, slots, k_scale=ks_t, v_scale=vs_t
+            )
+            arms[f"gather_nvfp4_{label}"] = lambda: nvt.gather_dequant_nvfp4_kv_triton(
+                cache, table, token_to_req, indices, k_scale=ks, v_scale=vs
+            )
+            arms[f"decode_nvfp4_{label}"] = lambda: attention(
+                q,
+                cache[:, 0],
+                cache[:, 1],
+                indices,
+                table,
+                token_to_req,
+                kv_cache_dtype="nvfp4",
+                k_scale=ks,
+                v_scale=vs,
+            )
+            arms[f"decode_fp16_dequantized_{label}"] = lambda: attention(
+                q, k16, v16, indices, table, token_to_req
+            )
+        else:
+            k_cache, v_cache, ks, vs = self._e4m3
+            scratch_k, scratch_v = torch.zeros_like(k_cache), torch.zeros_like(v_cache)
+            ks_t = torch.tensor(ks, device=self.device)
+            vs_t = torch.tensor(vs, device=self.device)
+            arms[f"store_e4m3_{label}"] = lambda: self._e4m3_store(
+                scratch_k, scratch_v, key, value, slots, ks_t, vs_t
+            )
+            arms[f"decode_e4m3_{label}"] = lambda: attention(
+                q,
+                k_cache,
+                v_cache,
+                indices,
+                table,
+                token_to_req,
+                kv_cache_dtype="fp8_e4m3",
+                k_scale=ks,
+                v_scale=vs,
+            )
+        return arms
+
+
+def run_all(
+    cases: Sequence[Case],
+    geometry: Geometry,
+    kernels: dict[str, Any],
+    args: argparse.Namespace,
+    log: Callable[[str], None] = print,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Verify every case, then time the arms of each row count together."""
+    results: list[dict[str, Any]] = []
+    runs: dict[str, CaseRun] = {}
+    for case in cases:
+        entry: dict[str, Any] = {
+            "case": case.label,
+            "kind": case.kind,
+            "rows": case.rows,
+        }
+        try:
+            run = CaseRun(
+                case,
+                geometry,
+                kernels,
+                seed=args.seed,
+                context=args.context,
+                k_scale=args.k_scale,
+                v_scale=args.v_scale,
+            )
+            entry.update(run.run_nvfp4() if case.kind == "nvfp4" else run.run_e4m3())
+            runs[case.label] = run
+            log(f"verified {case.label}")
+        except Exception as exc:  # noqa: BLE001 - reported, the other cases still run
+            entry["error"] = f"{type(exc).__name__}: {exc}"
+            log(f"FAILED {case.label}: {entry['error']}")
+        results.append(entry)
+
+    timings: dict[str, dict[str, Any]] = {}
+    if not args.no_timing:
+        for rows in sorted({c.rows for c in cases}):
+            arms: dict[str, Callable[[], Any]] = {}
+            for case in cases:
+                if case.rows == rows and case.label in runs:
+                    arms.update(runs[case.label].timing_arms())
+            if not arms:
+                continue
+            try:
+                timings[f"M={rows}"] = time_arms(
+                    arms, rounds=args.rounds, iters=args.iters, warmup=args.warmup
+                )
+            except Exception as exc:  # noqa: BLE001
+                log(f"TIMING FAILED M={rows}: {type(exc).__name__}: {exc}")
+                timings[f"M={rows}"] = {}
+    return results, timings
+
+
+# ------------------------------------------------------------------ driver
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
+    parser.add_argument("--tp", type=int, default=4)
+    parser.add_argument("--head-dim", dest="head_dim", type=int, default=None)
+    parser.add_argument("--q-heads", dest="q_heads", type=int, default=None)
+    parser.add_argument("--kv-heads", dest="kv_heads", type=int, default=None)
+    parser.add_argument("--topk", type=int, default=None)
+    parser.add_argument(
+        "--nvfp4-blocks", type=int, nargs="+", default=list(DEFAULT_NVFP4_BLOCKS)
+    )
+    parser.add_argument("--e4m3-block", type=int, default=DEFAULT_E4M3_BLOCK)
+    parser.add_argument("--no-e4m3", action="store_true", help="skip the E4M3 control")
+    parser.add_argument("--rows", type=int, nargs="+", default=list(DEFAULT_ROWS))
+    parser.add_argument("--context", type=int, default=8192, help="tokens per request")
+    parser.add_argument("--k-scale", type=float, default=DEFAULT_K_SCALE)
+    parser.add_argument("--v-scale", type=float, default=DEFAULT_V_SCALE)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--iters", type=int, default=50, help="calls per timing turn")
+    parser.add_argument("--rounds", type=int, default=4, help="ABBA timing rounds")
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--no-timing", action="store_true")
+    parser.add_argument("--max-used-mib", type=int, default=1024)
+    parser.add_argument("--allow-busy", action="store_true")
+    parser.add_argument("--out", help="write the JSON report here")
+    args = parser.parse_args(argv)
+    if args.iters <= 0 or args.rounds <= 0 or args.warmup < 0:
+        parser.error("--iters and --rounds must be positive, --warmup non-negative")
+    if args.context <= 0 or args.k_scale <= 0 or args.v_scale <= 0:
+        parser.error("--context and the layer scales must be positive")
+    return args
+
+
+def refuse_busy_gpu(max_used_mib: int) -> str | None:
+    """A message if the GPU already holds more than ``max_used_mib``, else None."""
+    free, total = torch.cuda.mem_get_info()
+    used_mib = (total - free) / (1 << 20)
+    if used_mib > max_used_mib:
+        return (
+            f"the GPU already holds {used_mib:.0f} MiB (limit {max_used_mib}); run "
+            "on an idle GPU, never one a server holds, or pass --allow-busy"
+        )
+    return None
+
+
+def device_info() -> dict[str, Any]:
+    props = torch.cuda.get_device_properties(0)
+    return {
+        "name": props.name,
+        "capability": list(torch.cuda.get_device_capability(0)),
+        "total_mib": props.total_memory // (1 << 20),
+        "torch": torch.__version__,
+    }
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    if not torch.cuda.is_available():
+        print("needs a CUDA device (set CUDA_VISIBLE_DEVICES to an idle GPU)")
+        return 2
+    if not args.allow_busy:
+        message = refuse_busy_gpu(args.max_used_mib)
+        if message:
+            print(message)
+            return 2
+    try:
+        geometry = resolve_geometry(args)
+        cases = plan_cases(
+            args.nvfp4_blocks, None if args.no_e4m3 else args.e4m3_block, args.rows
+        )
+    except ValueError as exc:
+        print(f"unusable arguments: {exc}")
+        return 2
+    kernels = load_kernels()
+    info = device_info()
+    print(
+        f"device {info['name']} capability {info['capability']}, torch {info['torch']}"
+    )
+    if info["capability"] != [7, 0]:
+        print("NOTE: not an sm_70 device; the numbers are not V100 numbers")
+    print(
+        f"geometry head_dim={geometry.head_dim} q_heads={geometry.q_heads} "
+        f"kv_heads={geometry.kv_heads} topk={geometry.topk} ({geometry.source})"
+    )
+    for name in ("nv", "nvt", "qsa"):
+        print(f"SOURCE {name}: {kernels[name].__file__}")
+    print(f"cases: {', '.join(c.label for c in cases)}")
+
+    with torch.inference_mode():
+        results, timings = run_all(cases, geometry, kernels, args)
+    verdict = compute_verdict(results)
+    lines = format_verdict(verdict, results)
+    for group, arms in timings.items():
+        for arm, summary in arms.items():
+            lines.append(
+                f"TIMING_US {group} {arm}: median {summary['median']:.1f} "
+                f"p10 {summary['p10']:.1f} p90 {summary['p90']:.1f} "
+                f"(round spread {summary['round_spread_pct']:.1f}%)"
+            )
+    lines += decode_roundtrip_lines(timings)
+    print("\n".join(lines))
+    if args.out:
+        report = {
+            "device": info,
+            "geometry": asdict(geometry),
+            "args": vars(args),
+            "cases": results,
+            "timings": timings,
+            "verdict": verdict,
+            "lines": lines,
+        }
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.out).write_text(json.dumps(report, indent=2, default=str))
+        print(f"wrote {args.out}")
+    return exit_code_for(results)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
