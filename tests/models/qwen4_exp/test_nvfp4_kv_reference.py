@@ -10,8 +10,11 @@ writer, and the sparse gather with its illegal-index zero-fill rule.
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
+import numpy as np
 import pytest
+import regex as re
 import torch
 
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
@@ -40,6 +43,27 @@ def _rows(shape, kind="gaussian", seed=0, dtype=torch.float16):
 def _group_amax(x):
     groups = x.float().reshape(*x.shape[:-1], -1, nv.NVFP4_KV_GROUP_SIZE)
     return groups.abs().amax(-1, keepdim=True)
+
+
+def _sm100_store_reference(x: torch.Tensor, layer_scale: float):
+    """Per-group scale byte and nibbles in the SM100 store's order, in numpy fp32.
+
+    ``nvfp4_utils.cuh:221-285`` with IEEE division for ``rcp.approx.ftz``:
+    SFScaleVal = 1 / k_scale; SFValue = SFScaleVal * (vecMax * (1 / 6));
+    byte = E4M3(SFValue); outputScale = 1 / (SFValue_q * (1 / SFScaleVal));
+    nibble = E2M1(x * outputScale).
+    """
+    f32 = np.float32
+    groups = x.float().numpy().reshape(-1, 16)
+    sf_scale = f32(1.0) / f32(layer_scale)
+    amax = np.abs(groups).max(axis=1).astype(f32)
+    sf = sf_scale * (amax * (f32(1.0) / f32(6.0)))
+    byte = nv.e4m3_encode(torch.from_numpy(sf))
+    sf_q = nv.e4m3_decode(byte).numpy().astype(f32)
+    with np.errstate(divide="ignore"):
+        out = np.where(sf_q != 0, f32(1.0) / (sf_q * (f32(1.0) / sf_scale)), f32(0))
+    nibbles = nv.e2m1_encode(torch.from_numpy((groups * out[:, None]).astype(f32)))
+    return byte.numpy(), nibbles.numpy()
 
 
 def _empty_cache(blocks, block_size, heads=1, head_size=D):
@@ -252,8 +276,11 @@ def test_values_on_the_grid_roundtrip_exactly() -> None:
 def test_group_scale_is_the_rounded_amax_over_six() -> None:
     x = _rows((16, D), seed=5)
     _, scales = nv.quantize_kv_nvfp4(x)
-    expected = nv.e4m3_encode(_group_amax(x).squeeze(-1) / 6.0)
-    assert torch.equal(scales.view(torch.uint8), expected)
+    expected, _ = _sm100_store_reference(x, 1.0)
+    assert torch.equal(scales.view(torch.uint8).reshape(-1), torch.from_numpy(expected))
+    # Away from rounding boundaries this is the rounded amax / 6.
+    plain = nv.e4m3_encode(_group_amax(x).squeeze(-1) / 6.0)
+    assert (scales.view(torch.uint8) != plain).float().mean() < 0.01
 
 
 def test_maximum_scale_group_is_not_clipped() -> None:
@@ -349,11 +376,10 @@ def test_layer_scale_is_divided_out_of_the_group_scale_and_multiplied_back(
 ) -> None:
     x = _rows((64, D), seed=36)
     packed, scales = nv.quantize_kv_nvfp4(x, layer_scale=scale)
-    expected = nv.e4m3_encode(_group_amax(x).squeeze(-1) / (6.0 * scale))
-    in_range = (_group_amax(x).squeeze(-1) / (6.0 * scale) >= 2.0**-6) & (
-        _group_amax(x).squeeze(-1) / (6.0 * scale) <= 448.0
-    )
-    assert torch.equal(scales.view(torch.uint8)[in_range], expected[in_range])
+    expected, _ = _sm100_store_reference(x, scale)
+    assert torch.equal(scales.view(torch.uint8).reshape(-1), torch.from_numpy(expected))
+    plain = nv.e4m3_encode(_group_amax(x).squeeze(-1) / (6.0 * scale))
+    assert (scales.view(torch.uint8) != plain).float().mean() < 0.01
     restored = nv.dequantize_kv_nvfp4(
         packed, scales, layer_scale=scale, out_dtype=torch.float32
     )
@@ -391,6 +417,122 @@ def test_a_wrong_layer_scale_at_dequantization_rescales_the_result() -> None:
         packed, scales, layer_scale=1.0, out_dtype=torch.float32
     )
     assert torch.equal(right, wrong * 2.0)
+
+
+@pytest.mark.parametrize("scale", [1.0, 0.0213623046875, 0.0404924675822258, 3.0])
+@pytest.mark.parametrize("kind", ["gaussian", "heavy"])
+def test_the_bytes_equal_the_sm100_store_operation_order(scale, kind) -> None:
+    # Scales and nibbles, byte for byte, against an independent numpy fp32
+    # emulation of nvfp4_utils.cuh:221-285 (IEEE division for rcp.approx).
+    x = _rows((256, D), kind, seed=41)
+    packed, scales = nv.quantize_kv_nvfp4(x, layer_scale=scale)
+    byte, nibbles = _sm100_store_reference(x, scale)
+    assert torch.equal(scales.view(torch.uint8).reshape(-1), torch.from_numpy(byte))
+    assert torch.equal(
+        nv.unpack_nibbles(packed).reshape(-1, 16), torch.from_numpy(nibbles)
+    )
+
+
+def test_the_operation_order_decides_the_byte_at_rounding_boundaries() -> None:
+    # For layer scale 7 some fp16 group maxima land where amax / (6 k) and the
+    # SM100 order (1/k) * (amax * fp32(1/6)) round to different E4M3 bytes. The
+    # quantizer must follow the SM100 order.
+    f32 = np.float32
+    amax = (
+        torch.arange(0, 0x7C00, dtype=torch.int32).to(torch.int16).view(torch.float16)
+    )
+    values = amax.float().numpy()
+    plain = nv.e4m3_encode(torch.from_numpy(values / f32(6.0 * 7.0)))
+    sm100 = nv.e4m3_encode(
+        torch.from_numpy((f32(1) / f32(7.0)) * (values * (f32(1) / f32(6.0))))
+    )
+    boundary = (plain != sm100).nonzero().flatten()
+    assert boundary.numel() >= 8  # the discriminating cases exist
+    for index in boundary[:8].tolist():
+        x = torch.zeros(1, D)
+        x[0, 0] = float(values[index])
+        _, scales = nv.quantize_kv_nvfp4(x, layer_scale=7.0)
+        assert scales.view(torch.uint8)[0, 0].item() == sm100[index].item()
+        assert scales.view(torch.uint8)[0, 0].item() != plain[index].item()
+
+
+@pytest.mark.parametrize("divisor", [2688.0, 448.0, 200.0, None])
+def test_the_global_scale_choice_barely_changes_the_error(divisor) -> None:
+    # k_scale = amax / divisor; None is the unit scale. 2688 = 6 * 448 is the
+    # smallest scale whose largest block scale still fits E4M3. The E4M3 QSA
+    # overlay (amax / 448 in upstream's convention) can be reused as is, and so
+    # can 1.0: the block scale carries the range.
+    x = _rows((1024, D), seed=42)
+    scale = 1.0 if divisor is None else float(x.float().abs().max()) / divisor
+    packed, scales = nv.quantize_kv_nvfp4(x, layer_scale=scale)
+    restored = nv.dequantize_kv_nvfp4(
+        packed, scales, layer_scale=scale, out_dtype=torch.float32
+    )
+    relative = (
+        torch.linalg.norm(restored - x.float()) / torch.linalg.norm(x.float())
+    ).item()
+    assert 0.085 < relative < 0.105, (divisor, relative)
+    assert nv.e4m3_decode(scales).max().item() <= 448.0
+
+
+def test_an_amax_over_448_scale_leaves_the_block_scale_far_from_the_cap() -> None:
+    x = _rows((512, D), seed=43)
+    scale = float(x.float().abs().max()) / 448.0
+    _, scales = nv.quantize_kv_nvfp4(x, layer_scale=scale)
+    assert nv.e4m3_decode(scales).max().item() <= 448.0 / 6.0 * (1 + 1 / 16)
+
+
+# --------------------------------------------------------------------------- #
+# The SM100/SM120 store is the specification: pin its source conventions
+# --------------------------------------------------------------------------- #
+_CSRC = Path(__file__).resolve().parents[3] / "csrc" / "libtorch_stable"
+_needs_csrc = pytest.mark.skipif(
+    not (_CSRC / "nvfp4_kv_cache_kernels.cu").is_file(),
+    reason="the csrc tree is not part of this install",
+)
+
+
+def _squash(text: str) -> str:
+    return re.sub(r"\s+", " ", text)
+
+
+@_needs_csrc
+def test_sm100_store_page_layout_and_scale_convention() -> None:
+    source = _squash((_CSRC / "nvfp4_kv_cache_kernels.cu").read_text())
+    assert "page = [K_data | K_scale | V_data | V_scale]" in source
+    # The kernel is handed 1 / k_scale and 1 / v_scale.
+    assert "1.0f / ((kv == 0) ? *k_scale_ptr : *v_scale_ptr)" in source
+    # K scales are written linearly, V scales swizzled (V100 writes both linear).
+    assert "K (kv==0): linear layout (no swizzle)" in source
+    assert "V (kv==1): swizzled layout" in source
+    # 16 values -> 8 data bytes: low word then high word of one uint64.
+    assert "(uint64_t(packed.hi) << 32) | uint64_t(packed.lo)" in source
+    assert "data_byte_offset = group_in_head * 8" in source
+
+
+@_needs_csrc
+def test_sm100_store_scale_math_and_nibble_order() -> None:
+    source = _squash((_CSRC / "quantization/fp4/nvfp4_utils.cuh").read_text())
+    assert "SFScaleVal * (vecMax * reciprocal_approximate_ftz(6.0f))" in source
+    assert "__nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue)" in source
+    assert (
+        "reciprocal_approximate_ftz( SFValue * reciprocal_approximate_ftz(SFScaleVal))"
+        in source
+    )
+    # cvt.rn.satfinite.e2m1x2 d, a, b puts a in the high nibble: the odd element
+    # is the first source operand, so the even element is the low nibble.
+    assert "cvt.rn.satfinite.e2m1x2.f32 b0, %3, %2;" in source
+    assert "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;" in source
+    assert "// maximum value of e2m1 = 6.0." in source
+
+
+@_needs_csrc
+def test_the_only_sm100_only_intrinsic_is_the_e2m1_conversion() -> None:
+    utils = (_CSRC / "quantization/fp4/nvfp4_utils.cuh").read_text()
+    # Every cvt of the store is the e2m1x2 one, with no __CUDA_ARCH__ guard, so a
+    # build for another architecture needs it replaced (e2m1_encode is the spec).
+    assert set(re.findall(r"cvt\.[a-z.0-9]+", utils)) == {"cvt.rn.satfinite.e2m1x2.f32"}
+    assert "__CUDA_ARCH__" not in utils
 
 
 def test_default_layer_scale_is_one() -> None:

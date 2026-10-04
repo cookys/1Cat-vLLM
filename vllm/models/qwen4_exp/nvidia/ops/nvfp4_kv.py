@@ -15,14 +15,22 @@ Format (one K row or one V row = ``head_size`` values of one KV head)::
     E2M1 code    -> 0, .5, 1, 1.5, 2, 3, 4, 6
     scale byte   = E4M3FN (non-negative; 0x7F/0xFF decode to NaN)
 
-    sf    = amax16 / (6 * layer_scale)         per 16-value group
-    sf_q  = E4M3(min(sf, 448))                 round-to-nearest-even
-    nib   = E2M1(clamp(x / (sf_q * layer_scale), -6, 6))
+    sf    = (1 / layer_scale) * (amax16 * fp32(1/6))   per 16-value group
+    sf_q  = E4M3(min(sf, 448))                         round-to-nearest-even
+    out   = 1 / (sf_q * layer_scale)    (0 when sf_q is 0)
+    nib   = E2M1(clamp(x * out, -6, 6))
     x_hat = E2M1(nib) * sf_q * layer_scale
 
-``layer_scale`` is the checkpoint's per-layer scalar K or V scale (the same
-scalar the E4M3 QSA cache uses). It is the "global scale" of the two-level
-NVFP4 scheme; with 1.0 the block scale alone carries the dynamic range.
+This is the operation order of upstream's SM100/SM120 store
+(``csrc/libtorch_stable/nvfp4_kv_cache_kernels.cu`` and
+``quantization/fp4/nvfp4_utils.cuh:221-285``), so the SM100 unit tests apply to
+it. ``layer_scale`` is the checkpoint's per-layer scalar K or V scale, the
+dequantization multiplier of ``reshape_and_cache_flash`` (the kernel is given
+``1 / k_scale``; the FlashInfer reader folds ``k_scale`` into ``bmm1_scale``).
+Upstream's tests use ``amax / 448`` per tensor, and the E4M3 QSA overlay scales
+are of that kind. The block scale is capped at 448, so the scale only has to
+be at least ``amax / 2688``; with 1.0 the block scale alone carries the dynamic
+range and the error is the same (see the tests).
 
 Choices that keep the later fused kernel simple:
 
@@ -46,9 +54,11 @@ Choices that keep the later fused kernel simple:
   scale byte can be an E4M3 NaN (0x7F/0xFF) and a masked-but-read NaN poisons
   the softmax-weighted sum.
 
-Everything here computes in float32 and rounds to nearest-even. The CUDA/PTX
-store of upstream uses approximate reciprocals, so a tie can differ by one code
-there; that difference is not reproducible on V100 and is not tested here.
+Everything here computes in float32 with IEEE division and rounds to nearest-even.
+The SM100 store uses ``rcp.approx.ftz.f32`` for the three reciprocals, which is
+within one ulp of the IEEE result, so a byte can differ only when an fp32
+intermediate lies within an ulp of an E4M3 or E2M1 rounding boundary. That
+residual cannot be reproduced on V100 and is not tested.
 """
 
 from __future__ import annotations
@@ -63,6 +73,8 @@ E2M1_MAX = 6.0
 E4M3_MAX = 448.0
 E4M3_MIN_SUBNORMAL = 2.0**-9
 E2M1_GRID = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+# fp32(1/6): what the GPU's rcp.approx.ftz(6.0f) returns when it rounds correctly.
+_ONE_SIXTH = torch.tensor(1.0 / 6.0, dtype=torch.float32)
 
 __all__ = [
     "E2M1_GRID",
@@ -243,11 +255,14 @@ def quantize_kv_nvfp4(
 
     groups = values.reshape(*x.shape[:-1], -1, NVFP4_KV_GROUP_SIZE)
     amax = groups.abs().amax(dim=-1)
-    block_scale = e4m3_encode(amax / (E2M1_MAX * scale))
+    # The SM100 store's order: SFScaleVal = 1 / k_scale; SFValue = SFScaleVal *
+    # (vecMax * rcp(6)); outputScale = rcp(SFValue * rcp(SFScaleVal)).
+    scale_inverse = 1.0 / scale
+    block_scale = e4m3_encode(scale_inverse * (amax * _ONE_SIXTH))
     block_value = e4m3_decode(block_scale)
     inverse = torch.where(
         block_value > 0,
-        1.0 / (block_value * scale),
+        1.0 / (block_value * (1.0 / scale_inverse)),
         torch.zeros_like(block_value),
     )
     scaled = (groups * inverse.unsqueeze(-1)).clamp(-E2M1_MAX, E2M1_MAX)
