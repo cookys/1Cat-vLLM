@@ -66,6 +66,23 @@ from ..common.qsa_cache import (
     qsa_dcp_block_geometry,
 )
 from .indexer_qsa import QSAIndexer
+from .ops.nvfp4_kv import (
+    NVFP4_KV_CACHE_DTYPE,
+    NVFP4_KV_GROUP_SIZE,
+    nvfp4_kv_row_bytes,
+)
+
+# Main K/V cache dtypes the QSA owner admits. "nvfp4" (plan 071 stage 1) is
+# admitted through the cache spec and the allocator only: the NVFP4 store and
+# attention kernels do not exist yet, so ``_run_qsa`` refuses to execute it.
+_QSA_MAIN_KV_CACHE_DTYPES = (
+    "auto",
+    "float16",
+    "bfloat16",
+    "fp8",
+    "fp8_e4m3",
+    NVFP4_KV_CACHE_DTYPE,
+)
 
 
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
@@ -187,11 +204,37 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
         "bfloat16",
         "fp8",
         "fp8_e4m3",
+        "nvfp4",
     ]
 
     @staticmethod
     def get_name() -> str:
         return "QWEN4_EXP_QSA_TRITON"
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        if cache_dtype_str == NVFP4_KV_CACHE_DTYPE:
+            if block_size % 16:
+                raise ValueError("Block size must be a multiple of 16.")
+            # Per K or V row: head_size // 2 packed bytes plus one E4M3 scale
+            # byte per 16 values (144 for head_size 256). The last dimension
+            # is the size of that pair, not a stride; see nvfp4_kv.py.
+            return (
+                num_blocks,
+                2,
+                block_size,
+                num_kv_heads,
+                nvfp4_kv_row_bytes(head_size),
+            )
+        return FlashAttentionBackend.get_kv_cache_shape(
+            num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str
+        )
 
     @staticmethod
     def get_impl_cls() -> type[Qwen4ExpQSAFlashAttentionImpl]:
@@ -228,15 +271,9 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise NotImplementedError("Qwen4Exp QSA requires FlashAttention")
         if self.dcp_world_size not in (1, 2):
             raise NotImplementedError("Qwen4Exp QSA supports DCP1 or DCP2")
-        if self.kv_cache_dtype not in (
-            "auto",
-            "float16",
-            "bfloat16",
-            "fp8",
-            "fp8_e4m3",
-        ):
+        if self.kv_cache_dtype not in _QSA_MAIN_KV_CACHE_DTYPES:
             raise NotImplementedError(
-                "Qwen4Exp QSA requires FP16/BF16 or E4M3 main KV cache"
+                "Qwen4Exp QSA requires FP16/BF16, E4M3 or NVFP4 main KV cache"
             )
         self.supports_quant_query_input = False
 
@@ -424,6 +461,52 @@ def _verify_e4m3_kv_requirements(
         raise NotImplementedError(f"QSA E4M3 cache unavailable: {reason}")
 
 
+def _verify_main_kv_storage_dtype(
+    kv_cache_dtype: str, storage_dtype: torch.dtype, model_dtype: torch.dtype
+) -> None:
+    """Unquantized main K/V must be stored in the model dtype.
+
+    E4M3 and NVFP4 store raw bytes (uint8) and carry their own decode.
+    """
+    if kv_cache_dtype in ("fp8", "fp8_e4m3", NVFP4_KV_CACHE_DTYPE):
+        return
+    if storage_dtype != model_dtype:
+        raise NotImplementedError(
+            "Qwen4Exp QSA main cache dtype must match the model dtype"
+        )
+
+
+def _verify_nvfp4_kv_requirements(
+    model_config: ModelConfig,
+    cache_config: CacheConfig,
+    head_dim: int,
+) -> None:
+    """Admit the NVFP4 main K/V cache; a no-op for every other cache dtype.
+
+    The software decode runs in the query dtype's tensor-core format, so the
+    operator capability is the E4M3 one. NVFP4 scales are per 16-value group,
+    so the head size must be a multiple of the group; a runtime scale
+    calibration pass is not supported (the per-layer scalar comes from the
+    checkpoint, or is 1.0).
+    """
+    if cache_config.cache_dtype != NVFP4_KV_CACHE_DTYPE:
+        return
+    if head_dim <= 0 or head_dim % NVFP4_KV_GROUP_SIZE:
+        raise NotImplementedError(
+            f"QSA NVFP4 cache unavailable: head size {head_dim} is not a "
+            f"multiple of {NVFP4_KV_GROUP_SIZE}"
+        )
+    if getattr(cache_config, "calculate_kv_scales", False):
+        raise ValueError(
+            "QSA NVFP4 forbids calculate_kv_scales; the per-layer scale is "
+            "taken from the checkpoint"
+        )
+    from .ops.qsa import qsa_e4m3_capability_reason
+
+    if reason := qsa_e4m3_capability_reason(model_config.dtype):
+        raise NotImplementedError(f"QSA NVFP4 cache unavailable: {reason}")
+
+
 class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
     """Merged Qwen full-attention owner with a QSA index side branch."""
 
@@ -454,15 +537,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             raise ValueError("Qwen4Exp QSA requires a paged KV cache")
         if model_config.dtype not in (torch.float16, torch.bfloat16):
             raise NotImplementedError("Qwen4Exp QSA requires FP16 or BF16")
-        if cache_config.cache_dtype not in (
-            "auto",
-            "float16",
-            "bfloat16",
-            "fp8",
-            "fp8_e4m3",
-        ):
+        if cache_config.cache_dtype not in _QSA_MAIN_KV_CACHE_DTYPES:
             raise NotImplementedError(
-                "Qwen4Exp QSA requires FP16/BF16 or E4M3 main KV cache"
+                "Qwen4Exp QSA requires FP16/BF16, E4M3 or NVFP4 main KV cache"
             )
         _verify_e4m3_kv_requirements(vllm_config, model_config, cache_config)
         if getattr(quant_config, "kv_cache_scheme", None) is not None:
@@ -492,6 +569,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             raise ValueError("TP size must be divisible by replicated QSA KV heads")
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
         self.head_dim = int(config.head_dim or self.hidden_size // self.num_heads)
+        _verify_nvfp4_kv_requirements(model_config, cache_config, self.head_dim)
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
@@ -575,12 +653,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, model_config
         )
-        if self.kv_cache_dtype not in ("fp8", "fp8_e4m3") and (
-            self.kv_cache_torch_dtype != model_config.dtype
-        ):
-            raise NotImplementedError(
-                "Qwen4Exp QSA main cache dtype must match the model dtype"
-            )
+        _verify_main_kv_storage_dtype(
+            self.kv_cache_dtype, self.kv_cache_torch_dtype, model_config.dtype
+        )
         self.kv_sharing_target_layer_name = None
         self.kv_cache = torch.tensor([])
         set_default_quant_scales(self, register_buffer=True)
@@ -758,6 +833,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         if not self._qsa_kv_scales_finalized:
             raise RuntimeError(
                 f"QSA E4M3 scales were not finalized for {self.layer_name}"
+            )
+        if self.kv_cache_dtype == NVFP4_KV_CACHE_DTYPE:
+            raise NotImplementedError(
+                "QSA NVFP4 KV cache: the store and attention kernels are not "
+                "implemented yet; only the cache spec and the allocator "
+                "admit it (plan 071 stage 1)"
             )
         metadata = get_forward_context().attn_metadata
         if isinstance(metadata, list):
