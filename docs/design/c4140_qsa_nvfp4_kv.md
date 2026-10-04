@@ -493,3 +493,22 @@ llm-playground 的 `scripts/eval/kv-logprob-probe.py capture --backend vllm`，�
 10. store 的 K、V 各一次啟動的實際成本，以及 `rows` 大時的 grid 形狀，沒有量。
 11. `ops/qsa.py` 的內核簽名多了一個 constexpr。8 個既有組態的 PTX 在去掉行號後沒變，但服務重啟後仍應照
     `notes/methodology/serving-determinism-floor.md` 跑 12 案 parity。
+
+## 2026-10-05 GPU 實測結果（GPU results：chain19 與 ABBA 窗）
+
+取代文首與上一節第 1 點「沒有在任何 GPU 上跑過」的說法。tip `5db3e49b4`（相對 chain19 用的 `367094a11` 只多了 page4 plan 測試 fixture 的 import 修正）；
+no-MTP、`--max-model-len 131072`、推測解碼關。判讀、原始檔路徑與閘門表在 llm-playground 的 `doc/plan/071-c4140-qsa-nvfp4-kv.md`（§3 預算 (d)、§4、§5、§8）。
+
+- **kernel 自檢**：00:51 `SELF_CHECK: PASS`（7 個正向 PASS、8 個負向 FLAGGED、8 個階段 RAN）。
+- **既有 GPU 測試**：PASS 附一個保留。`test_qsa_reference` 41 passed、3 failed，這 3 個在 base（`c4140-p070` @`1b5731f90`）上相同；`qsa_cache.py` 與該測試檔在 p070..p071 之間沒有改動，是既有問題，不是回歸。
+  `test_qsa_e4m3` 9、`test_e4m3_mtp_gpu` 7、`test_e4m3_mtp_capture_gpu` 3、`test_qsa_dcp_attention` 4、`test_qsa_dcp_packed_cache` 2 全過。
+  `test_sm70_qsa_page4_plan` 原本 38 skipped（fixture import），`5db3e49b4` 修好後 03:39 重跑 **38 passed、0 skipped**。
+- **容量**：同一個預算 5.54 GiB/rank、131K：E4M3 772,338 tokens、NVFP4-A 1,161,251 tokens，**×1.5036**（位元組比是 1.778，差距來自 GDN state 的固定 ID）。
+  serve log 與 `nvfp4-kv-capacity.py` 的輸出逐位相同，真 allocator 的 CPU 模型第一次在 NVFP4 格式本身上被 GPU 驗證。
+- **prefill**（`prefill-probe.py`，冷、每個長度 2 次取第 2 次）：nvfp4 ÷ fp8_e4m3 = **0.435**（16K：2,424 對 5,567 tok/s）、**0.459**（64K：2,456 對 5,351 tok/s）。上 production 要 ≥ 90%，M1 預期內不過。
+- **decode**（ABBA，4 個 fresh cell，每個 `GRAPH … FULL`，downgrade 0、skip 0）：nvfp4 − fp8_e4m3 = **+0.898 ms/round（約 +0.90，+7.87% 對 no-MTP 的約 11.4 ms）**；
+  11 個 shape 各自 +0.895…+0.921 ms，1K 到 64K 持平，所以是每步固定成本（gather 加小 kernel），不是 KV 頻寬；約 75 µs/QSA 層。
+  自檢 harness 的 699 µs/層含每次 launch 延遲，graph replay 下大半消失（推論，未用 profiler）。閘門 4 的 decode 判 FAIL（容許約 +0.04 ms），M1 預期內。M=5（MTP4 verify）沒量。
+- **品質探針**（對 fp16，視窗平均 ΔNLL，nats/token，30 窗）：8K −0.00005 [−0.01048, +0.00789]、32K −0.00307 [−0.01155, +0.00394]，**PASS**（≤ +0.01）。
+  首 chunk（2K）+0.0213 [−0.0043, +0.0509]，E4M3 對照臂也有 +0.0182 [+0.0014, +0.0369]，**未決**：量化 KV 在第一個 chunk 內先寫後讀是兩種格式共同的懲罰，16 窗解不開兩者之差（plan 071 §5）。
+- **結論**：融合 reader（步驟 C）是下一個里程碑，prefill 與 decode 都要它（gather 加 FP16 reader 的路徑過不了閘門 4）；M2（MTP4 draft）排在它之後；3-bit（TQ3／TQ3.5）依 plan 071 §5.1 的規則**不排**。
