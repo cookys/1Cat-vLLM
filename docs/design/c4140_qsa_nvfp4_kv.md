@@ -1,8 +1,10 @@
 # C4140 plan 071：QSA main K/V 的 NVFP4 KV cache（階段 1，僅 CPU）
 
 基底 `c4140-p070`（`1b5731f90`）。階段 1 做參考實作、dtype 准入、cache spec 與 allocator 推導；
-之後依序接上 global scale（步驟 A）、Triton store 與呼叫點契約（步驟 B），並記錄編譯路徑與 reader 計畫（步驟 C）。
-還沒有 attention reader，所以 `--kv-cache-dtype nvfp4` 在 `_run_qsa` 仍明確拒絕執行。
+之後依序接上 global scale（步驟 A）、Triton store 與呼叫點契約（步驟 B），並記錄編譯路徑與 reader 計畫（步驟 C）；
+步驟 D 把 reader 接進稀疏注意力（先 gather 再走 FP16），步驟 E 是單 GPU 的內核數值與計時腳本。
+`--kv-cache-dtype nvfp4` 現在在沒有 DCP2、沒有 MTP draft 的設定下可以執行，但**沒有在任何 GPU 上跑過**：
+證據只有直譯器測試與 sm_70 編譯閘門。
 
 ## 已定決策（Fable）
 
@@ -152,7 +154,9 @@ Fable 在 GPU 上驗證五個開關全關後，預期 pool 回到約 411K 到 41
 | global scale 接線：載入、次正規數守衛、`nvfp4` 不要求校準 | `qsa.py`、`model.py`、`nvfp4_kv.py` |
 | Triton fused unpack+scale gather（直譯器逐位元等於參考） | `nvidia/ops/nvfp4_kv_triton.py` |
 | Triton store（量化、打包、寫 scale）與 `do_kv_cache_update` 契約（直譯器逐位元組等於參考 writer） | `nvfp4_kv_triton.py`、`qsa.py` |
-| sm_70 編譯閘門：不需 GPU，檢查 PTX 與暫存器 | `tests/models/qwen4_exp/test_nvfp4_kv_sm70_compile.py` |
+| sm_70 編譯閘門：不需 GPU，檢查 PTX 與暫存器，含步驟 D 的 split-K 與 merge 內核 | `tests/models/qwen4_exp/test_nvfp4_kv_sm70_compile.py` |
+| reader：gather 後走 FP16 split-K，layer scale 以 `FOLD_SCALES` 折疊，放行三道門，保留 DCP2 與 MTP draft 的拒絕 | `ops/qsa_nvfp4.py`、`ops/qsa.py`、`qsa.py` |
+| 單 GPU 的內核數值與計時腳本（未執行）與它的 CPU 測試 | `benchmarks/sm70_nvfp4_kv_kernel_check.py`、`tests/models/qwen4_exp/test_sm70_nvfp4_kv_kernel_check_cpu.py` |
 
 放在 `nvidia/ops/` 與 `qsa.py`、`qsa_kv_calibration.py` 並列，後續 kernel 從這裡取格式常數；
 `nvfp4_kv_cache_full_dim` 與 `nvfp4_kv_cache_split_views` 留在 upstream 的 `utils/torch_utils.py`，只匯入不修改。
@@ -170,9 +174,11 @@ Fable 在 GPU 上驗證五個開關全關後，預期 pool 回到約 411K 到 41
 
 ```text
 CUDA_VISIBLE_DEVICES= PYTHONPATH=$PWD uv run --no-project --python /data/venvs/1cat-p070/bin/python \
-  --with pytest -- python -m pytest --noconftest tests/models/qwen4_exp/test_nvfp4_kv_{reference,admission,scale,triton,store,sm70_compile}.py -q
-275 passed, 51 skipped   # 參考 123、准入與 spec 與 allocator 65、scale 66、編譯閘門 21；Triton gather 19 與 store 32 預設略過
-TRITON_INTERPRET=1 同上   # 305 passed, 21 skipped；編譯閘門需要真的編譯器，直譯器下略過
+  --with pytest -- python -m pytest --noconftest \
+  tests/models/qwen4_exp/test_nvfp4_kv_{reference,admission,scale,triton,store,decode,sm70_compile}.py \
+  tests/models/qwen4_exp/test_sm70_nvfp4_kv_kernel_check_cpu.py -q
+326 passed, 83 skipped   # 參考 129、准入與 spec 與 allocator 65、scale 66、編譯閘門 27、步驟 E 腳本 39；Triton gather 19、store 31、decode 32 與腳本的 1 個端到端預設略過
+TRITON_INTERPRET=1 同上   # 382 passed, 27 skipped；編譯閘門需要真的編譯器，直譯器下略過
 ```
 
 - 參考測試含「SM100 約定釘選」：讀 `csrc` 原始碼字串，斷言頁版面、`1/k_scale`、scale 運算順序、
@@ -185,14 +191,36 @@ TRITON_INTERPRET=1 同上   # 305 passed, 21 skipped；編譯閘門需要真的�
   輸入驗證，以及兩個內核內編碼器對 torch 在每個 tie 與每個 fp16 值上的窮舉。
   突變檢查：換 nibble 順序 17 個失敗、拿掉 tie 規則 13 個失敗、拿掉資料寫入的遮罩使行程崩潰、
   改成 `amax/6` 的運算順序 2 個失敗、輸出 scale 用錯 3 個失敗。
-- 編譯閘門（21 個）：Triton 3.6.0 內附的 ptxas 對 sm_70 編 store 與 gather，斷言目標 sm_70、PTX 無 bf16 或 fp8 轉換、
-  無 e2m1、wgmma、`cp.async`、新架構 mma，store 無 atomic，暫存器不超過 64 且不溢出到 local memory。
-  把 store 的 block scale 改成原生 fp8 轉換會讓 13 個失敗。它只證明能編譯、資源小，不證明能跑或跑多快。
+- 編譯閘門（27 個）：Triton 3.6.0 內附的 ptxas 對 sm_70 編 store、gather，以及步驟 D 的 split-K 與 merge 內核，
+  斷言目標 sm_70、PTX 無 bf16 或 fp8 轉換、無 e2m1、wgmma、`cp.async`、新架構 mma，store 無 atomic；
+  store 與 gather 暫存器不超過 64、stack 不超過 16 B，gathered 路徑的 split-K 在 2 與 4 個 warp 都沒有 stack。
+  把 store 的 block scale 改成原生 fp8 轉換會讓 13 個失敗；讓 split-K 內核不折疊 scale 會讓折疊檢查失敗。
+  它只證明能編譯、資源小，不證明能跑或跑多快。先前這一條寫「不溢出到 local memory」不精確：store 在 1 與 2 個 warp 有
+  8 B 的 stack，閘門現在同時檢查 stack 與 local。
+- decode 測試（32 個，直譯器）：NVFP4 路徑對「同一個 FP16 內核跑在解碼後的 FP16 cache」逐位元相等（TP4 形狀、
+  單 tile 不經 merge、兩個 KV head）；非法 top-k 項（負值、超出 table、未映射頁、越界 block、不存在的 request）、cache 中
+  被 NaN scale 毒化卻只被遮掉的 block、每頁首尾 token、共用頁與重複 token 的混合批次，都與 FP16 路徑相等；
+  2 的冪次 layer scale 對「預先縮放的 FP16 K、V」逐位元相等（釘住 k_scale 乘在分數、v_scale 乘在輸出），
+  單 split 與多 split 兩個分支各一；一般 layer scale 對 FP32 注意力用 rtol 3e-2 比對（FP16 機率與輸出捨入的量級）；
+  gate 與 lse 輸出、列分組、page4 路由不會被呼叫、入口驗證、`forward_qsa` 的 nvfp4 路徑與它的拒絕、MTP draft 拒絕、
+  halves 版 gather 等於 5 維版。Triton 直譯器跑不動現行 merge 內核（對純量與區塊做 `&`，編譯後沒有問題），
+  所以 CPU 上 split 數大於 1 的測試用一個算術相同的 torch 函式取代它，兩邊比對都用同一個；真的 merge 內核搭
+  `FOLD_SCALES=True` 只由編譯閘門與步驟 E 的 GPU 腳本涵蓋。
+  突變檢查（在 production 程式碼上）：不遮非法項 3 個失敗、K 與 V scale 對調 4、不折疊 scale 4、K 的折疊用了 V 的 scale 4、
+  validity 少了物理 block 上界 1、分組時用了全部 request 2、拿掉 forward_qsa 的 DCP 拒絕 1；
+  內核裡 V scale 不折疊一開始沒有被抓到（31 個全過），原因是單 split 分支沒有非 1 純量的測試，補上後 2 個失敗。
+- 既有內核沒有被改動的證據：把 split-K（E4M3 與 FP16，三種 tile 與 warp 組合）與 merge（E4M3 與 FP16）共 8 個既有組態
+  編到 sm_70，去掉原始碼行號資訊後的 PTX 在修改前後逐位元相同。
+- 步驟 E 腳本的 CPU 測試（40 個）：參數、從真實 config 讀出的幾何、case 與 cache 規劃、種子化的 K/V 與含非法項的 top-k
+  （非法位置的預期與 `nvfp4_entry_validity` 逐項一致）、位元組比對、誤差與計時統計、ABBA 順序、verdict 與結束碼、
+  沒有 CUDA 與 GPU 已被佔用時的快速失敗；直譯器下另有一個小 case 從 store 到計時完整跑一遍。
 - worktree 內 `vllm/*.so` 與 `_version.py` 是指向 `/data/venvs/1cat-p070` 的符號連結（已被 git 忽略，沒有建置），
   讓 worktree 的原始碼能載入 `vllm._C`；沒有修改任何 venv。
 - 沒有可見 GPU 時，匯入 `qsa.py` 會因 `flash_attn.py` 向 GPU 詢問 FlashAttention 版本而失敗；
   相關測試檔在 `torch.cuda.is_available()` 為假時用 FA2 的答案取代（Volta 本來就是 FA2）。
-- `test_config.py` 的 4 個失敗在 `c4140-p070` 本來就失敗，與本案無關。
+- 鄰近測試（QSA 快取、E4M3、DCP、page4、hybrid block、auto E4M3 policy、kv cache utils、既有的 sparse 內核測試）：
+  216 passed、30 skipped；失敗的 26 個是沒有 CUDA 時才失敗的 GPU 測試（`test_qsa_reference.py` 等，它們也涵蓋被改動的 sparse 內核，要在 GPU 上跑），
+  2 個錯誤是 `--noconftest` 下找不到 fixture；`test_config.py` 的 4 個失敗在 `c4140-p070` 本來就失敗，與本案無關。
 - 提交使用 `--no-verify`：共用的 `.git/hooks` 被裝上 pre-commit，首次執行要下載全部工具環境而卡住。
   改為直接跑 ruff 0.14.0 的 `check` 與 `format`、typos、markdownlint-cli2 0.21.0，以及 `tools/pre_commit` 內的
   spdx、forbidden-imports、torch-cuda、boolean-context-manager、lazy-imports、env-registration 腳本。mypy 未跑。
@@ -209,12 +237,18 @@ E4M3 那三列的 constexpr 是照內核簽名手動填的（TOPK 2051、PAGE_SI
 | NVFP4 store，head 256，fp16 輸入 | 1／2／4 | 40／28／24 | 8／8／0 B | 128／128／256 B |
 | NVFP4 store，head 256，bf16 輸入 | 1 | 38 | 8 B | 128 B |
 | NVFP4 gather，head 256 | 1／2／4 | 64／32／30 | 0 | 0 |
-| 現行 E4M3 split-K，BLOCK_N 16 | 4 | 241 | 0 | 24,576 B |
-| 現行 E4M3 split-K，BLOCK_N 16 | 2 | 255 | 288 B | 24,576 B |
-| 現行 E4M3 split-K，BLOCK_N 64 | 2 | 32 | 9,232 B | 73,728 B |
+| 現行 E4M3 split-K，BLOCK_N 16，64 splits | 4 | 243 | 0 | 24,576 B |
+| 現行 E4M3 split-K，BLOCK_N 16，64 splits | 2 | 255 | 304 B | 24,576 B |
+| 現行 E4M3 split-K，BLOCK_N 64，4 splits | 2 | 32 | 9,232 B | 73,728 B |
+| 步驟 D 的 FP16 split-K（gather 之後），BLOCK_N 16，64 splits | 4 | 166 | 0 | 24,576 B |
+| 步驟 D 的 FP16 split-K（gather 之後），BLOCK_N 16，64 splits | 2 | 255 | 0 | 24,576 B |
+| merge 內核，有無折疊 scale 相同 | 2 | 255 | 72 B | 256 B |
 
 store 與 gather 都不需要 shared memory 的調校，一個 warp 就夠；它們不是瓶頸候選。
-reader 才是：E4M3 split-K 在最好的 profile 已用 241 個暫存器，2 個 warp 就溢出。
+reader 才是：E4M3 split-K 在 4 個 warp 已用 243 個暫存器，2 個 warp 用滿 255 個並溢出 304 B。
+步驟 D 的路徑在內核裡讀的是 FP16，沒有解碼，4 個 warp 只要 166 個暫存器，2 個 warp 用滿 255 個但沒有 stack；
+V100 上 TP4 的 decode 用 2 個 warp（`_use_sm70_qsa_two_warp_partial`），所以這是比 E4M3 好的一面。
+前面三列 E4M3 的 split 數與先前版本不同（先前是 8，這裡是 decode 實際用的 64），所以數字有些許差異。
 
 ### decode 的融合 reader 需要什麼
 
@@ -258,6 +292,10 @@ NVFP4 的末維是 144 所以被擋；`qsa_sparse_paged_attention` 對 dtype 字
 | b | 先解碼成 fp16 scratch，再用現成的 FP16 page4 CUDA 路由 | gather 內核已逐位元正確。scratch 每個選中 token 1,024 B（K 與 V 各 fp16 512 B），而儲存是 288 B。依列逐一展開不可行：16 列 33.6 MB、64 列 134 MB、2048 列 4.3 GB。要依 page 去重：不重複 token 最多 `min(rows×2051, context+rows)`，64K context 約 64 MiB，262K 約 256 MiB，對 p070 每 rank 約 2.1 GiB 的 KV 預算不是小數。XQA page4 已有壓縮 page 索引（`_qsa_xqa_page4_block_table`），可借其表重映射 |
 | c | 在 `flash-attention-v100/kernel/flash_decode_paged.cu` 加 NVFP4 的 CUDA reader | 仿 E4M3 分支（`KV_DTYPE == KV_CACHE_DTYPE_FP8_E4M3`，`:809-909`；`fp8_kv_utils.cuh`；grouped page4 ABI v2 已帶 `kv_cache_dtype` 與 scale）。需要建置 flash_attn_v100 擴充，不能在純 CPU 階段做 |
 
+**步驟 D 落地的是選項 b 的 Triton 變體**：所有列數走同一條路，gather 到 FP16 後用現成的 Triton FP16 split-K，不經任何
+CUDA page4 路由；沒有跨列的 page 去重，改成把列分組，每組的 gather 暫存不超過 64 MiB（head 256、top-k 2051 時 31 列）。
+decode 的 M5 與 M1 都在一組內；prefill 的列數大時逐組處理，預期明顯慢於 E4M3 的 CUDA page4，沒有量。
+
 建議：先 a（decode 與 prefill 一起），量 prefill 對 E4M3 CUDA page4 的差距；只有 a 大幅落後且列數大於 16 的流量佔多數時才做 b；
 團隊並發（約 20 人、256K context）若 prefill 成為瓶頸才投資 c。
 
@@ -274,6 +312,83 @@ NVFP4 的末維是 144 所以被擋；`qsa_sparse_paged_attention` 對 dtype 字
 | 里程碑 2：draft 也用 NVFP4 | 約 1 天 | 是 |
 
 合計單人約 1.5 到 2 週，其中約 1 週要占 GPU。
+
+## 步驟 D：reader 接進稀疏注意力，先 gather 再走 FP16
+
+沒有發現設計衝突：gather 出來的 FP16 張量可以直接當成分頁 cache 餵給現成的內核而不複製；K 與 V 的 layer scale 折疊位置
+不同（K 乘在分數、V 乘在輸出），但參考把兩者都吸收進 `layer_scale` 後相乘，數學等價，差只在捨入，測試把兩種差異分開驗。
+
+### 資料流
+
+`qsa_sparse_paged_attention`（`ops/qsa.py:2403`）對 `kv_cache_dtype == "nvfp4"` 轉給 `qsa_sparse_attention_nvfp4`
+（`ops/qsa_nvfp4.py:65`）。對每一組列：
+
+1. `gather_dequant_nvfp4_sides_triton`（`nvfp4_kv_triton.py:227`）把每列選中的 token 解碼成 FP16，不乘 layer scale。
+   這一步是精確的（步驟 C）。它收 cache 的兩個半邊，也就是 `forward_qsa` 從 `unbind(1)` 拿到的那兩個 4 維 view。
+2. `nvfp4_entry_validity`（`nvfp4_kv.py:401`）算出內核會遮掉的位置；參考 gather 現在也呼叫它，所以規則只有一份定義。
+3. 現成的 FP16 split-K 與 merge 內核照舊執行。gather 出來的 `[rows, topk, heads, 256]` 當成 `rows` 頁、每頁 `topk` 個
+   token 的 cache：第 r 列是 request r，它的 block table 是單一頁 r，選中的第 c 項就是 token c，要遮掉的項設成 -1。
+   沒有複製，內核本體逐行不變。
+4. layer scale 照 E4M3 折疊：`k_scale` 乘在 QK 分數上，`v_scale` 乘在正規化後的輸出上，各一次、FP32。內核與 merge 內核
+   的條件從 `KV_E4M3` 改成新的 constexpr `FOLD_SCALES`（`ops/qsa.py:695`、`:786`、`:892`）；解碼仍只在 `KV_E4M3` 下。
+   既有路徑傳 `FOLD_SCALES == KV_E4M3`，PTX 不變（見測試）。
+
+### 三道門怎麼放行
+
+| 門 | 之前 | 現在 |
+|---|---|---|
+| `_run_qsa` 的 `NotImplementedError`（`qsa.py:930`） | 一律拒絕 nvfp4 | 只拒絕 DCP 分片的 cache |
+| ops 入口對 dtype 字串 `nvfp4` 的 `ValueError`（`ops/qsa.py:2334`） | nvfp4 不在清單內 | nvfp4 分支：FP16 query、uint8 儲存、head size 是 16 的倍數、scale 有限為正；head size 由列位元組數 `×16/9` 還原 |
+| `forward_qsa` 的 storage dtype `RuntimeError`（`qsa.py:381`） | uint8 與 query dtype 不同就拋 | nvfp4 分支：uint8、FP16 query、DCP 分片拒絕 |
+| MTP draft | 沒有 | `_verify_nvfp4_kv_speculation`（`qsa.py:545`，owner 初始化時呼叫 `:658`）：有 speculative 設定就 `NotImplementedError` |
+| page4 CUDA | 形狀檢查（末維 144）擋住 | nvfp4 分支在到達 page4 閘門前就回傳；gathered 的 FP16 呼叫另外明確排除 page4；測試把三個 page4 函式換成會拋例外的版本來證明沒呼叫 |
+
+### 限制與成本
+
+- `qsa_sparse_paged_attention` 的入口現在在 `TRITON_INTERPRET=1` 時也接受 CPU 張量（`ops/qsa.py:34`、`:2306`），只供測試；
+  CUDA 張量的行為不變。
+- 每次呼叫多寫再多讀 1,024 B/token 的 FP16 暫存，而融合 reader 只讀 288 B/token：M5 時各 10.5 MB 對 2.95 MB。
+  以 900 GB/s 粗估每層約 23 µs 的暫存流量，12 個 QSA 層約 0.28 ms；這是算術估計，不是量測，不含 cache 命中。
+  另有十幾個小的 torch 運算（validity）。
+- 分組：`NVFP4_GATHER_SCRATCH_BYTES`（64 MiB）；列數不大於 8 時分組不改變結果，列數更大時 launch profile 可能不同，
+  只有容差意義上的相等。
+
+### 融合 reader：之後的最佳化，這次不建
+
+結構已在步驟 C 寫出（`KV_NVFP4` constexpr 分支、偶奇兩塊 tile、fp16 精確解碼、scale 位置同 E4M3）。相對於步驟 D 的差別：
+省掉 1 KiB/token 的暫存寫讀與十幾個 torch 運算，少一次啟動；代價是 QK 變成兩段 K=128 的部分和，與 D 的路徑不再逐位元相同，
+所以 D 是它的正確性基準，容許差距要用 `kv-logprob-probe` 對重跑組定。先決條件：步驟 E 在 GPU 上跑完，量到 gather 與 validity 在
+decode round-trip 裡佔多少；佔比小就不值得做。
+
+## 步驟 E：單 GPU 的內核數值與計時腳本
+
+`benchmarks/sm70_nvfp4_kv_kernel_check.py`，結構仿 `sm70_ple_conv_cudnn_memory_check.py` 與
+`sm70_gemm_alignment_memory_check.py`（在 `/data/src/1cat-wt-fable`）。**沒有執行過**。它做的事：
+
+1. 真實幾何（從 `--config` 讀，TP4 為 head 256、6 個 query head、1 個 KV head、top-k 2051），NVFP4 block 2784 與 2864，
+   E4M3 對照 block 1616，列數 1 與 5，每個 request 8192 個 token，K/V 與 top-k 都以種子產生。
+2. store：Triton store 對參考 writer，data 與 scale 位元組分開比；E4M3 對照用 `reshape_and_cache_flash`。
+3. gather：Triton gather 對 CPU 參考，用參考 cache 的位元組以免 store 的差異遮住它；top-k 含非法項。
+4. decode：NVFP4 路徑對「FP16 內核跑在解碼後的 cache」在單位 scale 下逐位元比（路徑一致性）；真實 layer scale 下對未量化 FP16
+   的 max |d|、mean |d| 與 relative L2；同樣的流程跑 E4M3 作為對照。
+5. 計時：CUDA events，ABBA 交錯，store、gather、整條 NVFP4 decode、gather 之後的 FP16 內核、E4M3 decode。
+
+印出：`STORE_MATCHES_REFERENCE`、`GATHER_MATCHES_REFERENCE`、`ZERO_FILL_OK`、`DECODE_PATH_IDENTICAL`（YES、NO 或 UNKNOWN，NO 附證據）、
+`DECODE_VS_FP16`、`E4M3_CONTROL`、`NVFP4_VS_E4M3_REL_L2`、`TIMING_US`、`DECODE_ROUNDTRIP_US`。`--out` 寫 JSON。
+結束碼：0 乾淨跑完（不論 verdict），2 沒有 CUDA、GPU 已被佔用或參數不可用，1 有 case 丟例外。
+
+GPU 操作員要跑的：
+
+```text
+cd <worktree> && CUDA_VISIBLE_DEVICES=<idle gpu> PYTHONPATH=$PWD \
+    /data/venvs/1cat-p070/bin/python benchmarks/sm70_nvfp4_kv_kernel_check.py \
+    --out /data/bench/nvfp4_kv_kernel_check.json
+```
+
+回傳 stdout 與 JSON。看 `SOURCE` 三行確認匯入的是對的樹。**這台機器現在沒有閒置的 GPU**：四張都占約 31.5 GiB，使用率 61% 到 87%
+（`nvidia-smi`，2026-10-04）。腳本在 GPU 已占用超過 1 GiB 時拒絕執行（結束碼 2），不要對服務正在用的 GPU 加 `--allow-busy`：
+它會拿走服務的剩餘記憶體。`STORE_MATCHES_REFERENCE` 在 GPU 上為 NO 時先看差異是否只在 scale 位元組、是否在捨入平手點：
+Triton 的 fp32 除法不一定是 IEEE，參考用的是 IEEE 除法。
 
 ## 品質驗證：SGLang 的證據不是 1Cat 的上界
 
@@ -299,11 +414,18 @@ SGLang 的第一個 4096-token prefill chunk 內，位置從不讀 pooled KV，�
 
 ## 未完成與開放問題
 
-1. 沒有 attention reader。`_run_qsa` 拒絕執行，page4、ops 入口、`forward_qsa` 另有三層擋下，reader 上線時要逐層放行並補明確的 `kv_cache_dtype` 守衛。
-2. Triton store 與 gather 只在直譯器跑過；sm_70 只證明能編譯、資源小，沒有在 V100 執行，沒有速度。
-   store 的捨入平手無法與 SM100 的 PTX 對拍。
-3. 融合 reader 的 QK 是兩段部分和，與 gather 加 FP16 的路徑不會逐位元相同；可接受的差距要用 `kv-logprob-probe` 對重跑組定，不能用 SWE-34。
-4. draft 的 scale 載入對 nvfp4 只由 `model.py` 的旗標放行，沒有 draft 實測，里程碑 2 要驗。
-5. 首個 prefill chunk 也讀量化 KV（QSA 先寫後讀），SGLang 的 ΔNLL 證據不能當上界；驗證計畫見上一節。
-6. packed 頁在 DCP1 下與 `KVBlockZeroer`、offload 的互動沒有驗證；測試只涵蓋 member view 的寫入不碰鄰居。
-7. store 的 K、V 各一次啟動的實際成本，以及 `rows` 大時的 grid 形狀，沒有量。
+1. 整條 NVFP4 路徑沒有在 V100 上執行過。Triton store、gather 與 gather 後的 FP16 路徑只在直譯器與 sm_70 編譯閘門驗證過；
+   GPU 腳本（步驟 E）寫好但未執行，本機四張 GPU 都被服務占住。
+2. 沒有放行的：page4 CUDA（目前也不會被呼叫）、DCP2、MTP draft，各有明確的 `NotImplementedError`。
+3. store 的捨入平手無法與 PTX 對拍；GPU 上 `1.0 / x` 用的除法沒驗證，`STORE_MATCHES_REFERENCE` 會第一個告訴我們。
+4. 現行 merge 內核在 Triton 直譯器跑不動，CPU 測試用 torch 替身；真的 merge 內核搭 `FOLD_SCALES=True` 只由編譯閘門與 GPU 腳本涵蓋。
+5. gather 路徑的成本沒量：每次呼叫寫再讀 1 KiB/token 的暫存與十幾個小的 torch 運算；prefill 逐組處理，預期明顯慢於 E4M3 的
+   CUDA page4。
+6. 融合 reader（之後的最佳化）以 gather 路徑為正確性基準，QK 兩段部分和與它不逐位元相同；容許差距要用 `kv-logprob-probe`
+   對重跑組定，不能用 SWE-34。
+7. draft 的 scale 載入對 nvfp4 只由 `model.py` 的旗標放行，沒有 draft 實測，里程碑 2 要驗。
+8. 首個 prefill chunk 也讀量化 KV（QSA 先寫後讀），SGLang 的 ΔNLL 證據不能當上界；驗證計畫見上一節。
+9. packed 頁在 DCP1 下與 `KVBlockZeroer`、offload 的互動沒有驗證；測試只涵蓋 member view 的寫入不碰鄰居。
+10. store 的 K、V 各一次啟動的實際成本，以及 `rows` 大時的 grid 形狀，沒有量。
+11. `ops/qsa.py` 的內核簽名多了一個 constexpr。8 個既有組態的 PTX 在去掉行號後沒變，但服務重啟後仍應照
+    `notes/methodology/serving-determinism-floor.md` 跑 12 案 parity。
