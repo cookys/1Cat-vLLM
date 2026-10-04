@@ -42,6 +42,21 @@ The chain, per case (one NVFP4 or E4M3 block size and one row count):
    cache, and the E4M3 decode, for each row count (default 1 and 5, the decode
    steps of a plain and an MTP4 target).
 
+5. The fused reader (``--arms gather fused``, the default; ``--arms gather`` skips it).
+   ``qsa_sparse_paged_attention(kv_cache_dtype="nvfp4", nvfp4_fused_reader=True)``
+   decodes the packed pages inside the split-K kernel (``KV_NVFP4``) instead of
+   gathering them to FP16 first. Its QK is two K = 128 dots, so it is NOT bit-equal to
+   the gather route: ``FUSED_MATCHES_GATHER`` accepts a relative L2 of at most
+   ``FUSED_REL_L2_TOLERANCE`` (FP16 output rounding level) against the gather route,
+   on the clean selection at the realistic layer scales and on the selection with
+   illegal entries at unit scales (illegal rows and empty rows must be exact zeros).
+   Lines: ``FUSED_VS_GATHER <case>`` (max, mean, relL2), ``FUSED_VS_FP16 <case>`` (the
+   quantization error of the fused route against the unquantized K/V, next to
+   ``DECODE_VS_FP16``) and ``FUSED_ROUNDTRIP_US`` (per-launch time of the fused
+   decode over the gather decode and the E4M3 decode). The two mutated caches must also
+   be FLAGGED through the fused route (``<mutation> fused_decode``). The timed arm is
+   ``decode_fused_nvfp4_B<block>``.
+
 Geometry. Read from ``--config`` for ``--tp`` ranks, as the engine builds it: head
 size, query heads per rank, KV heads per rank (replicated below the TP size),
 selection width ``indexer_budget + indexer_compress_ratio - 1``. The production
@@ -55,6 +70,7 @@ Verdict printed on stdout:
     GATHER_MATCHES_REFERENCE: YES/NO         FP16 outputs equal, every NVFP4 case
     ZERO_FILL_OK: YES/NO                     illegal entries are exact zeros
     DECODE_PATH_IDENTICAL: YES/NO            unit scales: NVFP4 route == FP16 kernel
+    FUSED_MATCHES_GATHER: YES/NO/UNKNOWN     fused reader within tolerance of gather
     DECODE_VS_FP16 <case>: max|d| .. mean|d| .. relL2 ..
     E4M3_CONTROL <case>: max|d| .. mean|d| .. relL2 ..
     NVFP4_VS_E4M3_REL_L2 M=<rows>: <ratio>   NVFP4 error over E4M3 error
@@ -146,6 +162,12 @@ DEFAULT_V_SCALE = 0.0404924675822258
 # the E4M3 maximum (amax / 6 / layer_scale <= 448 needs amax <= 53.7).
 MAX_ABS_VALUE = 40.0
 E4M3_MAX = 448.0
+# The fused reader sums QK as two K = 128 dots, so against the gather route it is
+# equal only up to FP32 summation order and the FP16 rounding of the output: relative
+# L2 of about 3e-4 is the rounding level (2**-11 per element); 2e-3 leaves a margin
+# and still fails a wrong nibble, scale or layer-scale placement (those are O(0.1..1)).
+FUSED_REL_L2_TOLERANCE = 2e-3
+ARMS = ("gather", "fused")
 RESULT_KEYS = ("store", "gather", "zero_fill", "decode_path", "decode_quality")
 # The measured attention error must lie within this factor of the CPU model's.
 BAND_LOW, BAND_HIGH = 0.7, 1.4
@@ -654,6 +676,15 @@ def _yes_no(flag: bool) -> str:
     return "YES" if flag else "NO"
 
 
+def fused_within_tolerance(fused: dict[str, Any]) -> bool:
+    """The fused reader against the gather route: rounding-level error, exact zeros."""
+    return bool(
+        fused["vs_gather"]["rel_l2"] <= FUSED_REL_L2_TOLERANCE
+        and fused["vs_gather_illegal"]["rel_l2"] <= FUSED_REL_L2_TOLERANCE
+        and fused["zero_fill_ok"]
+    )
+
+
 def compute_verdict(results: Sequence[dict[str, Any]]) -> dict[str, Any]:
     """Verdict lines from the per-case results.
 
@@ -684,6 +715,8 @@ def compute_verdict(results: Sequence[dict[str, Any]]) -> dict[str, Any]:
     verdict["DECODE_PATH_IDENTICAL"] = over(
         "decode_path", lambda d: d["max_abs"] == 0.0
     )
+    if any("fused" in r for r in nvfp4):
+        verdict["FUSED_MATCHES_GATHER"] = over("fused", fused_within_tolerance)
     verdict["errors"] = {r["case"]: r["error"] for r in results if r.get("error")}
     ratios: dict[str, float] = {}
     for rows in sorted({r["rows"] for r in results}):
@@ -717,6 +750,16 @@ def decode_roundtrip_lines(timings: dict[str, dict[str, Any]]) -> list[str]:
                 + f" e4m3 {e4['median']:.1f} ratio "
                 + "/".join(f"{x / e4['median']:.2f}" for x in fp4)
             )
+        fused = [v["median"] for k, v in arms.items() if k.startswith("decode_fused")]
+        if fused and fp4:
+            lines.append(
+                f"FUSED_ROUNDTRIP_US {group}: fused "
+                + "/".join(f"{x:.1f}" for x in fused)
+                + " gather "
+                + "/".join(f"{x:.1f}" for x in fp4)
+                + " ratio "
+                + "/".join(f"{f / g:.2f}" for f, g in zip(fused, fp4, strict=False))
+            )
     return lines
 
 
@@ -733,8 +776,10 @@ def format_verdict(
         "GATHER_MATCHES_REFERENCE",
         "ZERO_FILL_OK",
         "DECODE_PATH_IDENTICAL",
+        "FUSED_MATCHES_GATHER",
     ):
-        lines.append(f"{key}: {verdict[key]}")
+        if key in verdict:
+            lines.append(f"{key}: {verdict[key]}")
     for r in results:
         if (
             r.get("store")
@@ -766,6 +811,16 @@ def format_verdict(
             f"{name} {r['case']}: max|d| {q['max_abs']:.4g} mean|d| {q['mean_abs']:.4g}"
             f" relL2 {q['rel_l2']:.4g}"
         )
+    for r in results:
+        fused = r.get("fused")
+        if not fused:
+            continue
+        for name, key in (("FUSED_VS_GATHER", "vs_gather"), ("FUSED_VS_FP16", "quality")):
+            q = fused[key]
+            lines.append(
+                f"{name} {r['case']}: max|d| {q['max_abs']:.4g} "
+                f"mean|d| {q['mean_abs']:.4g} relL2 {q['rel_l2']:.4g}"
+            )
     for group, ratio in verdict["NVFP4_VS_E4M3_REL_L2"].items():
         lines.append(f"NVFP4_VS_E4M3_REL_L2 {group}: {ratio:.2f}")
     for case, error in verdict["errors"].items():
@@ -808,8 +863,13 @@ def compute_self_check(
     timings: dict[str, dict[str, Any]],
     *,
     no_timing: bool = False,
+    fused_arm: bool | None = None,
 ) -> dict[str, Any]:
-    """The positive controls, negative controls and stages, and the overall verdict."""
+    """The positive controls, negative controls and stages, and the overall verdict.
+
+    ``fused_arm`` says whether the fused reader was asked for (``--arms``); ``None``
+    infers it from the results, which cannot see a fused arm that raised everywhere.
+    """
     nvfp4 = [r for r in results if r["kind"] == "nvfp4"]
     e4m3 = [r for r in results if r["kind"] == "e4m3"]
     verdict = compute_verdict(results)
@@ -835,6 +895,14 @@ def compute_self_check(
     positive["NVFP4_ERROR_IN_BAND"] = _over(nvfp4, band, in_band, "PASS", "FAIL")
     positive["E4M3_ERROR_IN_BAND"] = _over(e4m3, band, in_band, "PASS", "FAIL")
 
+    fused_run = (
+        any("fused" in r for r in nvfp4) if fused_arm is None else fused_arm
+    )
+    if fused_run:
+        positive["FUSED_MATCHES_GATHER"] = _over(
+            nvfp4, lambda r: r.get("fused"), fused_within_tolerance, "PASS", "FAIL"
+        )
+
     negative: dict[str, str] = {}
     for mutation in MUTATIONS:
         for link in LINKS:
@@ -842,6 +910,17 @@ def compute_self_check(
                 nvfp4,
                 lambda r, m=mutation: (r.get("controls") or {}).get(m),
                 lambda c, m=mutation, link=link: _control_flagged(m, link, c),
+                "FLAGGED",
+                "MISSED",
+            )
+    if fused_run:
+        for mutation in MUTATIONS:
+            negative[f"{mutation} fused_decode"] = _over(
+                nvfp4,
+                lambda r, m=mutation: ((r.get("fused") or {}).get("controls") or {}).get(
+                    m
+                ),
+                lambda c, m=mutation: _control_flagged(m, "decode", c),
                 "FLAGGED",
                 "MISSED",
             )
@@ -881,6 +960,8 @@ def compute_self_check(
         "negative_controls": ran(nvfp4, "controls"),
         "timing": "RAN" if timing_ran else "SKIPPED",
     }
+    if fused_run:
+        stages["decode_fused"] = ran(nvfp4, "fused")
     reasons = [f"{n} {v}" for n, v in positive.items() if v != "PASS"]
     reasons += [f"{n} {v}" for n, v in negative.items() if v != "FLAGGED"]
     reasons += [f"stage {n} {v}" for n, v in stages.items() if v != "RAN"]
@@ -991,8 +1072,10 @@ class CaseRun:
         context: int,
         k_scale: float,
         v_scale: float,
+        fused: bool = False,
     ) -> None:
         self.case, self.geometry, self.k = case, geometry, kernels
+        self.fused = fused
         self.seed, self.k_scale, self.v_scale = seed, k_scale, v_scale
         self.device = torch.device(WORKER_DEVICE)
         self.layout = plan_layout(case.block_size, case.rows, geometry.topk, context)
@@ -1216,6 +1299,19 @@ class CaseRun:
         result["model_check"] = self._model_check(
             k_model, v_model, result["decode_quality"]["rel_l2"]
         )
+        if self.fused:
+            result["fused"] = self._run_fused(
+                nv,
+                sel,
+                unit_cache,
+                unit,
+                nvfp4_out,
+                fp16_out,
+                clean,
+                cache,
+                quantized,
+                baseline,
+            )
         self._cache = cache
         # What the FP16 kernel alone reads once the gather is done (timing only).
         self._k_deq = self._dev(
@@ -1225,6 +1321,62 @@ class CaseRun:
             nv.dequantize_kv_nvfp4(v_data, v_scales, layer_scale=vs)
         )
         return result
+
+    def _run_fused(
+        self,
+        nv,
+        sel: Selection,
+        unit_cache: torch.Tensor,
+        unit: torch.Tensor,
+        gather_unit_out: torch.Tensor,
+        fp16_unit_out: torch.Tensor,
+        clean: Selection,
+        cache: torch.Tensor,
+        gather_quantized: torch.Tensor,
+        baseline: torch.Tensor,
+    ) -> dict[str, Any]:
+        """The fused reader against the gather route (tolerance, not bit equality).
+
+        ``vs_gather``: the clean selection at the realistic layer scales, the same
+        comparison as ``decode_quality`` but against the gather route's output.
+        ``vs_gather_illegal``: the selection with illegal entries at unit scales,
+        against the gather route's output (``gather_unit_out``). ``quality``: the
+        quantization error of the fused route against the unquantized K/V. The mutated
+        caches go through the fused route and must differ from the FP16 kernel.
+        """
+        ks, vs = self.k_scale, self.v_scale
+
+        def fused(selection: Selection, kv: torch.Tensor, **scales) -> torch.Tensor:
+            return self._attention(
+                selection,
+                k_cache=kv[:, 0],
+                v_cache=kv[:, 1],
+                kv_cache_dtype="nvfp4",
+                nvfp4_fused_reader=True,
+                **scales,
+            ).cpu()
+
+        realistic = fused(clean, cache, k_scale=ks, v_scale=vs)
+        unit_out = fused(sel, unit_cache)
+        controls = {
+            mutation: {
+                "decode": error_stats(
+                    fused(
+                        sel,
+                        self._dev(mutate_cache(unit, mutation, nv.nvfp4_kv_split_views)),
+                    ),
+                    fp16_unit_out,
+                )
+            }
+            for mutation in MUTATIONS
+        }
+        return {
+            "vs_gather": error_stats(realistic, gather_quantized),
+            "vs_gather_illegal": error_stats(unit_out, gather_unit_out),
+            "quality": error_stats(realistic, baseline),
+            "zero_fill_ok": all(not unit_out[row].any() for row in sel.empty_rows),
+            "controls": controls,
+        }
 
     # -- the E4M3 control ------------------------------------------------
     def run_e4m3(self) -> dict[str, Any]:
@@ -1393,6 +1545,19 @@ class CaseRun:
             arms[f"decode_fp16_dequantized_{label}"] = lambda: attention(
                 q, k16, v16, indices, table, token_to_req
             )
+            if self.fused:
+                arms[f"decode_fused_nvfp4_{label}"] = lambda: attention(
+                    q,
+                    cache[:, 0],
+                    cache[:, 1],
+                    indices,
+                    table,
+                    token_to_req,
+                    kv_cache_dtype="nvfp4",
+                    k_scale=ks,
+                    v_scale=vs,
+                    nvfp4_fused_reader=True,
+                )
         else:
             k_cache, v_cache, ks, vs = self._e4m3
             scratch_k, scratch_v = torch.zeros_like(k_cache), torch.zeros_like(v_cache)
@@ -1440,6 +1605,7 @@ def run_all(
                 context=args.context,
                 k_scale=args.k_scale,
                 v_scale=args.v_scale,
+                fused="fused" in getattr(args, "arms", ("gather",)),
             )
             entry.update(run.run_nvfp4() if case.kind == "nvfp4" else run.run_e4m3())
             runs[case.label] = run
@@ -1486,6 +1652,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--e4m3-block", type=int, default=DEFAULT_E4M3_BLOCK)
     parser.add_argument("--no-e4m3", action="store_true", help="skip the E4M3 control")
+    parser.add_argument(
+        "--arms",
+        nargs="+",
+        choices=ARMS,
+        default=list(ARMS),
+        help="NVFP4 decode routes to verify and time: the gather route (production) "
+        "and/or the fused reader; `--arms gather` is the run without the fused reader",
+    )
     parser.add_argument("--rows", type=int, nargs="+", default=list(DEFAULT_ROWS))
     parser.add_argument("--context", type=int, default=8192, help="tokens per request")
     parser.add_argument("--k-scale", type=float, default=DEFAULT_K_SCALE)
@@ -1573,7 +1747,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     with torch.inference_mode():
         results, timings = run_all(cases, geometry, kernels, args)
     verdict = compute_verdict(results)
-    check = compute_self_check(results, timings, no_timing=args.no_timing)
+    check = compute_self_check(
+        results, timings, no_timing=args.no_timing, fused_arm="fused" in args.arms
+    )
     lines = format_verdict(verdict, results)
     for group, arms in timings.items():
         for arm, summary in arms.items():

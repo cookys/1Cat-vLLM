@@ -25,7 +25,10 @@ from __future__ import annotations
 
 import torch
 
-from vllm.models.deepseek_v4.common.ops.fp8_software import fp8_e4m3fn_bits_to_fp32
+from vllm.models.deepseek_v4.common.ops.fp8_software import (
+    fp8_e4m3fn_bits_to_fp32,
+    fp8_e4m3fn_bits_to_fp32_bitcast,
+)
 from vllm.models.qwen4_exp.nvidia.ops.nvfp4_kv import (
     NVFP4_KV_GROUP_SIZE,
     nvfp4_kv_split_views,
@@ -98,6 +101,22 @@ def _nvfp4_row(
     even = _e2m1_value(packed & 0xF) * scale
     odd = _e2m1_value(packed >> 4) * scale
     return even, odd
+
+
+@triton.jit
+def _nvfp4_tile_halves(packed, scale_bits):
+    """Even and odd FP16 values of packed NVFP4 bytes, layer scale not applied.
+
+    ``packed`` holds int32 packed bytes (low nibble = even index) and
+    ``scale_bits`` the E4M3 scale byte of each element's group of 16, in the same
+    shape; a masked lane carries byte 0 and scale 0, which decodes to exactly 0.
+    The product of an e2m1 value and an E4M3 scale is exact in FP16 (see the
+    design note), so the fused attention reader casts without rounding.
+    """
+    scale = fp8_e4m3fn_bits_to_fp32_bitcast(scale_bits)
+    even = _e2m1_value(packed & 0xF) * scale
+    odd = _e2m1_value(packed >> 4) * scale
+    return even.to(tl.float16), odd.to(tl.float16)
 
 
 @triton.jit

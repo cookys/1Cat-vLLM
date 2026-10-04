@@ -924,3 +924,138 @@ def test_one_small_case_runs_end_to_end_on_cpu_tensors(chk, monkeypatch):
     assert any(line.startswith("E4M3_BAND") for line in lines)
     ratio = results[0]["model_check"]
     assert chk.error_in_band(ratio["measured_rel_l2"], ratio["model_rel_l2"])
+
+
+# ------------------------------------------------------------- the fused arm
+def _fused_block(rel=3e-4, illegal=3e-4, zero_ok=True):
+    stats = {"max_abs": 1e-3, "mean_abs": 1e-4, "rel_l2": rel, "reference_norm": 1.0}
+    return {
+        "vs_gather": stats,
+        "vs_gather_illegal": {**stats, "rel_l2": illegal},
+        "quality": {"max_abs": 0.2, "mean_abs": 0.01, "rel_l2": 0.1},
+        "zero_fill_ok": zero_ok,
+        "controls": {
+            "nibble_order_swapped": {"decode": {"max_abs": 0.5}},
+            "scale_placement_wrong": {"decode": {"max_abs": 0.5}},
+        },
+    }
+
+
+def _passing_fused_run():
+    results, timings = _passing_run()
+    results[0]["fused"] = _fused_block()
+    timings["M=1"]["decode_fused_nvfp4_B32"] = {"median": 8.0}
+    return results, timings
+
+
+def test_the_arms_default_to_gather_and_fused_and_gather_alone_is_accepted(chk):
+    assert chk.parse_args([]).arms == ["gather", "fused"]
+    assert chk.parse_args(["--arms", "gather"]).arms == ["gather"]
+    with pytest.raises(SystemExit):
+        chk.parse_args(["--arms", "bogus"])
+
+
+def test_a_run_without_the_fused_arm_has_no_fused_lines(chk):
+    results, timings = _passing_run()
+    verdict = chk.compute_verdict(results)
+    assert "FUSED_MATCHES_GATHER" not in verdict
+    assert not any(line.startswith("FUSED") for line in chk.format_verdict(verdict, results))
+    check = chk.compute_self_check(results, timings, fused_arm=False)
+    assert check["verdict"] == "PASS" and "decode_fused" not in check["stages"]
+
+
+def test_a_fused_arm_inside_the_tolerance_passes_and_prints_its_lines(chk):
+    results, timings = _passing_fused_run()
+    verdict = chk.compute_verdict(results)
+    assert verdict["FUSED_MATCHES_GATHER"] == "YES"
+    lines = chk.format_verdict(verdict, results)
+    assert "FUSED_MATCHES_GATHER: YES" in lines
+    assert any(line.startswith("FUSED_VS_GATHER nvfp4-B32-M1: max|d|") for line in lines)
+    assert any(line.startswith("FUSED_VS_FP16 nvfp4-B32-M1:") for line in lines)
+    check = chk.compute_self_check(results, timings, fused_arm=True)
+    assert check["verdict"] == "PASS", check["reasons"]
+    assert check["positive"]["FUSED_MATCHES_GATHER"] == "PASS"
+    assert check["negative"]["nibble_order_swapped fused_decode"] == "FLAGGED"
+    assert check["negative"]["scale_placement_wrong fused_decode"] == "FLAGGED"
+    assert check["stages"]["decode_fused"] == "RAN"
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        {"rel": 5e-3},
+        {"illegal": 5e-3},
+        {"zero_ok": False},
+    ],
+    ids=["clean_selection", "illegal_entries", "nonzero_empty_row"],
+)
+def test_a_fused_arm_outside_the_tolerance_fails(chk, block):
+    results, timings = _passing_fused_run()
+    results[0]["fused"] = _fused_block(**block)
+    assert chk.compute_verdict(results)["FUSED_MATCHES_GATHER"] == "NO"
+    check = _fail_reasons(chk, results, timings, fused_arm=True)
+    assert check["positive"]["FUSED_MATCHES_GATHER"] == "FAIL"
+
+
+def test_a_fused_mutation_the_comparison_cannot_see_is_missed(chk):
+    results, timings = _passing_fused_run()
+    results[0]["fused"]["controls"]["scale_placement_wrong"] = {"decode": {"max_abs": 0.0}}
+    check = _fail_reasons(chk, results, timings, fused_arm=True)
+    assert check["negative"]["scale_placement_wrong fused_decode"] == "MISSED"
+
+
+def test_a_requested_fused_arm_that_never_ran_fails_even_if_every_case_raised(chk):
+    results, timings = _passing_run()  # no "fused" key anywhere
+    check = _fail_reasons(chk, results, timings, fused_arm=True)
+    assert check["stages"]["decode_fused"] == "SKIPPED"
+    assert check["positive"]["FUSED_MATCHES_GATHER"] == "SKIPPED"
+
+
+def test_the_fused_arm_does_not_pollute_the_gather_roundtrip_line(chk):
+    timings = {
+        "M=1": {
+            "decode_nvfp4_B2784": {"median": 300.0},
+            "decode_fused_nvfp4_B2784": {"median": 240.0},
+            "decode_e4m3_B1616": {"median": 150.0},
+        }
+    }
+    assert chk.decode_roundtrip_lines(timings) == [
+        "DECODE_ROUNDTRIP_US M=1: nvfp4 300.0 e4m3 150.0 ratio 2.00",
+        "FUSED_ROUNDTRIP_US M=1: fused 240.0 gather 300.0 ratio 0.80",
+    ]
+
+
+@pytest.mark.skipif(not INTERPRETER, reason="needs TRITON_INTERPRET=1")
+def test_one_small_case_runs_the_fused_arm_end_to_end_on_cpu_tensors(chk, monkeypatch):
+    from vllm.v1.attention.backends import fa_utils
+
+    fa_utils.get_flash_attn_version = lambda *args, **kwargs: 2
+    monkeypatch.setattr(chk, "WORKER_DEVICE", "cpu")
+    args = Namespace(
+        seed=0,
+        context=100,
+        k_scale=chk.DEFAULT_K_SCALE,
+        v_scale=chk.DEFAULT_V_SCALE,
+        no_timing=False,
+        rounds=2,
+        iters=1,
+        warmup=1,
+        arms=["gather", "fused"],
+    )
+    geometry = chk.Geometry(head_dim=256, q_heads=6, kv_heads=1, topk=16, source="test")
+    cases = chk.plan_cases([32], 32, [3])
+    with torch.inference_mode():
+        results, timings = chk.run_all(cases, geometry, chk.load_kernels(), args, lambda m: None)
+    assert not any(r.get("error") for r in results), results
+    nvfp4 = next(r for r in results if r["kind"] == "nvfp4")
+    fused = nvfp4["fused"]
+    assert fused["vs_gather"]["rel_l2"] < chk.FUSED_REL_L2_TOLERANCE
+    assert fused["vs_gather_illegal"]["rel_l2"] < chk.FUSED_REL_L2_TOLERANCE
+    assert fused["zero_fill_ok"]
+    assert 0.0 < fused["quality"]["rel_l2"] < 0.5
+    assert all(c["decode"]["max_abs"] > 0 for c in fused["controls"].values())
+    assert "decode_fused_nvfp4_B32" in timings["M=3"]
+    verdict = chk.compute_verdict(results)
+    assert verdict["FUSED_MATCHES_GATHER"] == "YES"
+    check = chk.compute_self_check(results, timings, fused_arm=True)
+    assert check["verdict"] == "PASS", chk.format_self_check(check, results)

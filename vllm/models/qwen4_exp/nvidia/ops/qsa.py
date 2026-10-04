@@ -16,9 +16,11 @@ from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
     fp8_e4m3fn_bits_to_fp32_bitcast as fp8_e4m3fn_bits_to_fp32,
 )
+from vllm.models.qwen4_exp.nvidia.ops.nvfp4_kv_triton import _nvfp4_tile_halves
 from vllm.models.qwen4_exp.nvidia.ops.nvfp4_kv import (
     NVFP4_KV_CACHE_DTYPE,
     NVFP4_KV_GROUP_SIZE,
+    nvfp4_side_views,
 )
 from vllm.models.qwen4_exp.nvidia.ops.sm70_qsa_tuning import (
     SM70_QSA_TUNING,
@@ -654,6 +656,14 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     num_requests,
     k_scale,
     v_scale,
+    k_block_scale_ptr,
+    v_block_scale_ptr,
+    stride_ks_block,
+    stride_ks_token,
+    stride_ks_head,
+    stride_vs_block,
+    stride_vs_token,
+    stride_vs_head,
     TOPK: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     PAGE_TABLE_WIDTH: tl.constexpr,
@@ -667,7 +677,16 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     KV_E4M3: tl.constexpr,
     FOLD_SCALES: tl.constexpr,
     RESOLVED_INDICES: tl.constexpr = False,
+    KV_NVFP4: tl.constexpr = False,
 ) -> None:
+    # KV_NVFP4 (plan 071): k_cache_ptr and v_cache_ptr are the packed e2m1 data
+    # views of the cache (HEAD_DIM // 2 bytes per row), k_block_scale_ptr and
+    # v_block_scale_ptr its E4M3 scale bytes (one per 16 values). The tile is read
+    # as an even-index half and an odd-index half, each [HEAD_DIM // 2, ...], so
+    # there is no register interleave: QK is two K = HEAD_DIM // 2 dots and PV two
+    # accumulators written back to the even and odd columns. The layer scales are
+    # not applied here (FOLD_SCALES, as for the gathered route). Exclusive with
+    # KV_E4M3.
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
     split_id = tl.program_id(2)
@@ -678,18 +697,37 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     dim_offsets = tl.arange(0, HEAD_DIM)
     column_offsets = tl.arange(0, BLOCK_N)
     first_head = kv_head * GROUP_SIZE
-    query = tl.load(
-        q_ptr
-        + row * stride_q_row
-        + (first_head + head_offsets[:, None]) * stride_q_head
-        + dim_offsets[None, :],
-        mask=head_offsets[:, None] < GROUP_SIZE,
-        other=0.0,
-    )
+    if KV_NVFP4:
+        half_offsets = tl.arange(0, HEAD_DIM // 2)
+        query_base = (
+            q_ptr
+            + row * stride_q_row
+            + (first_head + head_offsets[:, None]) * stride_q_head
+            + 2 * half_offsets[None, :]
+        )
+        query_even = tl.load(
+            query_base, mask=head_offsets[:, None] < GROUP_SIZE, other=0.0
+        )
+        query_odd = tl.load(
+            query_base + 1, mask=head_offsets[:, None] < GROUP_SIZE, other=0.0
+        )
+    else:
+        query = tl.load(
+            q_ptr
+            + row * stride_q_row
+            + (first_head + head_offsets[:, None]) * stride_q_head
+            + dim_offsets[None, :],
+            mask=head_offsets[:, None] < GROUP_SIZE,
+            other=0.0,
+        )
 
     max_value = tl.full((BLOCK_M,), -1.0e20, dtype=tl.float32)
     normalizer = tl.zeros((BLOCK_M,), dtype=tl.float32)
-    accumulator = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
+    if KV_NVFP4:
+        accumulator_even = tl.zeros((BLOCK_M, HEAD_DIM // 2), dtype=tl.float32)
+        accumulator_odd = tl.zeros((BLOCK_M, HEAD_DIM // 2), dtype=tl.float32)
+    else:
+        accumulator = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
     softmax_scale_log2: tl.constexpr = (HEAD_DIM**-0.5) * 1.4426950408889634
     qk_scale_log2 = softmax_scale_log2
     if FOLD_SCALES:
@@ -726,28 +764,55 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
         # physical_page * block stride can overflow int32 for large caches.
         safe_page = tl.maximum(physical_page, 0).to(tl.int64)
-        keys = tl.load(
-            k_cache_ptr
-            + safe_page[None, :] * stride_k_block
-            + page_offset[None, :] * stride_k_token
-            + kv_head * stride_k_head
-            + dim_offsets[:, None],
-            mask=valid[None, :],
-            other=0.0,
-        )
-        values = tl.load(
-            v_cache_ptr
-            + safe_page[:, None] * stride_v_block
-            + page_offset[:, None] * stride_v_token
-            + kv_head * stride_v_head
-            + dim_offsets[None, :],
-            mask=valid[:, None],
-            other=0.0,
-        )
-        if KV_E4M3:
-            keys = fp8_e4m3fn_bits_to_fp32(keys).to(query.dtype)
-            values = fp8_e4m3fn_bits_to_fp32(values).to(query.dtype)
-        scores = tl.dot(query, keys)
+        if KV_NVFP4:
+            # K: packed bytes [HALF, BLOCK_N] and the scale byte of byte // 8.
+            # A masked lane loads byte 0 and scale 0, which decodes to exactly 0.
+            key_bytes = tl.load(
+                k_cache_ptr
+                + safe_page[None, :] * stride_k_block
+                + page_offset[None, :] * stride_k_token
+                + kv_head * stride_k_head
+                + half_offsets[:, None],
+                mask=valid[None, :],
+                other=0,
+            )
+            key_scale_bits = tl.load(
+                k_block_scale_ptr
+                + safe_page[None, :] * stride_ks_block
+                + page_offset[None, :] * stride_ks_token
+                + kv_head * stride_ks_head
+                + half_offsets[:, None] // 8,
+                mask=valid[None, :],
+                other=0,
+            )
+            keys_even, keys_odd = _nvfp4_tile_halves(
+                key_bytes.to(tl.int32), key_scale_bits
+            )
+            scores = tl.dot(query_even, keys_even)
+            scores = tl.dot(query_odd, keys_odd, acc=scores)
+        else:
+            keys = tl.load(
+                k_cache_ptr
+                + safe_page[None, :] * stride_k_block
+                + page_offset[None, :] * stride_k_token
+                + kv_head * stride_k_head
+                + dim_offsets[:, None],
+                mask=valid[None, :],
+                other=0.0,
+            )
+            values = tl.load(
+                v_cache_ptr
+                + safe_page[:, None] * stride_v_block
+                + page_offset[:, None] * stride_v_token
+                + kv_head * stride_v_head
+                + dim_offsets[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            )
+            if KV_E4M3:
+                keys = fp8_e4m3fn_bits_to_fp32(keys).to(query.dtype)
+                values = fp8_e4m3fn_bits_to_fp32(values).to(query.dtype)
+            scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16.
         scores *= qk_scale_log2
         scores = tl.where(valid[None, :], scores, -1.0e20)
@@ -756,20 +821,61 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         probabilities = tl.where(
             valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
         )
-        accumulator = tl.dot(
-            probabilities.to(values.dtype),
-            values,
-            acc=accumulator * alpha[:, None],
-        )
+        if KV_NVFP4:
+            # V is decoded after the K tile is dead, so the two tiles never
+            # share live registers.
+            value_bytes = tl.load(
+                v_cache_ptr
+                + safe_page[:, None] * stride_v_block
+                + page_offset[:, None] * stride_v_token
+                + kv_head * stride_v_head
+                + half_offsets[None, :],
+                mask=valid[:, None],
+                other=0,
+            )
+            value_scale_bits = tl.load(
+                v_block_scale_ptr
+                + safe_page[:, None] * stride_vs_block
+                + page_offset[:, None] * stride_vs_token
+                + kv_head * stride_vs_head
+                + half_offsets[None, :] // 8,
+                mask=valid[:, None],
+                other=0,
+            )
+            values_even, values_odd = _nvfp4_tile_halves(
+                value_bytes.to(tl.int32), value_scale_bits
+            )
+            probabilities_fp16 = probabilities.to(values_even.dtype)
+            accumulator_even = tl.dot(
+                probabilities_fp16,
+                values_even,
+                acc=accumulator_even * alpha[:, None],
+            )
+            accumulator_odd = tl.dot(
+                probabilities_fp16,
+                values_odd,
+                acc=accumulator_odd * alpha[:, None],
+            )
+        else:
+            accumulator = tl.dot(
+                probabilities.to(values.dtype),
+                values,
+                acc=accumulator * alpha[:, None],
+            )
         normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)
         max_value = next_max
 
     has_values = normalizer > 0
-    normalized_output = tl.where(
-        has_values[:, None],
-        accumulator / tl.maximum(normalizer[:, None], 1.0e-20),
-        0.0,
-    )
+    if KV_NVFP4:
+        denominator = tl.maximum(normalizer[:, None], 1.0e-20)
+        normalized_even = tl.where(has_values[:, None], accumulator_even / denominator, 0.0)
+        normalized_odd = tl.where(has_values[:, None], accumulator_odd / denominator, 0.0)
+    else:
+        normalized_output = tl.where(
+            has_values[:, None],
+            accumulator / tl.maximum(normalizer[:, None], 1.0e-20),
+            0.0,
+        )
     output_mask = head_offsets[:, None] < GROUP_SIZE
     if NUM_SPLITS == 1:
         if final_lse_ptr is not None:
@@ -783,40 +889,71 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
                 lse,
                 mask=head_offsets < GROUP_SIZE,
             )
-        if FOLD_SCALES:
-            # V dequantization is linear, so apply its scalar after the
-            # normalized FP32 accumulation instead of to every loaded value.
-            normalized_output *= v_scale
-        if output_gate_ptr is not None:
-            # Preserve the compiled path's rounded attention output before
-            # evaluating the sigmoid gate and final product in FP32.
-            normalized_output = normalized_output.to(output_ptr.dtype.element_ty)
-            output_gate = tl.load(
-                output_gate_ptr
-                + row * stride_output_gate_row
-                + (first_head + head_offsets[:, None]) * stride_output_gate_head
+        if KV_NVFP4:
+            # Write the even and odd columns back with stride-2 stores.
+            for parity in tl.static_range(2):
+                if parity == 0:
+                    half_output = normalized_even
+                else:
+                    half_output = normalized_odd
+                columns_out = 2 * half_offsets[None, :] + parity
+                if FOLD_SCALES:
+                    half_output *= v_scale
+                if output_gate_ptr is not None:
+                    half_output = half_output.to(output_ptr.dtype.element_ty)
+                    output_gate = tl.load(
+                        output_gate_ptr
+                        + row * stride_output_gate_row
+                        + (first_head + head_offsets[:, None])
+                        * stride_output_gate_head
+                        + columns_out,
+                        mask=output_mask,
+                        other=0.0,
+                    ).to(tl.float32)
+                    half_output = half_output.to(tl.float32) * tl.sigmoid(output_gate)
+                tl.store(
+                    output_ptr
+                    + row * stride_output_row
+                    + (first_head + head_offsets[:, None]) * stride_output_head
+                    + columns_out,
+                    half_output,
+                    mask=output_mask,
+                )
+        else:
+            if FOLD_SCALES:
+                # V dequantization is linear, so apply its scalar after the
+                # normalized FP32 accumulation instead of to every loaded value.
+                normalized_output *= v_scale
+            if output_gate_ptr is not None:
+                # Preserve the compiled path's rounded attention output before
+                # evaluating the sigmoid gate and final product in FP32.
+                normalized_output = normalized_output.to(output_ptr.dtype.element_ty)
+                output_gate = tl.load(
+                    output_gate_ptr
+                    + row * stride_output_gate_row
+                    + (first_head + head_offsets[:, None]) * stride_output_gate_head
+                    + dim_offsets[None, :],
+                    mask=output_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                normalized_output = normalized_output.to(tl.float32) * tl.sigmoid(
+                    output_gate
+                )
+            tl.store(
+                output_ptr
+                + row * stride_output_row
+                + (first_head + head_offsets[:, None]) * stride_output_head
                 + dim_offsets[None, :],
+                normalized_output,
                 mask=output_mask,
-                other=0.0,
-            ).to(tl.float32)
-            normalized_output = normalized_output.to(tl.float32) * tl.sigmoid(
-                output_gate
             )
-        tl.store(
-            output_ptr
-            + row * stride_output_row
-            + (first_head + head_offsets[:, None]) * stride_output_head
-            + dim_offsets[None, :],
-            normalized_output,
-            mask=output_mask,
-        )
     else:
         partial_lse = tl.where(
             has_values,
             max_value + tl.math.log2(tl.maximum(normalizer, 1.0e-20)),
             -float("inf"),
         )
-        tl.store(
+        partial_base = (
             partial_output_ptr
             + (
                 (split_id * num_rows + row) * NUM_QUERY_HEADS
@@ -824,10 +961,24 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
                 + head_offsets[:, None]
             )
             * HEAD_DIM
-            + dim_offsets[None, :],
-            normalized_output,
-            mask=output_mask,
         )
+        if KV_NVFP4:
+            tl.store(
+                partial_base + 2 * half_offsets[None, :],
+                normalized_even,
+                mask=output_mask,
+            )
+            tl.store(
+                partial_base + 2 * half_offsets[None, :] + 1,
+                normalized_odd,
+                mask=output_mask,
+            )
+        else:
+            tl.store(
+                partial_base + dim_offsets[None, :],
+                normalized_output,
+                mask=output_mask,
+            )
         tl.store(
             partial_lse_ptr
             + (split_id * num_rows + row) * NUM_QUERY_HEADS
@@ -2296,8 +2447,13 @@ def qsa_sparse_paged_attention(
     k_scale: float = 1.0,
     v_scale: float = 1.0,
     lse: torch.Tensor | None = None,
+    nvfp4_fused_reader: bool | None = None,
 ) -> torch.Tensor:
     """Run sparse GQA, optionally returning base-2 LSE for a cross-rank merge.
+
+    ``nvfp4_fused_reader`` picks the route of an NVFP4 cache: ``False`` gathers the
+    selected rows to FP16 first, ``True`` decodes them inside the split-K kernel,
+    ``None`` follows ``VLLM_SM70_QSA_NVFP4_FUSED_READER`` (off by default).
 
     LSE callers may supply FP32 output to avoid rounding each rank's partial
     result. Apply output gating after the cross-rank merge, not per rank.
@@ -2330,7 +2486,8 @@ def qsa_sparse_paged_attention(
     kv_nvfp4 = kv_cache_dtype == NVFP4_KV_CACHE_DTYPE
     # Internal: NVFP4 rows already gathered and decoded to FP16, scales unapplied.
     kv_gathered = kv_cache_dtype == QSA_NVFP4_GATHERED_DTYPE
-    fold_scales = kv_e4m3 or kv_gathered
+    # An NVFP4 cache that reaches the kernel below is read by the fused reader.
+    fold_scales = kv_e4m3 or kv_gathered or kv_nvfp4
     if kv_nvfp4:
         if q.dtype != torch.float16:
             raise ValueError("QSA NVFP4 K/V caches require FP16 queries")
@@ -2400,9 +2557,19 @@ def qsa_sparse_paged_attention(
     if not q.shape[0]:
         return out
 
+    k_block_scales = v_block_scales = None
     if kv_nvfp4:
+        from .qsa_nvfp4 import nvfp4_fused_reader_enabled
+
+        kv_nvfp4_fused = nvfp4_fused_reader_enabled(nvfp4_fused_reader)
+    if kv_nvfp4 and kv_nvfp4_fused:
+        # The split-K kernel below reads the packed data bytes and block scales
+        # straight from the pages. The CUDA page4 routes never see an NVFP4 cache.
+        k_cache, k_block_scales = nvfp4_side_views(k_cache)
+        v_cache, v_block_scales = nvfp4_side_views(v_cache)
+    elif kv_nvfp4:
         # Gather and decode the selected rows to FP16, then run the FP16 kernel
-        # below unchanged. The CUDA page4 routes never see an NVFP4 cache.
+        # below unchanged.
         from .qsa_nvfp4 import qsa_sparse_attention_nvfp4
 
         return qsa_sparse_attention_nvfp4(
@@ -2422,6 +2589,7 @@ def qsa_sparse_paged_attention(
     if (
         lse is None
         and not kv_gathered
+        and not kv_nvfp4
         and _use_sm70_qsa_xqa_page4(
             q,
             k_cache,
@@ -2481,10 +2649,13 @@ def qsa_sparse_paged_attention(
     block_n, target_splits, partial_warps = _qsa_sparse_launch_profile(
         base_programs,
         block_m,
-        not current_platform.has_device_capability(80),
+        # The fused NVFP4 reader always starts from the pre-Ampere profile.
+        kv_nvfp4 or not current_platform.has_device_capability(80),
     )
 
-    if _use_sm70_qsa_two_warp_partial(q.shape[0], group_size, head_dim):
+    if not kv_nvfp4 and _use_sm70_qsa_two_warp_partial(
+        q.shape[0], group_size, head_dim
+    ):
         # Exact Qwen4Exp TP4 decode family. Two warps preserve the existing
         # split/merge arithmetic and cut the partial-kernel time on V100.
         partial_warps = 2
@@ -2542,6 +2713,14 @@ def qsa_sparse_paged_attention(
         block_table.shape[0],
         k_scale,
         v_scale,
+        k_block_scales,
+        v_block_scales,
+        k_block_scales.stride(0) if kv_nvfp4 else 0,
+        k_block_scales.stride(1) if kv_nvfp4 else 0,
+        k_block_scales.stride(2) if kv_nvfp4 else 0,
+        v_block_scales.stride(0) if kv_nvfp4 else 0,
+        v_block_scales.stride(1) if kv_nvfp4 else 0,
+        v_block_scales.stride(2) if kv_nvfp4 else 0,
         TOPK=logical_indices.shape[1],
         PAGE_SIZE=k_cache.shape[1],
         PAGE_TABLE_WIDTH=block_table.shape[1],
@@ -2555,6 +2734,7 @@ def qsa_sparse_paged_attention(
         KV_E4M3=kv_e4m3,
         FOLD_SCALES=fold_scales,
         RESOLVED_INDICES=resolved_indices,
+        KV_NVFP4=kv_nvfp4,
         num_warps=partial_warps,
         num_stages=2,
     )

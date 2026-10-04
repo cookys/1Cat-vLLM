@@ -140,6 +140,7 @@ if TYPE_CHECKING:
     VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS: str | None = None
     VLLM_SM70_QSA_INDEXER_SCORE_TILE_MB: str | None = None
     VLLM_SM70_QSA_MTP_TOPK: bool = True
+    VLLM_SM70_QSA_NVFP4_FUSED_READER: bool = False
     VLLM_SM70_QSA_TOPK_LIBRARY: str | None = None
     VLLM_SM70_QSA_XQA_PAGE4: str | None = None
     VLLM_SM70_QSA_XQA_PAGE4_MIN_ROWS: str | None = None
@@ -17594,6 +17595,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "QSA sparse attention/indexer",
             "Flash-Next qualified batch",
         ),
+        user_visible=True,
+    ),
+    "VLLM_SM70_QSA_NVFP4_FUSED_READER": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QSA_NVFP4_FUSED_READER", "0"))),
+        description=(
+            "Reads an NVFP4 QSA main K/V cache inside the sparse split-K attention "
+            "kernel instead of gathering the selected rows to FP16 first. Default "
+            "off: the gather route is the one with measured results. Set 1 only "
+            "for an A/B of the fused reader; its QK and PV sums differ from the "
+            "gather route at FP16 rounding level, not bit for bit."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("QSA sparse attention/indexer",),
         user_visible=True,
     ),
     "VLLM_SM70_QSA_TOPK_LIBRARY": env_var(

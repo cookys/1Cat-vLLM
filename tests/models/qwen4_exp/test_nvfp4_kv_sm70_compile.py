@@ -55,6 +55,11 @@ GATHERED_MAX_STACK = 0
 # The merge kernel keeps a [splits, head_dim] tile in registers; its 72 byte stack is
 # the same with and without scale folding.
 MERGE_MAX_STACK = 128
+# The fused NVFP4 reader (KV_NVFP4), BLOCK_N 16, 64 splits, TOPK 2051, head 256:
+# no stack at 4 warps; at 2 warps it spills (measured 1096 bytes of stack frame).
+FUSED_4_WARP_MAX_STACK = 0
+FUSED_2_WARP_MEASURED_STACK = 1096
+FUSED_MAX_SHARED = 16384
 
 STORE = {
     "x_ptr": "*fp16",
@@ -248,9 +253,18 @@ _SPLITK_RUNTIME = {
             "num_rows",
             "num_cache_blocks",
             "num_requests",
+            "stride_ks_block",
+            "stride_ks_token",
+            "stride_ks_head",
+            "stride_vs_block",
+            "stride_vs_token",
+            "stride_vs_head",
         )
     },
 }
+# The block-scale pointers exist only for the fused NVFP4 reader; every other launch
+# passes None, which Triton removes from the signature.
+_NO_BLOCK_SCALES = {"k_block_scale_ptr": None, "v_block_scale_ptr": None}
 _MERGE_RUNTIME = {
     "partial_output_ptr": "*fp32",
     "partial_lse_ptr": "*fp32",
@@ -295,6 +309,7 @@ def _gathered_splitk(num_warps, *, topk=2051, block_n=16, splits=64):
         "KV_E4M3": False,
         "FOLD_SCALES": True,
         "RESOLVED_INDICES": False,
+        **_NO_BLOCK_SCALES,
     }
     return triton.compile(
         ASTSource(
@@ -337,6 +352,7 @@ def test_the_gathered_kernel_is_not_larger_than_the_e4m3_kernel_it_replaces():
                 "KV_E4M3": True,
                 "FOLD_SCALES": True,
                 "RESOLVED_INDICES": False,
+                **_NO_BLOCK_SCALES,
             },
         ),
         target=VOLTA,
@@ -395,6 +411,7 @@ def test_scale_folding_changes_only_the_kernels_that_fold():
         "BLOCK_N": 16,
         "KV_E4M3": False,
         "RESOLVED_INDICES": False,
+        **_NO_BLOCK_SCALES,
     }
 
     def build(fold):
@@ -411,3 +428,138 @@ def test_scale_folding_changes_only_the_kernels_that_fold():
     plain, folded = body(build(False)), body(build(True))
     assert plain != folded
     assert plain.count("mul.f32") < folded.count("mul.f32")
+
+
+# --------------------------------------------------------------------------- #
+# The fused NVFP4 reader (``KV_NVFP4``), plan 071 step C
+# --------------------------------------------------------------------------- #
+def _fused_splitk(num_warps, *, num_stages=2, topk=2051, block_n=16, splits=64):
+    """The split-K kernel as the fused reader launches it: the packed data views of
+    the cache (uint8) and their block-scale bytes, real pages of 2784 tokens."""
+    kernel = qsa_ops._qsa_sparse_paged_gqa_splitk_kernel
+    runtime = {
+        **_SPLITK_RUNTIME,
+        "k_cache_ptr": "*u8",
+        "v_cache_ptr": "*u8",
+        "k_block_scale_ptr": "*u8",
+        "v_block_scale_ptr": "*u8",
+    }
+    constexprs = {
+        "TOPK": topk,
+        "PAGE_SIZE": 2784,
+        "PAGE_TABLE_WIDTH": 96,
+        "GROUP_SIZE": 6,
+        "HEAD_DIM": 256,
+        "NUM_QUERY_HEADS": 6,
+        "NUM_SPLITS": splits,
+        "NUM_TILES": -(-topk // block_n),
+        "BLOCK_M": 8,
+        "BLOCK_N": block_n,
+        "KV_E4M3": False,
+        "FOLD_SCALES": True,
+        "RESOLVED_INDICES": False,
+        "KV_NVFP4": True,
+    }
+    return triton.compile(
+        ASTSource(
+            fn=kernel,
+            signature=_with_constexprs(kernel, runtime),
+            constexprs=constexprs,
+        ),
+        target=VOLTA,
+        options={"num_warps": num_warps, "num_stages": num_stages},
+    )
+
+
+def test_the_fused_reader_lowers_to_sm70_at_four_warps_without_spilling():
+    # The launch of the fused path: BLOCK_N 16, 4 warps (the pre-Ampere profile).
+    # Measured with Triton 3.6.0's ptxas: 255 registers, no stack frame, no local
+    # memory, 16 KiB of shared memory. _check also bans bf16/fp8/fp4 conversions,
+    # cp.async, wgmma and the m16n8 mma shapes.
+    compiled = _fused_splitk(4)
+    _check(compiled, max_registers=255, max_stack=FUSED_4_WARP_MAX_STACK)
+    assert compiled.metadata.shared <= FUSED_MAX_SHARED
+
+
+def test_the_fused_reader_at_two_warps_is_banned_instruction_free_but_spills():
+    # The exact-TP4 decode launch of the other paths (the two-warp partial) is NOT
+    # what the fused path uses: at 2 warps the kernel spills. The measured frame is
+    # recorded here so a change shows up; it is a ceiling, not a target.
+    compiled = _fused_splitk(2)
+    _check(compiled, max_registers=255, max_stack=FUSED_2_WARP_MEASURED_STACK)
+    usage = _usage(compiled)
+    if usage is not None:
+        assert usage[1] > 0, "the 2-warp fused kernel no longer spills: update the note"
+
+
+def test_the_fused_reader_stack_does_not_depend_on_the_pipeline_depth():
+    if _usage(_fused_splitk(4)) is not None:
+        assert _usage(_fused_splitk(4, num_stages=1)) == _usage(_fused_splitk(4))
+
+
+def test_the_fused_reader_reads_no_gathered_scratch_and_uses_no_atomics():
+    ptx = _fused_splitk(4).asm["ptx"]
+    assert not re.search(r"^\s*(atom|red)\.", ptx, re.MULTILINE)
+
+
+def _ptx_body(compiled):
+    """The instructions of a kernel: no line info, comments, or parameter list."""
+    lines = []
+    for line in compiled.asm["ptx"].splitlines():
+        stripped = line.strip()
+        if stripped.startswith((".loc", ".file", "//", ".param")) or not stripped:
+            continue
+        lines.append(re.sub(r"\s*//.*$", "", line))
+    return "\n".join(lines).split(".section\t.debug_abbrev")[0]
+
+
+# md5 of the instruction text (``_ptx_body``) of the three launches that existed
+# before ``KV_NVFP4``, computed on the previous commit with Triton 3.6.0. The new
+# constexpr and its pointer arguments must not change what they compile to. If a
+# later edit changes these kernels on purpose, recompute them and say so.
+PRE_FUSED_PTX_MD5 = {
+    "e4m3": "c04e5b4cd0ea8917ae90d8730ab457e1",
+    "gathered_4": "d5196caac30dbb80fd35a6c8ab5c3a3d",
+    "gathered_2": "6e11d0194be901d650907867d01d24d6",
+}
+
+
+def test_the_fused_branch_leaves_the_existing_split_k_launches_unchanged():
+    if triton.__version__ != "3.6.0":
+        pytest.skip("the pinned digests were computed with Triton 3.6.0")
+    import hashlib
+
+    kernel = qsa_ops._qsa_sparse_paged_gqa_splitk_kernel
+    runtime = {**_SPLITK_RUNTIME, "k_cache_ptr": "*u8", "v_cache_ptr": "*u8"}
+    e4m3 = triton.compile(
+        ASTSource(
+            fn=kernel,
+            signature=_with_constexprs(kernel, runtime),
+            constexprs={
+                "TOPK": 2051,
+                "PAGE_SIZE": 1616,
+                "PAGE_TABLE_WIDTH": 163,
+                "GROUP_SIZE": 6,
+                "HEAD_DIM": 256,
+                "NUM_QUERY_HEADS": 6,
+                "NUM_SPLITS": 64,
+                "NUM_TILES": 129,
+                "BLOCK_M": 8,
+                "BLOCK_N": 16,
+                "KV_E4M3": True,
+                "FOLD_SCALES": True,
+                "RESOLVED_INDICES": False,
+                **_NO_BLOCK_SCALES,
+            },
+        ),
+        target=VOLTA,
+        options={"num_warps": 4, "num_stages": 2},
+    )
+    digests = {
+        "e4m3": e4m3,
+        "gathered_4": _gathered_splitk(4),
+        "gathered_2": _gathered_splitk(2),
+    }
+    for name, compiled in digests.items():
+        digest = hashlib.md5(_ptx_body(compiled).encode()).hexdigest()
+        assert digest == PRE_FUSED_PTX_MD5[name], name

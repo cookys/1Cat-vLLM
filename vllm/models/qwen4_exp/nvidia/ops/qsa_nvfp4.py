@@ -20,14 +20,17 @@ The layer scales are folded as for E4M3: ``k_scale`` multiplies the QK scores an
 
 The gathered tensors are 1 KiB per selected token at head size 256, so the rows
 are processed in groups that keep them under ``NVFP4_GATHER_SCRATCH_BYTES``. A
-decode step (up to 31 rows at topk 2051) is one group. A fused reader that never
-materializes them is a later optimization (see the design note).
+decode step (up to 31 rows at topk 2051) is one group. The fused reader
+(``VLLM_SM70_QSA_NVFP4_FUSED_READER``, ``KV_NVFP4`` of the split-K kernel) never
+materializes them and is selected in ``qsa_sparse_paged_attention``; see the design
+note, step C.
 """
 
 from __future__ import annotations
 
 import torch
 
+import vllm.envs as envs
 from vllm.models.qwen4_exp.nvidia.ops.nvfp4_kv import (
     nvfp4_entry_validity,
     nvfp4_side_views,
@@ -41,9 +44,22 @@ NVFP4_GATHER_SCRATCH_BYTES = 64 * 1024 * 1024
 
 __all__ = [
     "NVFP4_GATHER_SCRATCH_BYTES",
+    "nvfp4_fused_reader_enabled",
     "nvfp4_gather_rows_per_group",
     "qsa_sparse_attention_nvfp4",
 ]
+
+
+def nvfp4_fused_reader_enabled(override: bool | None = None) -> bool:
+    """Whether an NVFP4 cache is read inside the split-K kernel (no FP16 gather).
+
+    ``override`` (the ``nvfp4_fused_reader`` argument of the ops entry point) wins;
+    otherwise ``VLLM_SM70_QSA_NVFP4_FUSED_READER``, which is off by default: the
+    gather route is the one that has been measured.
+    """
+    if override is not None:
+        return override
+    return envs.VLLM_SM70_QSA_NVFP4_FUSED_READER
 
 
 def nvfp4_gather_rows_per_group(
