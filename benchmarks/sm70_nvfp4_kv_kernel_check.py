@@ -973,6 +973,29 @@ def error_in_band(measured: float, model: float) -> bool:
     return BAND_LOW <= measured / model <= BAND_HIGH
 
 
+# ------------------------------------------------------------------ poisoned context
+
+# After a device-side fault the CUDA context is dead: every later CUDA call in the process
+# raises the same sticky error, so the cases that follow would all read FAILED for a
+# reason that has nothing to do with them (2026-10-05, q15-w1b2: the M=5568 case hit an
+# illegal memory access and every later case "failed"). The run stops there instead.
+CONTEXT_POISON_MARKERS = (
+    "illegal memory access",
+    "unspecified launch failure",
+    "misaligned address",
+    "device-side assert",
+    "illegal instruction",
+)
+
+
+def is_context_poisoning(exc: BaseException) -> bool:
+    """True when ``exc`` is a CUDA error that leaves the context unusable."""
+    if type(exc).__name__ == "AcceleratorError":
+        return True
+    text = str(exc).lower()
+    return any(marker in text for marker in CONTEXT_POISON_MARKERS)
+
+
 # ------------------------------------------------------------------ verdicts
 
 
@@ -1051,6 +1074,9 @@ def compute_verdict(results: Sequence[dict[str, Any]]) -> dict[str, Any]:
             verdict["SCRATCH_ROUTE_WITHIN_TOLERANCE"] = "NO"
         else:
             verdict["SCRATCH_ROUTE_WITHIN_TOLERANCE"] = "YES" if routed else "UNKNOWN"
+    poisoned = [r["case"] for r in results if r.get("context_poisoned")]
+    verdict["CONTEXT_POISONED"] = "YES" if poisoned else "NO"
+    verdict["context_poisoned_at"] = poisoned[0] if poisoned else None
     verdict["errors"] = {r["case"]: r["error"] for r in results if r.get("error")}
     verdict["skipped"] = {r["case"]: r["skipped"] for r in results if r.get("skipped")}
     verdict["REFERENCE_ROWS"] = {
@@ -1140,9 +1166,17 @@ def format_verdict(
         "FUSED_MATCHES_GATHER",
         "SCRATCH_MATCHES_GATHER",
         "SCRATCH_ROUTE_WITHIN_TOLERANCE",
+        "CONTEXT_POISONED",
     ):
         if key in verdict:
             lines.append(f"{key}: {verdict[key]}")
+    if verdict.get("context_poisoned_at"):
+        not_run = sorted(r["case"] for r in results if r.get("context_poison_skip"))
+        lines.append(
+            f"CONTEXT_POISONED_AT {verdict['context_poisoned_at']}: the CUDA context "
+            f"died here; {len(not_run)} later case(s) were not run "
+            f"({', '.join(not_run) or 'none'}), their FAILED would be false"
+        )
     for r in results:
         scratch = r.get("prefill_scratch")
         if not scratch:
@@ -1412,10 +1446,13 @@ def compute_self_check(
     reasons += [f"stage {n} {v}" for n, v in stages.items() if v != "RAN"]
     reasons += [f"{r['case']} raised" for r in results if r.get("error")]
     reasons += [
-        f"{r['case']} skipped by the host-memory guard"
+        f"{r['case']} not run after CONTEXT_POISONED"
+        if r.get("context_poison_skip")
+        else f"{r['case']} skipped by the host-memory guard"
         for r in results
         if r.get("skipped")
     ]
+    reasons += [f"{r['case']} CONTEXT_POISONED" for r in results if r.get("context_poisoned")]
     return {
         "positive": positive,
         "negative": negative,
@@ -2394,12 +2431,20 @@ def _run_all_pinned(
     ref_chunk = getattr(args, "ref_chunk", REF_CHUNK_ROWS)
     max_host_gb = getattr(args, "max_host_gb", DEFAULT_MAX_HOST_GB)
     prefill_arm = "prefill_scratch" in getattr(args, "arms", ("gather",))
+    keep_going = bool(getattr(args, "continue_on_cuda_error", False))
+    poisoned_at: str | None = None
     for case in cases:
         entry: dict[str, Any] = {
             "case": case.label,
             "kind": case.kind,
             "rows": case.rows,
         }
+        if poisoned_at is not None:
+            entry["skipped"] = f"not run: CONTEXT_POISONED at {poisoned_at}"
+            entry["context_poison_skip"] = True
+            log(f"NOT_RUN {case.label}: CONTEXT_POISONED at {poisoned_at}")
+            results.append(entry)
+            continue
         checked = len(reference_rows(case.rows, ref_rows))
         entry["ref_rows"] = {"checked": checked, "total": case.rows}
         model = host_mem_model(
@@ -2457,10 +2502,20 @@ def _run_all_pinned(
         except Exception as exc:  # noqa: BLE001 - reported, the other cases still run
             entry["error"] = f"{type(exc).__name__}: {exc}"
             log(f"FAILED {case.label}: {entry['error']}")
+            if is_context_poisoning(exc) and not keep_going:
+                entry["context_poisoned"] = True
+                poisoned_at = case.label
+                log(
+                    f"CONTEXT_POISONED at {case.label}: the CUDA context is dead, "
+                    "stopping; later cases would fail for this reason alone "
+                    "(--continue-on-cuda-error runs them anyway)"
+                )
         results.append(entry)
 
     timings: dict[str, dict[str, Any]] = {}
-    if not args.no_timing:
+    if poisoned_at is not None:
+        log("TIMING SKIPPED: CONTEXT_POISONED")
+    elif not args.no_timing:
         for rows in sorted({c.rows for c in cases}):
             arms: dict[str, Callable[[], Any]] = {}
             for case in cases:
@@ -2527,6 +2582,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_MAX_HOST_GB,
         help="skip (SKIPPED line, not a crash) a case whose estimated host peak, "
         "this process's RSS plus the case's model, exceeds this many GiB; 0 = no limit",
+    )
+    parser.add_argument(
+        "--continue-on-cuda-error",
+        dest="continue_on_cuda_error",
+        action="store_true",
+        help="keep running the later cases after a CUDA fault (illegal memory access, "
+        "AcceleratorError). Off by default: the context is dead after such a fault, "
+        "the run stops with CONTEXT_POISONED and the later cases are NOT_RUN, because "
+        "their FAILED would be false",
     )
     parser.add_argument("--context", type=int, default=8192, help="tokens per request")
     parser.add_argument("--k-scale", type=float, default=DEFAULT_K_SCALE)

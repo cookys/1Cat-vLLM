@@ -155,9 +155,11 @@ def _gather_dequant_nvfp4_kernel(
     TABLE_WIDTH: tl.constexpr,
     HALF: tl.constexpr,
 ) -> None:
-    row = tl.program_id(0)
-    col = tl.program_id(1)
-    head = tl.program_id(2)
+    # int64 before any stride product: row * stride_out_row reaches 2**31 at about
+    # 4096 rows of topk 2051 x head_dim 256 (525,056 elements per row).
+    row = tl.program_id(0).to(tl.int64)
+    col = tl.program_id(1).to(tl.int64)
+    head = tl.program_id(2).to(tl.int64)
 
     request = tl.load(token_to_req_ptr + row)
     token = tl.load(indices_ptr + row * stride_indices_row + col)
@@ -386,8 +388,8 @@ def _dequant_nvfp4_prefix_kernel(
     """
     tile_head = tl.program_id(0)
     page = tl.program_id(1)
-    request = tl.program_id(2)
-    head = tile_head % HEADS
+    request = tl.program_id(2).to(tl.int64)
+    head = (tile_head % HEADS).to(tl.int64)
     tile = tile_head // HEADS
 
     seq_len = tl.load(seq_lens_ptr + request)
@@ -582,8 +584,8 @@ def _overlay_fp16_chunk_kernel(
     is invalid, whose position is outside ``[0, seq_len)`` or beyond the table, or
     whose scratch page does not fit, writes nothing.
     """
-    row = tl.program_id(0)
-    head = tl.program_id(1)
+    row = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1).to(tl.int64)
     request = tl.load(token_to_req_ptr + row)
     position = tl.load(positions_ptr + row)
     safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
@@ -748,8 +750,8 @@ def _store_nvfp4_kernel(
     PAGE_SIZE: tl.constexpr,
     GROUPS: tl.constexpr,
 ) -> None:
-    token = tl.program_id(0)
-    head = tl.program_id(1)
+    token = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1).to(tl.int64)
     slot = tl.load(slots_ptr + token)
     valid = (slot >= 0) & (slot < capacity)
     safe_slot = tl.maximum(slot, 0)

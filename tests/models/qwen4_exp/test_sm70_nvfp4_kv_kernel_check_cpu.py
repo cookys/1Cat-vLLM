@@ -1860,3 +1860,133 @@ def test_the_5_row_controls_equal_those_of_commit_017cbeb88(chk, monkeypatch):
 )
 def test_the_64_row_controls_equal_those_of_commit_017cbeb88(chk, monkeypatch):
     _run_against_golden(chk, monkeypatch, 64)
+
+
+# ------------------------------------------------------- a poisoned CUDA context
+class AcceleratorError(RuntimeError):
+    """Stands in for ``torch.AcceleratorError`` (matched by its class name)."""
+
+
+def test_only_faults_that_kill_the_context_count_as_poisoning(chk):
+    assert chk.is_context_poisoning(AcceleratorError("CUDA error: whatever"))
+    assert chk.is_context_poisoning(
+        RuntimeError("CUDA error: an illegal memory access was encountered")
+    )
+    assert chk.is_context_poisoning(RuntimeError("CUDA error: misaligned address"))
+    assert not chk.is_context_poisoning(ValueError("shape mismatch"))
+    assert not chk.is_context_poisoning(
+        torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 GiB")
+    )
+
+
+def _fake_case_run(fail_label, exc):
+    class FakeCaseRun:
+        def __init__(self, case, *args, **kwargs):
+            self.case = case
+
+        def run_nvfp4(self):
+            if self.case.label == fail_label:
+                raise exc
+            return {"gather": {"different": 0, "elements": 1, "max_abs": 0.0}}
+
+        def run_e4m3(self):
+            return {}
+
+        def timing_arms(self):
+            return {}
+
+    return FakeCaseRun
+
+
+def _run_poison_args(**extra):
+    return Namespace(
+        seed=0,
+        context=100,
+        k_scale=1.0,
+        v_scale=1.0,
+        no_timing=False,
+        rounds=1,
+        iters=1,
+        warmup=0,
+        **extra,
+    )
+
+
+def _poison_run(chk, monkeypatch, **extra):
+    geometry = chk.Geometry(head_dim=16, q_heads=1, kv_heads=1, topk=4, source="test")
+    cases = chk.plan_cases([32, 48, 64], None, [3])
+    exc = AcceleratorError("CUDA error: an illegal memory access was encountered")
+    monkeypatch.setattr(chk, "CaseRun", _fake_case_run(cases[1].label, exc))
+    logs: list[str] = []
+    results, timings = chk.run_all(
+        cases, geometry, {}, _run_poison_args(**extra), logs.append
+    )
+    return cases, results, timings, logs
+
+
+def test_a_poisoned_context_stops_the_run_and_the_later_cases_are_not_run(
+    chk, monkeypatch
+):
+    cases, results, timings, logs = _poison_run(chk, monkeypatch)
+    assert [r["case"] for r in results] == [c.label for c in cases]
+    first, poisoned, later = results
+    assert "error" not in first and not first.get("context_poisoned")
+    assert poisoned["context_poisoned"] and "AcceleratorError" in poisoned["error"]
+    assert later["context_poison_skip"] and "error" not in later
+    assert later["skipped"].startswith("not run: CONTEXT_POISONED")
+    assert timings == {}
+    assert "TIMING SKIPPED: CONTEXT_POISONED" in logs
+    assert any(line.startswith("CONTEXT_POISONED at") for line in logs)
+    assert not any(line.startswith("FAILED " + cases[2].label) for line in logs)
+
+    verdict = chk.compute_verdict(results)
+    assert verdict["CONTEXT_POISONED"] == "YES"
+    assert verdict["context_poisoned_at"] == cases[1].label
+    lines = chk.format_verdict(verdict, results)
+    assert "CONTEXT_POISONED: YES" in lines
+    assert any(
+        line.startswith(f"CONTEXT_POISONED_AT {cases[1].label}:")
+        and cases[2].label in line
+        for line in lines
+    )
+    assert chk.exit_code_for(results) == 1
+    check = chk.compute_self_check(results, timings)
+    assert check["verdict"] == "FAIL"
+    assert f"{cases[1].label} CONTEXT_POISONED" in check["reasons"]
+    assert f"{cases[2].label} not run after CONTEXT_POISONED" in check["reasons"]
+
+
+def test_the_continue_knob_keeps_the_old_behavior(chk, monkeypatch):
+    cases, results, _, logs = _poison_run(
+        chk, monkeypatch, continue_on_cuda_error=True
+    )
+    assert not any(r.get("context_poisoned") or r.get("context_poison_skip") for r in results)
+    assert results[1]["error"] and "error" not in results[2]
+    assert not any("CONTEXT_POISONED" in line for line in logs)
+    assert chk.compute_verdict(results)["CONTEXT_POISONED"] == "NO"
+
+
+def test_an_ordinary_error_does_not_stop_the_run(chk, monkeypatch):
+    geometry = chk.Geometry(head_dim=16, q_heads=1, kv_heads=1, topk=4, source="test")
+    cases = chk.plan_cases([32, 48, 64], None, [3])
+    monkeypatch.setattr(
+        chk, "CaseRun", _fake_case_run(cases[1].label, ValueError("bad shape"))
+    )
+    args = _run_poison_args()
+    args.no_timing = True
+    results, _ = chk.run_all(cases, geometry, {}, args, lambda m: None)
+    assert results[1]["error"] == "ValueError: bad shape"
+    assert not any(r.get("context_poison_skip") for r in results)
+    assert chk.compute_verdict(results)["CONTEXT_POISONED"] == "NO"
+
+
+def test_a_clean_run_prints_context_poisoned_no(chk):
+    results = [_ok_result(), _e4m3_result()]
+    assert "CONTEXT_POISONED: NO" in chk.format_verdict(
+        chk.compute_verdict(results), results
+    )
+
+
+def test_the_continue_flag_is_parsed_and_off_by_default(chk):
+    assert chk.parse_args([]).continue_on_cuda_error is False
+    assert chk.parse_args(["--continue-on-cuda-error"]).continue_on_cuda_error is True
