@@ -1259,6 +1259,10 @@ class MambaManager(SingleTypeKVCacheManager):
             self.last_state_block_idx: dict[str, list[int]] = {}
             # The set of the requests that have been allocated blocks
             self._allocated_block_reqs: set[str] = set()
+            # Whether the scheduler pipelines steps (async scheduling); decides
+            # how many superseded state blocks a running request holds. Defaults
+            # to the larger (async) figure; `KVCacheManager` narrows it.
+            self.async_scheduling = True
 
     @classmethod
     def find_longest_cache_hit(
@@ -1418,6 +1422,17 @@ class MambaManager(SingleTypeKVCacheManager):
                     # Old request. Needs at most 1 more blocks as we can reuse the
                     # speculative blocks in previous step.
                     num_new_blocks = 1
+                elif apply_admission_cap:
+                    # Admission of the full sequence: reserve what the request
+                    # holds once it is running, i.e. the running state, the
+                    # speculative blocks and the superseded blocks that await
+                    # release (`MAMBA_ALIGN_PENDING_STATE_BLOCKS_*`), not only
+                    # what its first chunk allocates. Otherwise a request whose
+                    # steady-state footprint exceeds the pool is admitted and
+                    # preempted in a loop.
+                    num_new_blocks = self.kv_cache_spec.align_steady_state_blocks(
+                        self.async_scheduling
+                    )
                 else:
                     # First prefill. Allocate 1 block for running state and the
                     # speculative blocks.

@@ -83,6 +83,16 @@ class KVCacheCoordinator(ABC):
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
 
+    def configure_async_scheduling(self, async_scheduling: bool) -> None:
+        """Tell the Mamba managers whether steps are pipelined (they reserve one
+        more superseded state block per request under async scheduling)."""
+        for manager in self.single_type_managers:
+            if (
+                isinstance(manager, MambaManager)
+                and manager.mamba_cache_mode == "align"
+            ):
+                manager.async_scheduling = async_scheduling
+
     def configure_prefix_cache_retention(self, interval: int | None) -> None:
         """Validate after 1Cat has resolved the heterogeneous cache geometry."""
         self.retention_interval = interval

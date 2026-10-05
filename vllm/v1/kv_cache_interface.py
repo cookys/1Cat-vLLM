@@ -682,6 +682,30 @@ class KpoolTailSpec(SlidingWindowSpec):
         return False
 
 
+# Superseded align-mode Mamba state blocks a running request still holds on top
+# of its running state and `num_speculative_blocks`. `MambaManager` records the
+# block a new allocation copies its state from and frees it in
+# `remove_skipped_blocks` once `idx < cdiv(processed_computed_tokens,
+# block_size) - 1`, so how long it lingers depends on how far
+# `processed_computed_tokens` lags the scheduled tokens:
+#   sync:  the previous step is processed, one superseded block is held
+#          (after allocate: 1 + spec + 1).
+#   async: the previous step is still in flight, its copy source cannot be freed
+#          yet and the newest one is recorded as well, two are held
+#          (after allocate: 1 + spec + 2).
+# Measured by tests/v1/core/test_mamba_align_state_block_leak.py.
+MAMBA_ALIGN_PENDING_STATE_BLOCKS_SYNC = 1
+MAMBA_ALIGN_PENDING_STATE_BLOCKS_ASYNC = 2
+
+
+def mamba_align_pending_state_blocks(async_scheduling: bool) -> int:
+    return (
+        MAMBA_ALIGN_PENDING_STATE_BLOCKS_ASYNC
+        if async_scheduling
+        else MAMBA_ALIGN_PENDING_STATE_BLOCKS_SYNC
+    )
+
+
 @dataclass(frozen=True)
 class MambaSpec(KVCacheSpec):
     shapes: tuple[tuple[int, ...], ...]
@@ -708,6 +732,16 @@ class MambaSpec(KVCacheSpec):
             return self.page_size_padded
         return page_size
 
+    def align_steady_state_blocks(self, async_scheduling: bool) -> int:
+        """State blocks one running request holds per group in align mode:
+        the running state, `num_speculative_blocks`, and the superseded blocks
+        still awaiting release (see `MAMBA_ALIGN_PENDING_STATE_BLOCKS_*`)."""
+        return (
+            1
+            + self.num_speculative_blocks
+            + mamba_align_pending_state_blocks(async_scheduling)
+        )
+
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         if vllm_config.cache_config.mamba_cache_mode == "all":
             max_model_len = vllm_config.model_config.max_model_len
@@ -715,7 +749,9 @@ class MambaSpec(KVCacheSpec):
                 cdiv(max_model_len, self.block_size) + self.num_speculative_blocks
             ) * self.page_size_bytes
         elif vllm_config.cache_config.mamba_cache_mode == "align":
-            return self.page_size_bytes * (2 + self.num_speculative_blocks)
+            return self.page_size_bytes * self.align_steady_state_blocks(
+                bool(getattr(vllm_config.scheduler_config, "async_scheduling", False))
+            )
         else:
             return self.page_size_bytes * (1 + self.num_speculative_blocks)
 
