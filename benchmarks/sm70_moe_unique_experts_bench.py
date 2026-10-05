@@ -190,52 +190,106 @@ def ncu_command(script: str, rows: int, u: int, out_dir: str, warmup: int, calls
 
 
 _UNIT_BYTES = {"byte": 1.0, "Kbyte": 1e3, "Mbyte": 1e6, "Gbyte": 1e9}  # assumed decimal
-_UNIT_SECONDS = {"second": 1.0, "msecond": 1e-3, "usecond": 1e-6, "nsecond": 1e-9}
+_UNIT_SECONDS = {"second": 1.0, "s": 1.0, "msecond": 1e-3, "ms": 1e-3, "usecond": 1e-6, "us": 1e-6,
+                 "nsecond": 1e-9, "ns": 1e-9}
+_METRIC_COLUMNS = {
+    "dram__bytes_read.sum": "bytes_read",
+    "dram__bytes_write.sum": "bytes_write",
+    "gpu__time_duration.sum": "seconds",
+}
+# ``--print-units base`` prints bytes and nanoseconds; used when a CSV has no unit row at all
+_DEFAULT_UNITS = {"bytes_read": "byte", "bytes_write": "byte", "seconds": "ns"}
 
 
 def _number(text: str) -> float:
     return float(text.replace(",", "").strip())
 
 
-def parse_ncu_csv(text: str) -> list[dict[str, Any]]:
-    """One dict per kernel launch: name, bytes_read, bytes_write, seconds.
+def _scale(field: str, unit: str) -> float:
+    table = _UNIT_SECONDS if field == "seconds" else _UNIT_BYTES
+    unit = unit.strip()
+    if unit not in table:
+        raise ValueError(f"unrecognised ncu unit {unit!r} for {field}; expected one of {sorted(table)}")
+    return table[unit]
 
-    Accepts ncu's ``--page raw`` (one row per launch, metric columns, optional unit
-    row) and ``--page details`` (one row per metric) CSV, with ``==PROF==`` lines
-    before the header tolerated.
+
+def parse_ncu_csv_counted(text: str) -> tuple[list[dict[str, Any]], int]:
+    """(launches, skipped): one dict per kernel launch with name, bytes_read, bytes_write, seconds.
+
+    Accepts ncu's ``--page raw`` (one row per launch, one column per metric, a unit row
+    right under the header) and ``--page details`` (one row per metric) CSV. ``==PROF==``
+    lines are skipped, the header is found by its ``ID`` and ``Kernel Name`` columns, and
+    ONLY the ID / Kernel Name / dram__bytes_read.sum / dram__bytes_write.sum /
+    gpu__time_duration.sum columns are read: the raw page also carries hundreds of device
+    attribute columns (``CC`` = ``No-CC`` ...) that are never parsed. Values are scaled by
+    the unit row (``byte``, ``ns``, ...). ``skipped`` counts launches whose required metric
+    was ``n/a`` or empty; those launches are dropped.
     """
-    lines = text.splitlines()
-    start = next((i for i, ln in enumerate(lines) if '"Kernel Name"' in ln or ln.startswith("ID,")), None)
+    rows = [r for r in csv.reader(io.StringIO(text)) if r and not r[0].startswith("==")]
+    start = next((i for i, r in enumerate(rows) if "Kernel Name" in r and "ID" in r), None)
     if start is None:
-        raise ValueError("no ncu CSV header with a Kernel Name column")
-    reader = csv.DictReader(io.StringIO("\n".join(lines[start:])))
+        raise ValueError("no ncu CSV header with ID and Kernel Name columns")
+    header = rows[start]
+    col = {name: i for i, name in enumerate(header)}
+    details = "Metric Name" in col
+    wanted = ("dram__bytes_read.sum", "gpu__time_duration.sum")
+    if not details and any(m not in col for m in wanted):
+        raise ValueError(f"raw-page CSV lacks metric column(s) {[m for m in wanted if m not in col]}")
+
+    def cell(row: Sequence[str], name: str) -> str:
+        i = col[name]
+        return row[i].strip() if i < len(row) else ""
+
+    units = dict(_DEFAULT_UNITS)
     launches: dict[str, dict[str, Any]] = {}
-    for row in reader:
-        ident = (row.get("ID") or "").strip()
+    broken: set[str] = set()
+    for row in rows[start + 1:]:
+        ident = cell(row, "ID")
         if not ident.isdigit():
-            continue  # unit row of the raw page
-        launch = launches.setdefault(ident, {"id": int(ident), "name": row["Kernel Name"]})
-        if "Metric Name" in row:  # details page
-            _store(launch, row["Metric Name"], row["Metric Value"], row.get("Metric Unit", ""))
+            # the unit row of the raw page: empty ID, units under the metric columns
+            if not ident and not details:
+                for metric, field in _METRIC_COLUMNS.items():
+                    if metric in col and cell(row, metric):
+                        _scale(field, cell(row, metric))  # reject units we cannot convert
+                        units[field] = cell(row, metric)
+            continue
+        launch = launches.setdefault(ident, {"id": int(ident), "name": cell(row, "Kernel Name")})
+        if details:
+            field = next((f for m, f in _METRIC_COLUMNS.items() if cell(row, "Metric Name").startswith(m)), None)
+            if field is not None:
+                _store(launch, field, cell(row, "Metric Value"), cell(row, "Metric Unit") or _DEFAULT_UNITS[field], broken)
         else:
-            for key, value in row.items():
-                if key and "__" in key and value not in (None, ""):
-                    _store(launch, key, value, "")
-    return sorted(launches.values(), key=lambda d: d["id"])
+            for metric, field in _METRIC_COLUMNS.items():
+                if metric in col:
+                    _store(launch, field, cell(row, metric), units[field], broken)
+    out = [x for x in sorted(launches.values(), key=lambda d: d["id"]) if str(x["id"]) not in broken]
+    out = [x for x in out if "bytes_read" in x and "seconds" in x]
+    return out, len(launches) - len(out)
 
 
-def _store(launch: dict[str, Any], metric: str, value: str, unit: str) -> None:
-    v = _number(value)
-    if metric.startswith("dram__bytes_read"):
-        launch["bytes_read"] = v * _UNIT_BYTES.get(unit, 1.0)
-    elif metric.startswith("dram__bytes_write"):
-        launch["bytes_write"] = v * _UNIT_BYTES.get(unit, 1.0)
-    elif metric.startswith("gpu__time_duration"):
-        # raw page without units: base units are seconds; details page names the unit
-        launch["seconds"] = v * _UNIT_SECONDS.get(unit, 1.0)
+def parse_ncu_csv(text: str) -> list[dict[str, Any]]:
+    return parse_ncu_csv_counted(text)[0]
 
 
-def summarize_ncu(launches: Sequence[dict[str, Any]], u: int, model_bytes: int) -> dict[str, Any]:
+def _store(launch: dict[str, Any], field: str, value: str, unit: str, broken: set[str]) -> None:
+    try:
+        v = _number(value)
+    except ValueError:
+        if value.strip().lower() in ("", "n/a"):
+            if field != "bytes_write":  # a missing write counter is tolerated, a missing read/time is not
+                broken.add(str(launch["id"]))
+            return
+        raise
+    launch[field] = v * _scale(field, unit)
+
+
+def kernel_label(name: str) -> str:
+    m = re.search(r"(\w+_kernel)\b", name)
+    return m.group(1) if m else name
+
+
+def summarize_ncu(launches: Sequence[dict[str, Any]], u: int, model_bytes: int,
+                  rows: int | None = None, skipped: int = 0) -> dict[str, Any]:
     w13 = [x for x in launches if "w13_kernel" in x["name"]]
     w2 = [x for x in launches if "w2_" in x["name"]]
     calls = min(len(w13), len(w2))
@@ -246,9 +300,27 @@ def summarize_ncu(launches: Sequence[dict[str, Any]], u: int, model_bytes: int) 
     secs = [w13[i]["seconds"] + w2[i]["seconds"] for i in range(calls)]
     read = statistics.median(reads)
     sec = statistics.median(secs)
+    per_kernel: dict[str, dict[str, Any]] = {}
+    for x in launches:
+        k = per_kernel.setdefault(kernel_label(x["name"]), {"n": 0, "read": 0.0, "write": 0.0, "seconds": 0.0})
+        k["n"] += 1
+        k["read"] += x["bytes_read"]
+        k["write"] += x.get("bytes_write", 0.0)
+        k["seconds"] += x["seconds"]
+    for k in per_kernel.values():
+        k["read_per_launch"] = k["read"] / k["n"]
+        k["bytes_per_unique_expert"] = k["read_per_launch"] / u
+        k["gbps"] = k["read"] / k["seconds"] / 1e9 if k["seconds"] > 0 else float("nan")
     return {
+        "M": rows,
         "U": u,
         "calls": calls,
+        "kernel_rows": len(launches),
+        "skipped": skipped,
+        "total_read": sum(x["bytes_read"] for x in launches),
+        "total_write": sum(x.get("bytes_write", 0.0) for x in launches),
+        "total_seconds": sum(x["seconds"] for x in launches),
+        "per_kernel": per_kernel,
         "bytes_read": read,
         "bytes_write": statistics.median(writes),
         "bytes_per_unique_expert": read / u,
@@ -260,23 +332,45 @@ def summarize_ncu(launches: Sequence[dict[str, Any]], u: int, model_bytes: int) 
     }
 
 
-def format_ncu_table(rows: Sequence[dict[str, Any]]) -> list[str]:
+def format_ncu_table(rows: Sequence[dict[str, Any]], expected: dict[str, int] | None = None) -> list[str]:
+    """Per-file table (per-call medians) then per-kernel sub-totals; ``expected`` = {'w13': B, 'w2': B}."""
     out = [
-        "NCU_TABLE (replay serialises kernels: GB/s here is ncu-time based, not serving-level)",
-        f"{'U':>3} {'calls':>5} {'bytes_read':>12} {'B/unique':>10} {'vs768000':>8} "
-        f"{'x691200':>8} {'GB/s':>7} {'%672':>6}",
+        "NCU_TABLE (replay serialises kernels: GB/s here is ncu-time based, not serving-level; bytes/GB/s per call = median)",
+        f"{'M':>2} {'U':>3} {'calls':>5} {'rows':>4} {'skip':>4} {'bytes_read':>12} {'B/unique':>10} {'vs768000':>8} "
+        f"{'x691200':>8} {'GB/s':>7} {'%672':>6} {'sum_read':>12} {'sum_write':>10} {'sum_us':>9}",
     ]
     for r in rows:
         out.append(
-            f"{r['U']:>3} {r['calls']:>5} {r['bytes_read']:>12.0f} {r['bytes_per_unique_expert']:>10.0f} "
+            f"{r.get('M') or '-':>2} {r['U']:>3} {r['calls']:>5} {r['kernel_rows']:>4} {r['skipped']:>4} "
+            f"{r['bytes_read']:>12.0f} {r['bytes_per_unique_expert']:>10.0f} "
             f"{r['vs_model_768000']:>8.3f} {r['vs_e4m3_691200_multiple']:>8.2f} "
-            f"{r['gbps_ncu']:>7.1f} {r['pct_roofline']:>6.1f}"
+            f"{r['gbps_ncu']:>7.1f} {r['pct_roofline']:>6.1f} "
+            f"{r['total_read']:>12.0f} {r['total_write']:>10.0f} {r['total_seconds'] * 1e6:>9.1f}"
         )
+    out += [
+        "NCU_PER_KERNEL (read bytes per launch / U = per unique expert; expected = fp16-scale model split)",
+        f"{'M':>2} {'U':>3} {'kernel':<24} {'n':>3} {'read/launch':>12} {'B/unique':>9} {'expected':>9} {'ratio':>6} "
+        f"{'write/launch':>12} {'us/launch':>9} {'GB/s':>7}",
+    ]
+    for r in rows:
+        for name, k in r["per_kernel"].items():
+            exp = (expected or {}).get("w13" if name.startswith("w13") else "w2")
+            out.append(
+                f"{r.get('M') or '-':>2} {r['U']:>3} {name:<24} {k['n']:>3} {k['read_per_launch']:>12.0f} "
+                f"{k['bytes_per_unique_expert']:>9.0f} {exp if exp else '-':>9} "
+                f"{(k['bytes_per_unique_expert'] / exp if exp else float('nan')):>6.3f} "
+                f"{k['write'] / k['n']:>12.0f} {k['seconds'] / k['n'] * 1e6:>9.2f} {k['gbps']:>7.1f}"
+            )
     return out
 
 
 def u_from_name(path: str) -> int | None:
     m = re.search(r"U(\d+)", Path(path).name)
+    return int(m.group(1)) if m else None
+
+
+def m_from_name(path: str) -> int | None:
+    m = re.search(r"_M(\d+)", Path(path).name)
     return int(m.group(1)) if m else None
 
 
@@ -550,8 +644,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             if u is None:
                 print(f"cannot tell U for {path}: name it ..._U<n>.csv or pass --u-list per file")
                 return 2
-            out.append(summarize_ncu(parse_ncu_csv(Path(path).read_text()), u, model["total"]))
-        print("\n".join(format_ncu_table(sorted(out, key=lambda r: r["U"]))))
+            launches, skipped = parse_ncu_csv_counted(Path(path).read_text())
+            out.append(summarize_ncu(launches, u, model["total"], rows=m_from_name(path), skipped=skipped))
+        expected = {"w13": model["w13"], "w2": model["w2"]}
+        print("\n".join(format_ncu_table(sorted(out, key=lambda r: (r["M"] or 0, r["U"])), expected)))
         return 0
     plan = {m: [u for u in args.u_list if feasible(m, shapes.top_k, shapes.experts, u)] for m in args.rows}
     for m, us in plan.items():

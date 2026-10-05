@@ -128,6 +128,48 @@ def test_parse_raw_page_and_summary(bench):
     assert "774400" in "\n".join(bench.format_ncu_table([row]))
 
 
+# Shape of the real ``--csv --page raw --print-units base`` output (Q1.2, 2026-10-05): two ==PROF==
+# lines, a header with hundreds of columns (device attributes whose values are text such as
+# No-CC / CachePreferNone, some with "__" in the name), a unit row, then one row per launch.
+REAL_SHAPE_CSV = """==PROF== Connected to process 1758033 (/usr/bin/python3.12)
+"ID","Process ID","Process Name","Host Name","Kernel Name","Context","Stream","Block Size","Grid Size","Device","CC","c2clink__enabled_mask","device__attribute_confidential_computing_mode","launch__func_cache_config","dram__bytes_read.sum","dram__bytes_write.sum","gpu__time_duration.sum"
+"","","","","","","","","","","","","","","byte","byte","ns"
+"0","1758033","python3.12","127.0.0.1","void <unnamed>::w13_kernel<4, 1>(const __half *, const int *)","1","7","(256, 1, 1)","(5, 20, 1)","0","7.0","0x3","No-CC","CachePreferNone","5,156,128","5,760","28,448"
+"1","1758033","python3.12","127.0.0.1","<unnamed>::w2_batch_reduce_kernel(const __half *, const float *, int)","1","7","(1024, 1, 1)","(80, 1, 1)","0","7.0","0x3","No-CC","CachePreferNone","2,591,712","0","13,312"
+==PROF== Disconnected from process 1758033
+"""
+
+
+def test_parse_real_shape_raw_page_with_attribute_columns(bench):
+    launches, skipped = bench.parse_ncu_csv_counted(REAL_SHAPE_CSV)
+    assert skipped == 0 and [x["id"] for x in launches] == [0, 1]
+    assert launches[0]["bytes_read"] == 5_156_128 and launches[0]["bytes_write"] == 5_760
+    assert launches[0]["seconds"] == pytest.approx(28_448e-9)  # ns from the unit row
+    row = bench.summarize_ncu(launches, u=10, model_bytes=768_000, rows=5, skipped=skipped)
+    assert row["total_read"] == 5_156_128 + 2_591_712 and row["kernel_rows"] == 2
+    assert row["total_write"] == 5_760 and row["total_seconds"] == pytest.approx(41_760e-9)
+    assert row["bytes_per_unique_expert"] == pytest.approx(774_784)  # 7,747,840 / 10
+    assert row["vs_model_768000"] == pytest.approx(774_784 / 768_000)
+    assert set(row["per_kernel"]) == {"w13_kernel", "w2_batch_reduce_kernel"}
+    assert row["per_kernel"]["w13_kernel"]["bytes_per_unique_expert"] == pytest.approx(515_612.8)
+    assert row["per_kernel"]["w2_batch_reduce_kernel"]["gbps"] == pytest.approx(2_591_712 / 13_312e-9 / 1e9)
+    table = "\n".join(bench.format_ncu_table([row], {"w13": 512_000, "w2": 256_000}))
+    assert "NCU_PER_KERNEL" in table and "w2_batch_reduce_kernel" in table
+
+
+def test_parse_counts_na_rows_and_rejects_unknown_unit(bench):
+    na = REAL_SHAPE_CSV.replace('"2,591,712"', '"n/a"')
+    launches, skipped = bench.parse_ncu_csv_counted(na)
+    assert skipped == 1 and [x["id"] for x in launches] == [0]
+    with pytest.raises(ValueError, match="unrecognised ncu unit"):
+        bench.parse_ncu_csv(REAL_SHAPE_CSV.replace('"byte","byte","ns"', '"byte","byte","furlong"'))
+
+
+def test_m_from_name(bench):
+    assert bench.m_from_name("/d/ncu_M5_U30.csv") == 5 and bench.m_from_name("/d/ncu_M1_U10.csv") == 1
+    assert bench.m_from_name("/d/other.csv") is None
+
+
 def test_parse_details_page_with_units(bench):
     launches = bench.parse_ncu_csv(DETAILS_CSV)
     assert len(launches) == 2
@@ -191,4 +233,5 @@ def test_main_parse_ncu(bench, capsys, tmp_path):
     path = tmp_path / "ncu_M5_U20.csv"
     path.write_text(RAW_CSV)
     assert bench.main(["--parse-ncu", str(path)]) == 0
-    assert "NCU_TABLE" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "NCU_TABLE" in out and "NCU_PER_KERNEL" in out
