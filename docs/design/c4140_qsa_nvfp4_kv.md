@@ -317,7 +317,7 @@ decode 的 M5 與 M1 都在一組內；prefill 的列數大時逐組處理，預
 ### 2026-10-05：融合 reader 已建（CPU）
 
 上面「只有計畫」的描述到 2026-10-05 為止；tip `e56be74f1`（`[Kernel][SM70] Fused NVFP4 reader in the QSA split-K kernel (KV_NVFP4, plan 071 step C)`）起有程式。
-**所有證據都是 CPU（直譯器與 sm_70 編譯閘門）；GPU 上沒有跑過任何一項【沒數據】。**
+**下面各條（內容、旋鈕、編譯閘門、直譯器 parity）的證據是 CPU（直譯器與 sm_70 編譯閘門）；GPU 的 kernel 層級結果在本節最後的「GPU 結果（Q1.2）」（2026-10-05），serving 層級仍沒有【沒數據】。**
 
 - **內容**：`_qsa_sparse_paged_gqa_splitk_kernel`（`vllm/models/qwen4_exp/nvidia/ops/qsa.py`）加 `KV_NVFP4` constexpr 分支，不是新內核。
   K tile 解成偶／奇兩半 `[HEAD_DIM/2, BLOCK_N]`，QK = 兩次 K=128 的 `tl.dot`；V 兩個半累加器，最後 stride 2 寫回；
@@ -344,9 +344,32 @@ decode 的 M5 與 M1 都在一組內；prefill 的列數大時逐組處理，預
 - **測試數**（NVFP4 檔案：`test_nvfp4_kv_*.py`、`test_sm70_nvfp4_kv_kernel_check_cpu.py`、`test_sm70_moe_unique_experts_bench_cpu.py`）：
   直譯器 440 passed、32 skipped；預設 377 passed、95 skipped。
   ⚠ 不要對整個 `tests/models/qwen4_exp/` 跑 pytest：沒有 GPU 時 GPU-only 模組在收集階段就報 No CUDA；只跑上列檔案。
-- **【沒數據】（全部要 GPU 窗）**：fused 的實際 occupancy 與 decode `round_ms`（M1 的懲罰是 +0.898 ms/round，閘門 4 目標是回到約 E4M3）；prefill 對 E4M3 的比（閘門 4 要 ≥ 0.9，M1 是 0.435／0.459）；
-  `FUSED_MATCHES_GATHER`、`FUSED_ROUNDTRIP_US` 的實測；fused 路由放進 serve 後的 12 案 parity 與 `kv-logprob-probe`；M=5（MTP4 verify）。
+- **【沒數據】（剩下的，都要 GPU 窗；Q1.2 已量掉 `FUSED_MATCHES_GATHER`、`FUSED_ROUNDTRIP_US`，見下）**：fused 的 prefill 對 E4M3 的比（閘門 4 要 ≥ 0.9，M1 是 0.435／0.459；kernel 自檢只有 decode 列）；
+  255 暫存器（4 warps，已在上限）對長 context occupancy 的影響；serving 層級的 decode `round_ms`（M1 的懲罰是 +0.898 ms/round，閘門 4 目標是回到約 E4M3）；fused 路由放進 serve 後的 12 案 parity 與 `kv-logprob-probe`；M=5（MTP4 verify）的 serving 層級。
   環境變數的轉發：serve script 經 `scripts/fence.sh`（`systemd-run --user --scope`，前景，繼承 cwd 與 env）啟動 `vllm serve`，呼叫端 export 的 `VLLM_SM70_QSA_NVFP4_FUSED_READER=1` 會到達 server 行程（Fable 讀 fence.sh 第 20 行確認，機制同 production 的 `VLLM_SM70_SAMPLING_CUDAGRAPH=1`）；server 上的實際行為仍未跑過【沒數據】。
+
+#### GPU 結果（Q1.2，2026-10-05）
+
+lead 的 GPU 窗（08:47，GPU 0，Tesla V100-SXM2-32GB，tip `19d328ea7`，venv `1cat-p070`，TP4 幾何 head 256／6 個 q head／1 個 kv head／top-k 2051）。
+原始檔 `/data/bench/q12-20261005-084455/{SUMMARY.txt,kernel-check.txt,kernel-check.json}`；`benchmarks/sm70_nvfp4_kv_kernel_check.py --arms gather fused --rounds 4`，exit 0，`SELF_CHECK: PASS`
+（8 項正向對照 PASS、10 項負向對照全 FLAGGED，含走 fused 路由的 `nibble_order_swapped`、`scale_placement_wrong`；9 個階段都 RAN，含 `decode_fused`）。
+
+- **正確性【已量】**：`FUSED_MATCHES_GATHER: YES`。fused 對 gather：max|d| 4.883e-4（M=1）／1.953e-3（M=5），relL2 7.665e-6／1.667e-5，在 fp16 捨入量級（兩段 K=128 的 dot，依設計不逐位元相同）。
+  `FUSED_VS_FP16` relL2 0.3478（M=1）／0.2232（M=5），與 gather 路徑的 `DECODE_VS_FP16` 完全相同；`NVFP4_BAND` 對 CPU 模型比值 1.000（帶 0.7–1.4）。
+- **每次 launch 往返（µs，中位數，B2784／B2864）【已量】**：
+
+| | gather 路徑 | fused | fused／gather（`FUSED_ROUNDTRIP_US`） | E4M3（B1616） | fused − E4M3 |
+|---|---:|---:|---:|---:|---:|
+| M=1 | 697.3／693.2 | 209.9／199.7 | 0.30／0.29 | 171.0 | +38.9／+28.7 |
+| M=5 | 701.4／698.4 | 267.3／267.3 | 0.38／0.38 | 187.4 | +79.9／+79.9 |
+
+  這個往返每次 launch 含約 22 µs host 間隙，比差、不比絕對值。E4M3 對照用 B1616，NVFP4 用 B2784／B2864，同為 context 8192、頁數不同。
+  fused 拿掉 gather 路徑對 E4M3 的懲罰：M=1 (697.3−209.9)/(697.3−171.0) ≈ 93 %（B2864 ≈ 95 %）、M=5 ≈ 84 %（算式是用上表重算）。
+  同次的 `decode_fp16_dequantized`（吃現成暫存的 FP16 內核）是 175.1／171.0（M=1）、184.3／182.3（M=5），所以 fused 比「已反量化的 FP16 reader」還貴約 +35／+29 µs（M=1）、+83／+85 µs（M=5）：殘差來自 fused 內核本身，不是 gather。
+- **serving 層級殘差【估計】，不是量測**：M1 的 serving 懲罰 +0.898 ms/round（no-MTP、12 個 QSA 層）對應 harness 的 gather 路徑懲罰 (697.3−171.0)×12 ≈ 6.32 ms，serving／harness ≈ 0.142。
+  (a) 殘差按同比例縮（host 間隙在 graph replay 消失）：M=1 約 +0.05–0.07 ms、M=5 約 +0.14 ms；(b) 殘差全是 GPU 時間、不縮：M=1 約 +0.34–0.47 ms、M=5 約 +0.96 ms。
+  fused 與 E4M3 同為兩個 launch（split-K 加 merge；merge 內核沒改），host 間隙占殘差的比例【沒數據】，所以 (a) 只是下界。兩端都不低於閘門 4 的 decode 門檻（production + 2× spread，約 +0.04 ms）；verdict 要等 chain19 的 `nvfp4_fused` 臂（plan 072 queue Q1.4）。
+- **仍然【沒數據】**：prefill 比值；255 暫存器的 occupancy 效應（長 context）；serve 內的 12 案 parity 與 `kv-logprob-probe`；M=5 的 serving 層級。
 
 ## 步驟 D：reader 接進稀疏注意力，先 gather 再走 FP16
 
