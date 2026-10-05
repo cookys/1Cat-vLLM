@@ -452,6 +452,11 @@ if TYPE_CHECKING:
     VLLM_SM70_MTP_DRAFT_NVFP4_RERANK_K: int = 64
     VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_DIR: str | None = None
     VLLM_SM70_MTP_DRAFT_HIDDEN_DUMP_STEPS: int = 256
+    VLLM_SM70_EXPERT_ROUTING_DUMP_DIR: str | None = None
+    VLLM_SM70_EXPERT_ROUTING_DUMP_STEPS: int = 256
+    VLLM_SM70_EXPERT_ROUTING_DUMP_WEIGHTS: bool = True
+    VLLM_SM70_EXPERT_ROUTING_DUMP_MAX_ROWS: int = 64
+    VLLM_SM70_EXPERT_ROUTING_DUMP_RANKS: str = "all"
     VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH: int = 0
     VLLM_SM70_ASYNC_STAGED_INPUT_PREP: bool = False
     VLLM_SM70_ASYNC_CPU_TRACE: bool = False
@@ -6394,6 +6399,92 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="debug",
         declared_default="256",
         effective_default="256",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+    ),
+    # Diagnostic expert-routing dump (see fused_moe/expert_routing_dump.py): the
+    # router's top-k expert ids/weights of every MoE layer, staged by two copies
+    # per layer call (recorded into the CUDA graphs), read back asynchronously
+    # after each step and written to npz files every N steps.
+    "VLLM_SM70_EXPERT_ROUTING_DUMP_DIR": env_var(
+        lambda: os.getenv("VLLM_SM70_EXPERT_ROUTING_DUMP_DIR") or None,
+        description=(
+            "Diagnostic: directory where every TP rank dumps the router's "
+            "top-k expert ids (and weights) of every MoE layer for every "
+            "decode step and prefill chunk, as rank<r>/routing_<first>_<last>"
+            ".npz files plus meta.json and index.jsonl. Per step the file "
+            "holds the target model's layers, the MTP draft layer for each "
+            "draft step, the request id and position of every token row and "
+            "a prefill flag. Works with CUDA graphs ON: each MoE layer call "
+            "copies its top-k ids/weights into a static staging buffer "
+            "(two device copies, recorded into the graphs) and the eager "
+            "call site after each step reads the buffers back with "
+            "asynchronous device-to-host copies; the host synchronizes once "
+            "per file. Unset (default) means no dumper exists, nothing is "
+            "captured and the MoE runner pays one module-attribute check "
+            "per layer call (not per graph replay). Does not change any "
+            "computed value."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+    ),
+    "VLLM_SM70_EXPERT_ROUTING_DUMP_STEPS": env_var(
+        lambda: int(os.getenv("VLLM_SM70_EXPERT_ROUTING_DUMP_STEPS", "256")),
+        description=(
+            "Number of model steps per routing npz file of "
+            "VLLM_SM70_EXPERT_ROUTING_DUMP_DIR; also the size of the pinned "
+            "host ring that holds the steps between two flushes. Values of 0 "
+            "or less disable the dump."
+        ),
+        category="debug",
+        declared_default="256",
+        effective_default="256",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+    ),
+    "VLLM_SM70_EXPERT_ROUTING_DUMP_WEIGHTS": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_EXPERT_ROUTING_DUMP_WEIGHTS", "1"))),
+        description=(
+            "Also dump the float16 routing weights of the target layers "
+            "(target_topk_weight) when VLLM_SM70_EXPERT_ROUTING_DUMP_DIR is "
+            "set. 0 skips the weight staging copies and the array."
+        ),
+        category="debug",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+    ),
+    "VLLM_SM70_EXPERT_ROUTING_DUMP_MAX_ROWS": env_var(
+        lambda: int(os.getenv("VLLM_SM70_EXPERT_ROUTING_DUMP_MAX_ROWS", "64")),
+        description=(
+            "Token rows per step that VLLM_SM70_EXPERT_ROUTING_DUMP_DIR "
+            "records (capacity of the staging buffers and the host ring). "
+            "Rows beyond it (the tail of a large prefill chunk, or "
+            "concurrency x (1 + draft steps) above it) are dropped and "
+            "counted in meta.json and index.jsonl. A step has one row per "
+            "scheduled token, so MTP4 at concurrency c needs 5c rows."
+        ),
+        category="debug",
+        declared_default="64",
+        effective_default="64",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+    ),
+    "VLLM_SM70_EXPERT_ROUTING_DUMP_RANKS": env_var(
+        lambda: os.getenv("VLLM_SM70_EXPERT_ROUTING_DUMP_RANKS", "all"),
+        description=(
+            "Which TP ranks dump when VLLM_SM70_EXPERT_ROUTING_DUMP_DIR is "
+            "set: 'all' (default) or a comma-separated list such as '0'. "
+            "The router is replicated, so every rank sees identical ids; "
+            "'0' cuts the output four-fold on TP4."
+        ),
+        category="debug",
+        declared_default="'all'",
+        effective_default="'all'",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
     ),
@@ -16819,6 +16910,13 @@ def compile_factors() -> dict[str, object]:
         "LD_LIBRARY_PATH",
         "VLLM_SERVER_DEV_MODE",
         "VLLM_SM70_REQUIRE_PROFILE_ACCELERATION",
+        # The routing dump never touches the compiled graph (its hook runs in
+        # the opaque MoE op), so setting it must not change the cache key.
+        "VLLM_SM70_EXPERT_ROUTING_DUMP_DIR",
+        "VLLM_SM70_EXPERT_ROUTING_DUMP_STEPS",
+        "VLLM_SM70_EXPERT_ROUTING_DUMP_WEIGHTS",
+        "VLLM_SM70_EXPERT_ROUTING_DUMP_MAX_ROWS",
+        "VLLM_SM70_EXPERT_ROUTING_DUMP_RANKS",
         "VLLM_DP_MASTER_IP",
         "VLLM_DP_MASTER_PORT",
         "VLLM_NIXL_SIDE_CHANNEL_HOST",

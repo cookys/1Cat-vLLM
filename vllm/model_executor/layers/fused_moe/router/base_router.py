@@ -171,10 +171,23 @@ class BaseRouter(FusedMoERouter):
         self.eplb_state = eplb_state
         self.indices_type_getter = indices_type_getter
         self.capture_fn: Callable[[torch.Tensor], None] | None = None
+        self.dump_fn: Callable[[torch.Tensor, torch.Tensor], None] | None = None
 
     def set_capture_fn(self, capture_fn: Callable[[torch.Tensor], None] | None) -> None:
         """Set a capture callback for logical routed expert IDs."""
         self.capture_fn = capture_fn
+
+    def set_dump_fn(
+        self, dump_fn: Callable[[torch.Tensor, torch.Tensor], None] | None
+    ) -> None:
+        """Set the diagnostic routing-dump callback ``(topk_weights, topk_ids)``.
+
+        Called with the router's final outputs (VLLM_SM70_EXPERT_ROUTING_DUMP_DIR,
+        see ``expert_routing_dump``).  It runs where ``select_experts`` runs: in
+        the opaque MoE custom op, i.e. during CUDA graph capture and in eager
+        steps, never in a replay.
+        """
+        self.dump_fn = dump_fn
 
     def _validate_eplb_state(self) -> None:
         """Validate that EPLB state is properly initialized if EPLB is enabled."""
@@ -294,5 +307,8 @@ class BaseRouter(FusedMoERouter):
 
         # Step 5: Convert indices dtype
         topk_ids = self._convert_indices_dtype(topk_ids, indices_type)
+
+        if self.dump_fn is not None:
+            self.dump_fn(topk_weights, topk_ids)
 
         return topk_weights, topk_ids
