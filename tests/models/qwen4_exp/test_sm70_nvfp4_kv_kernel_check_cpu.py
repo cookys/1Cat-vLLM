@@ -1312,3 +1312,78 @@ def test_a_chunk_too_short_for_the_cuda_route_is_not_held_against_the_route(chk)
     )
     assert only_short["positive"]["SCRATCH_ROUTE_WITHIN_TOLERANCE"] == "SKIPPED"
     assert only_short["verdict"] == "FAIL"
+
+
+# ------------------------------------------------- the route knobs are pinned
+def test_the_route_knobs_are_pinned_inside_the_context_and_restored_after(
+    chk, monkeypatch
+):
+    monkeypatch.setenv("VLLM_SM70_QSA_NVFP4_FUSED_READER", "1")
+    monkeypatch.setenv("VLLM_SM70_QSA_NVFP4_PREFILL_MIN_ROWS", "8")
+    monkeypatch.delenv("VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH", raising=False)
+    with chk.pinned_route_knobs():
+        for name, value in chk.ROUTE_KNOBS.items():
+            assert os.environ[name] == value
+        assert chk.ROUTE_KNOBS["VLLM_SM70_QSA_NVFP4_FUSED_READER"] == "0"
+        assert chk.ROUTE_KNOBS["VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH"] == "0"
+        assert chk.ROUTE_KNOBS["VLLM_SM70_QSA_NVFP4_PREFILL_MIN_ROWS"] == "64"
+    assert os.environ["VLLM_SM70_QSA_NVFP4_FUSED_READER"] == "1"
+    assert os.environ["VLLM_SM70_QSA_NVFP4_PREFILL_MIN_ROWS"] == "8"
+    assert "VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH" not in os.environ
+    assert chk.ambient_route_knobs() == {
+        "VLLM_SM70_QSA_NVFP4_FUSED_READER": "1",
+        "VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH": None,
+        "VLLM_SM70_QSA_NVFP4_PREFILL_MIN_ROWS": "8",
+    }
+
+
+def test_the_pin_is_restored_when_the_run_raises(chk, monkeypatch):
+    monkeypatch.setenv("VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH", "1")
+    with pytest.raises(RuntimeError):
+        with chk.pinned_route_knobs():
+            raise RuntimeError("boom")
+    assert os.environ["VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH"] == "1"
+
+
+@pytest.mark.skipif(not INTERPRETER, reason="needs TRITON_INTERPRET=1")
+def test_an_exported_serving_environment_does_not_move_the_decode_controls(
+    chk, monkeypatch
+):
+    """W1 of plan 071 exported FUSED_READER=1 and PREFILL_SCRATCH=1 (the chain's
+    environment): the decode-path controls then ran the fused reader and read NO, and
+    the timed gather arm was the fused reader. The run pins the knobs, so it reads the
+    same as with a clean environment."""
+    from vllm.v1.attention.backends import fa_utils
+
+    fa_utils.get_flash_attn_version = lambda *args, **kwargs: 2
+    monkeypatch.setattr(chk, "WORKER_DEVICE", "cpu")
+    monkeypatch.setenv("VLLM_SM70_QSA_NVFP4_FUSED_READER", "1")
+    monkeypatch.setenv("VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH", "1")
+    args = Namespace(
+        seed=0,
+        context=100,
+        k_scale=chk.DEFAULT_K_SCALE,
+        v_scale=chk.DEFAULT_V_SCALE,
+        no_timing=True,
+        rounds=1,
+        iters=1,
+        warmup=0,
+        arms=["gather", "fused", "prefill_scratch"],
+    )
+    geometry = chk.Geometry(head_dim=256, q_heads=6, kv_heads=1, topk=16, source="test")
+    cases = chk.plan_cases([32], 32, [3])
+    logs: list[str] = []
+    with torch.inference_mode():
+        results, _ = chk.run_all(
+            cases, geometry, chk.load_kernels(), args, logs.append
+        )
+    assert not any(r.get("error") for r in results), results
+    verdict = chk.compute_verdict(results)
+    assert verdict["ZERO_FILL_OK"] == "YES", chk.format_verdict(verdict, results)
+    assert verdict["DECODE_PATH_IDENTICAL"] == "YES"
+    assert verdict["FUSED_MATCHES_GATHER"] == "YES"
+    nvfp4 = next(r for r in results if r["kind"] == "nvfp4")
+    assert nvfp4["decode_path"]["max_abs"] == 0.0
+    assert any(line.startswith("ROUTE_KNOBS ambient") for line in logs), logs
+    assert os.environ["VLLM_SM70_QSA_NVFP4_FUSED_READER"] == "1"
+    assert os.environ["VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH"] == "1"

@@ -84,6 +84,16 @@ values at TP4 are head 256, 6 query heads, 1 KV head, top-k 2051. Block sizes ar
 the ones the allocator derives (``docs/design/c4140_qsa_nvfp4_kv.md``): 2784 and
 2864 for NVFP4 without and with MTP4, 1616 for E4M3 with MTP4 (the control).
 
+Route knobs. Every arm names its own route, so the run pins
+``VLLM_SM70_QSA_NVFP4_FUSED_READER=0``, ``VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH=0`` and
+``VLLM_SM70_QSA_NVFP4_PREFILL_MIN_ROWS=64`` for its whole duration (the fused arm passes
+``nvfp4_fused_reader=True``, the scratch arm calls the route directly) and restores the
+environment after. An exported serving environment therefore cannot change what the
+controls and the timed ``decode_nvfp4`` / ``gather`` arms measure: with
+``FUSED_READER=1`` exported they ran the fused reader (``ZERO_FILL_OK`` and
+``DECODE_PATH_IDENTICAL`` NO; W1 of plan 071, 2026-10-05). A run that overrode an
+ambient value prints ``ROUTE_KNOBS ambient ...``; the JSON carries ``route_knobs``.
+
 Verdict printed on stdout:
 
     STORE_MATCHES_REFERENCE: YES/NO          data and scale bytes, every NVFP4 case
@@ -158,6 +168,7 @@ import argparse
 import contextlib
 import json
 import math
+import os
 import statistics
 import sys
 import time
@@ -227,6 +238,44 @@ STAGES = (
 )
 # The device the cases run on; the CPU tests point it at "cpu" (Triton interpreter).
 WORKER_DEVICE = "cuda:0"
+# The route-selecting knobs of ``qsa_sparse_paged_attention``. A call that does not pass
+# ``nvfp4_fused_reader`` follows ``VLLM_SM70_QSA_NVFP4_FUSED_READER``, and a chunk of
+# enough rows with query positions takes the scratch route when the scratch knob is on.
+# The harness names the route of every arm itself (the fused arm passes
+# ``nvfp4_fused_reader=True``, the scratch route is called directly), so a run pins the
+# knobs for its whole duration: an exported serving environment must not change what
+# "decode", "gather" or "prefill" mean. Without the pin, FUSED_READER=1 made the
+# gather-route controls run the fused reader (ZERO_FILL_OK and DECODE_PATH_IDENTICAL
+# NO, and the timed ``decode_nvfp4`` arm equal to ``decode_fused_nvfp4``).
+ROUTE_KNOBS = {
+    "VLLM_SM70_QSA_NVFP4_FUSED_READER": "0",
+    "VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH": "0",
+    "VLLM_SM70_QSA_NVFP4_PREFILL_MIN_ROWS": str(PREFILL_ROUTE_MIN_ROWS),
+}
+
+
+def ambient_route_knobs() -> dict[str, str | None]:
+    """The route knobs as the process environment has them (None: not set)."""
+    return {name: os.environ.get(name) for name in ROUTE_KNOBS}
+
+
+@contextlib.contextmanager
+def pinned_route_knobs():
+    """Run with every route knob at the harness's value; restore the environment after.
+
+    ``vllm.envs`` reads ``os.environ`` at each access (the engine's cache is not
+    enabled here), so the pin takes effect on the next call.
+    """
+    saved = ambient_route_knobs()
+    os.environ.update(ROUTE_KNOBS)
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 # ------------------------------------------------------------------ geometry
@@ -2049,7 +2098,24 @@ def run_all(
     args: argparse.Namespace,
     log: Callable[[str], None] = print,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
-    """Verify every case, then time the arms of each row count together."""
+    """Verify every case, then time the arms of each row count together.
+
+    The route knobs are pinned (``ROUTE_KNOBS``) for the whole run, timing included.
+    """
+    ambient = {k: v for k, v in ambient_route_knobs().items() if v is not None}
+    if ambient:
+        log(f"ROUTE_KNOBS ambient {ambient} overridden by {ROUTE_KNOBS}")
+    with pinned_route_knobs():
+        return _run_all_pinned(cases, geometry, kernels, args, log)
+
+
+def _run_all_pinned(
+    cases: Sequence[Case],
+    geometry: Geometry,
+    kernels: dict[str, Any],
+    args: argparse.Namespace,
+    log: Callable[[str], None],
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     results: list[dict[str, Any]] = []
     runs: dict[str, CaseRun] = {}
     for case in cases:
@@ -2235,6 +2301,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "device": info,
             "geometry": asdict(geometry),
             "args": vars(args),
+            "route_knobs": {"pinned": ROUTE_KNOBS, "ambient": ambient_route_knobs()},
             "cases": results,
             "timings": timings,
             "verdict": verdict,
