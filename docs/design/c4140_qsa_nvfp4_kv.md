@@ -574,9 +574,11 @@ no-MTP、`--max-model-len 131072`、推測解碼關。判讀、原始檔路徑�
 
 ## 2026-10-05 選項 B′：prefill 經 FP16 scratch 走 grouped page4（只有 CPU，所有 GPU 數字都是沒數據）
 
-起因：W0（Q1.4b）量到 FP16 grouped 對 E4M3 grouped 的 prefill 比值 f = 0.976（16K）／0.948（64K），所以 llm-playground
-`doc/plan/071-prefill-fused-reader-design.md` 的選項 B′ 成立。現況的 fused Triton reader 對 E4M3 只有 0.58–0.60，缺口是那個逐列、255 暫存器的 reader
-本身，不是 gather 迴圈。B′ 的設計預估是 f × (1 − scratch 解碼成本) ≈ 0.92–0.95（**估計，沒有任何 GPU 量測**）。
+起因：W0（Q1.4b）量到 f = TTFT_fp16 ÷ TTFT_e4m3 = 0.976（16K）／0.948（64K），所以 FP16 grouped route 比 E4M3 **快** 2.4%／5.5%，
+llm-playground `doc/plan/071-prefill-fused-reader-design.md` 的選項 B′ 成立（該設計文件把 f 當成「FP16 比 E4M3 慢」的比值，方向相反，結論不變）。
+現況的 fused Triton reader 對 E4M3 只有 0.58–0.60，缺口是那個逐列、255 暫存器的 reader 本身，不是 gather 迴圈。
+**預期 prefill 比值（對 E4M3）約 1.00–1.05（估計，沒有 GPU 量測）**：scratch 解碼每 chunk 每層讀寫約 1 GB（64K 前綴），12 層約 1.2 ms，
+對每 chunk 約 1.3 s 不到 0.2%。解碼維持每 chunk 每層一次（不逐列重解碼），這個成本才會一直可忽略。
 
 ### 資料流（每個 QSA 層、每個 prefill chunk）
 
@@ -594,11 +596,31 @@ no-MTP、`--max-model-len 131072`、推測解碼關。判讀、原始檔路徑�
 4. V 的層級 scale 與 output gate 由一個新的逐元素 kernel `_qsa_output_scale_gate_kernel` 一次套用（沒有 gate 時只乘 scale），一次 FP16 捨入。
    既有的 `_qsa_output_gate_kernel` 與 split-K、merge kernel 一個位元組都沒改。
 
+### 第一個 chunk 的 FP16 槓桿（`VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH_CURRENT_FP16`，scratch 路由開時預設 1）
+
+動機（Q1.4b 實測）：fused 路徑的第一 chunk 品質閘門不過，nvfp4_fused − fp8_e4m3 在 192 組 2K 窗上是 +0.01126 [+0.00372, +0.01969] nats/token，
+8K／32K 在雜訊內。原因是 chunk 內「先寫（量化）後讀」：chunk 自己的 token 剛被量化，attention 馬上讀回量化後的值。
+
+做法：`forward_qsa` 把 `do_kv_cache_update` 剛量化的 FP16 K/V（RoPE 與 q/k norm 之後、量化之前）傳進路由；解碼前綴之後，
+`overlay_fp16_chunk_triton` 把 chunk 自己每個 token 的 scratch 列覆寫成 `fp16(K / k_scale)`、`fp16(V / v_scale)`。
+除以層級 scale 是因為 scratch 存的是「不含層級 scale」的值，attention 在別處把 scale 折回去；所以 chunk 列與 FP16 投影之間只差一次
+FP16 捨入（CPU 上對 torch 的 `(x.float() / scale).half()` 逐位元相同；GPU 上 Triton 的 fp32 除法在 2 ulp 內，落在 FP16 捨入平手點的值可能差 1 個 FP16 ulp）。
+這樣 chunk 內的 attention 看到的是 FP16 精確的 K/V，只有讀更早 chunk 的前綴才帶 NVFP4 誤差（SGLang 的第一個 4096-token chunk 實質上就是這樣）。
+
+- **這是刻意改變第一 chunk 的數值**：閘門 3 必須在這條路徑上重量，不能沿用 fused 的 Q1.4。
+- **儲存的 cache 不變**：後續 decode（與之後的 chunk）讀這些 token 仍是 NVFP4，和先前一樣。
+- 設 0 就回到「chunk 自己的 token 也從 NVFP4 讀回」（保留給 A/B）。傳進去的 K/V 在這個模式下被忽略。
+- 只有 scratch 路由會用；fused、gather 路由與 decode 完全不受影響。
+- 成本：一個每列每 head 的小 kernel（30 暫存器、無 stack），每層每 chunk 一次；GPU 時間沒數據。
+- CPU 測試：旋鈕開時 chunk 列對 `fp16(K/k_scale)` 逐位元相同、前綴列仍是 gather 解碼；關時 chunk 列對 gather 解碼逐位元相同；
+  對 dense FP32 參考（chunk 自己的 token 用 FP16 K/V）relL2 < 2e-3，且與 NVFP4 讀回的參考確實不同；儲存的 cache 位元組不變；scale 沒除會被抓到。
+
 ### 開關與路由
 
 | 環境變數 | 預設 | 作用 |
 |---|---|---|
 | `VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH` | 0 | 開 B′。關著時行為與先前逐位元相同（既有 NVFP4 測試全過，見下） |
+| `VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH_CURRENT_FP16` | 1（路由開時） | chunk 自己的 token 用 FP16 K/V（見上一節） |
 | `VLLM_SM70_QSA_NVFP4_PREFILL_MIN_ROWS` | 64 | 小於此列數（decode、MTP verify）仍走 fused／gather reader |
 | `VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH_TOKENS` | `max_model_len` | scratch 容量覆寫 |
 
@@ -612,7 +634,7 @@ serve log 的路由證據（每個 process 各一次，`logger.info_once`）：
 ```text
 QSA NVFP4 KV read routes: decode and small batches use the fused Triton reader (VLLM_SM70_QSA_NVFP4_FUSED_READER=1); chunks of >=64 rows use the prefill scratch route (decode once to FP16 + grouped page4) (VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH=1).
 QSA NVFP4 prefill scratch reserved: 48 pages x 2784 tokens (133632 tokens, 130.5 MiB per rank) on cuda:0; reserved before the KV pool is sized.
-QSA NVFP4 prefill scratch route active: prefix decoded once to FP16 (48 pages x 2784 tokens, 130.5 MiB) + grouped page4 (first chunk: 5568 rows).
+QSA NVFP4 prefill scratch route active: prefix decoded once to FP16 (48 pages x 2784 tokens, 130.5 MiB) + grouped page4 (first chunk: 5568 rows); the chunk's own tokens are FP16 pre-quantization K/V (VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH_CURRENT_FP16=1).
 QSA NVFP4 prefill scratch route declined (<reason>); using the NVFP4 reader.
 ```
 
@@ -664,7 +686,7 @@ CPU（`TRITON_INTERPRET=1`、`CUDA_VISIBLE_DEVICES=`）：
 - `benchmarks/sm70_nvfp4_kv_kernel_check.py --arms gather fused prefill_scratch`（需要 prefill 大小的 `--rows`）：`SCRATCH_MATCHES_GATHER`（逐位元＋頁尾為零）、
   兩個突變對 scratch 解碼必須被抓、GPU 上多做 route 對 fused／gather 的容許、計時臂 `prefill_scratch_decode`／`prefill_scratch_route`／`prefill_fused`／`prefill_e4m3`。CPU 自檢仍 PASS。
 
-**沒數據（全部）**：任何 GPU 上的時間（解碼 kernel、整條路由、對 E4M3 的比值）、grouped kernel 吃外部 scratch 的實際結果與 relL2、
+**沒數據（全部）**：FP16 槓桿對第一 chunk ΔNLL 的實際效果（要在這條路徑上重量閘門 3）、任何 GPU 上的時間（解碼 kernel、整條路由、對 E4M3 的比值）、grouped kernel 吃外部 scratch 的實際結果與 relL2、
 scratch 對池大小的實際影響、解碼 kernel 的 tile 大小（8 token）是否合適、1 位元組載入的有效頻寬、
 多 request／混合 batch、128K 以上、`--max-num-batched-tokens 8352` 槓桿、聯集大小 U、MTP draft 層（M2）。
 

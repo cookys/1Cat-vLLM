@@ -50,6 +50,7 @@ from vllm.models.qwen4_exp.nvidia.ops.nvfp4_kv import (
 from vllm.models.qwen4_exp.nvidia.ops.nvfp4_kv_triton import (
     dequant_nvfp4_prefix_triton,
     gather_dequant_nvfp4_sides_triton,
+    overlay_fp16_chunk_triton,
 )
 
 logger = init_logger(__name__)
@@ -67,6 +68,7 @@ __all__ = [
     "log_nvfp4_route_knobs",
     "nvfp4_fused_reader_enabled",
     "nvfp4_gather_rows_per_group",
+    "nvfp4_prefill_current_fp16_enabled",
     "nvfp4_prefill_min_rows",
     "nvfp4_prefill_scratch_bytes",
     "nvfp4_prefill_scratch_capacity_tokens",
@@ -184,6 +186,12 @@ def qsa_sparse_attention_nvfp4(
 def nvfp4_prefill_scratch_enabled() -> bool:
     """``VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH``, off by default (unmeasured on a GPU)."""
     return bool(envs.VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH)
+
+
+def nvfp4_prefill_current_fp16_enabled() -> bool:
+    """``VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH_CURRENT_FP16`` (default on with the route):
+    the chunk's own tokens enter the scratch as FP16 K/V, not as their NVFP4 decode."""
+    return bool(envs.VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH_CURRENT_FP16)
 
 
 def nvfp4_prefill_min_rows() -> int:
@@ -495,6 +503,8 @@ def qsa_sparse_attention_nvfp4_prefill(
     query_positions: torch.Tensor | None,
     sequence_lengths: torch.Tensor | None,
     max_sequence_length: int | None,
+    current_key: torch.Tensor | None = None,
+    current_value: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Decode the prefix once, then run the FP16 grouped page4 route (option B').
 
@@ -511,6 +521,15 @@ def qsa_sparse_attention_nvfp4_prefill(
        a remainder of ``rows % 8`` goes through the XQA page4 route with the same
        scale.
     3. ``v_scale`` and the output gate are applied by one elementwise kernel.
+
+    First-chunk lever (``current_key``/``current_value``, the FP16 projections that
+    ``do_kv_cache_update`` quantizes, with
+    ``VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH_CURRENT_FP16`` on): after step 1 the scratch
+    rows of the chunk's own tokens are overwritten with ``fp16(K / k_scale)`` and
+    ``fp16(V / v_scale)``, so attention inside a chunk sees FP16-exact K/V and only
+    reads of earlier chunks carry the NVFP4 error. This changes the numerics of the
+    chunk on purpose. The stored cache is unchanged, so later steps read those tokens
+    from NVFP4 as before.
 
     The attention is the CUDA grouped kernel's own arithmetic, so it differs from the
     split-K Triton routes at FP16 rounding level, not bit for bit.
@@ -584,6 +603,26 @@ def qsa_sparse_attention_nvfp4_prefill(
             block_table.shape[1], -(-int(max_sequence_length) // block_size)
         ),
     )
+    current = False
+    if (
+        current_key is not None
+        and current_value is not None
+        and nvfp4_prefill_current_fp16_enabled()
+    ):
+        overlay_fp16_chunk_triton(
+            current_key,
+            current_value,
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+            offsets,
+            scratch.key,
+            scratch.value,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            table_width=block_table.shape[1],
+        )
+        current = True
     result = ops._qsa_sparse_paged_attention_sm70_xqa_page4(
         q,
         scratch.key,
@@ -605,10 +644,14 @@ def qsa_sparse_attention_nvfp4_prefill(
     ops._qsa_output_scale_gate(out, output_gate, v_scale)
     logger.info_once(
         "QSA NVFP4 prefill scratch route active: prefix decoded once to FP16 "
-        "(%d pages x %d tokens, %.1f MiB) + grouped page4 (first chunk: %d rows).",
+        "(%d pages x %d tokens, %.1f MiB) + grouped page4 (first chunk: %d rows); "
+        "the chunk's own tokens are %s "
+        "(VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH_CURRENT_FP16=%d).",
         scratch.pages,
         scratch.block_size,
         scratch.nbytes / 2**20,
         rows,
+        "FP16 pre-quantization K/V" if current else "read back from NVFP4",
+        int(current),
     )
     return out

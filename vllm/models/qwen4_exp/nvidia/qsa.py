@@ -350,7 +350,6 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        del key, value
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError("QSA does not support fused output quantization")
         if self.alibi_slopes is not None or self.sinks is not None:
@@ -414,6 +413,15 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             # Host-side longest sequence of the batch: lets the NVFP4 prefill scratch
             # route prove its scratch is big enough without a device synchronization.
             qsa_metadata["max_sequence_length"] = int(max_sequence_length)
+        if (
+            self.kv_cache_dtype == NVFP4_KV_CACHE_DTYPE
+            and key is not None
+            and value is not None
+        ):
+            # The FP16 K/V that do_kv_cache_update just quantized: the NVFP4 prefill
+            # scratch route reads the chunk's own tokens from these, not from NVFP4.
+            qsa_metadata["current_key"] = key[:num_tokens]
+            qsa_metadata["current_value"] = value[:num_tokens]
         if query_positions is not None:
             qsa_metadata["query_positions"] = query_positions[:num_tokens]
         if sequence_lengths is not None:

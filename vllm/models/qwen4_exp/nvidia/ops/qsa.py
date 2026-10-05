@@ -2540,6 +2540,8 @@ def qsa_sparse_paged_attention(
     lse: torch.Tensor | None = None,
     nvfp4_fused_reader: bool | None = None,
     max_sequence_length: int | None = None,
+    current_key: torch.Tensor | None = None,
+    current_value: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run sparse GQA, optionally returning base-2 LSE for a cross-rank merge.
 
@@ -2552,7 +2554,9 @@ def qsa_sparse_paged_attention(
     (``qsa_nvfp4.qsa_sparse_attention_nvfp4_prefill``, plan 071 option B'), and runs the
     route above when that declines. ``max_sequence_length`` is the host-side longest
     sequence of the batch; without it the scratch route cannot prove its scratch is big
-    enough and declines.
+    enough and declines. ``current_key``/``current_value`` are the batch's FP16 K/V
+    before quantization; the scratch route uses them for the batch's own tokens (see
+    ``qsa_sparse_attention_nvfp4_prefill``) and every other route ignores them.
 
     LSE callers may supply FP32 output to avoid rounding each rank's partial
     result. Apply output gating after the cross-rank merge, not per rank.
@@ -2682,6 +2686,8 @@ def qsa_sparse_paged_attention(
                 query_positions=query_positions,
                 sequence_lengths=sequence_lengths,
                 max_sequence_length=max_sequence_length,
+                current_key=current_key,
+                current_value=current_value,
             )
             if routed is not None:
                 return routed

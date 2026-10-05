@@ -39,6 +39,7 @@ from vllm.models.qwen4_exp.nvidia.ops import qsa_nvfp4  # noqa: E402
 from vllm.models.qwen4_exp.nvidia.ops.nvfp4_kv_triton import (  # noqa: E402
     dequant_nvfp4_prefix_triton,
     gather_dequant_nvfp4_sides_triton,
+    overlay_fp16_chunk_triton,
 )
 
 # 36 = 9 microblocks of 4 and not a multiple of the 16-token decode tile, so the
@@ -532,3 +533,91 @@ def test_the_layer_scale_inside_the_decode_would_be_caught() -> None:
         _assert_scratch_equals_gather(
             cache, table, seq_lens, scaled_k, scratch_v, offsets
         )
+
+
+# --------------------------------------------------- the FP16 chunk overlay
+
+
+def _overlay(scratch_k, scratch_v, key, value, requests, positions, seq_lens, offsets,
+             k_scale, v_scale, table_width=4):
+    overlay_fp16_chunk_triton(
+        key.to(DEVICE),
+        value.to(DEVICE),
+        requests.to(DEVICE),
+        positions.to(DEVICE),
+        seq_lens.to(DEVICE),
+        offsets.to(DEVICE),
+        scratch_k,
+        scratch_v,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        table_width=table_width,
+    )
+
+
+def test_the_overlay_writes_fp16_k_over_scale_for_the_chunk_rows_only() -> None:
+    k_scale, v_scale = 0.0213623046875, 0.0404924675822258
+    cache = _cache(seed=20, k_scale=k_scale, v_scale=v_scale)
+    table, seq_lens = _table([[3, 5, 1, 7]]), _lens(2 * BLOCK + 20)
+    scratch_k, scratch_v, _, offsets = _decode(cache, table, seq_lens)
+    before_k, before_v = scratch_k.clone(), scratch_v.clone()
+    generator = torch.Generator().manual_seed(5)
+    rows, first = 12, int(seq_lens[0]) - 12
+    # strided K/V: a slice of a wider projection output, only the last stride is 1
+    wide = (torch.randn(rows, 3, HEAD, generator=generator) * 2).half()
+    key, value = wide[:, :1], wide[:, 1:2]
+    positions = torch.arange(first, first + rows, dtype=torch.int64)
+    _overlay(
+        scratch_k, scratch_v, key, value, torch.zeros(rows, dtype=torch.int32),
+        positions, seq_lens, offsets, k_scale, v_scale,
+    )
+    flat_k = scratch_k.reshape(-1, HEAD)
+    flat_v = scratch_v.reshape(-1, HEAD)
+    want_k = (key[:, 0].float() / k_scale).half()
+    want_v = (value[:, 0].float() / v_scale).half()
+    assert torch.equal(_bits(flat_k[first : first + rows]), _bits(want_k))
+    assert torch.equal(_bits(flat_v[first : first + rows]), _bits(want_v))
+    # everything else is what the NVFP4 decode wrote
+    other = torch.ones(flat_k.shape[0], dtype=torch.bool)
+    other[first : first + rows] = False
+    assert torch.equal(
+        _bits(flat_k[other]), _bits(before_k.reshape(-1, HEAD)[other])
+    )
+    assert torch.equal(
+        _bits(flat_v[other]), _bits(before_v.reshape(-1, HEAD)[other])
+    )
+
+
+def test_the_overlay_skips_invalid_rows_and_follows_the_request_offset() -> None:
+    cache = _cache(seed=21)
+    table = _table([[3, 5, 1, 7], [2, 4, 6, 8]])
+    seq_lens = _lens(BLOCK + 5, BLOCK + 9)
+    scratch_k, scratch_v, _, offsets = _decode(cache, table, seq_lens)
+    before = scratch_k.clone()
+    key = torch.full((4, 1, HEAD), 1.0, dtype=torch.float16)
+    value = torch.full((4, 1, HEAD), 2.0, dtype=torch.float16)
+    # row 0: request 1 position 3; row 1: request -1; row 2: position past seq_len;
+    # row 3: negative position
+    requests = torch.tensor([1, -1, 0, 0], dtype=torch.int32)
+    positions = torch.tensor([3, 0, int(seq_lens[0]), -4], dtype=torch.int64)
+    _overlay(scratch_k, scratch_v, key, value, requests, positions, seq_lens, offsets,
+             1.0, 1.0)
+    target = int(offsets[1]) * BLOCK + 3
+    flat = scratch_k.reshape(-1, HEAD)
+    flat_v = scratch_v.reshape(-1, HEAD)
+    assert (flat[target] == 1.0).all() and (flat_v[target] == 2.0).all()
+    changed = (_bits(scratch_k) != _bits(before)).reshape(-1, HEAD).any(-1).nonzero()
+    assert changed.flatten().tolist() == [target]
+
+
+def test_an_unscaled_overlay_differs_from_the_scaled_one() -> None:
+    cache = _cache(seed=22)
+    table, seq_lens = _table([[3, 5, 1, 7]]), _lens(BLOCK + 10)
+    scratch_k, scratch_v, _, offsets = _decode(cache, table, seq_lens)
+    key = (torch.randn(4, 1, HEAD) * 3).half()
+    positions = torch.arange(int(seq_lens[0]) - 4, int(seq_lens[0]), dtype=torch.int64)
+    other = (scratch_k.clone(), scratch_v.clone())
+    for (sk, sv), scale in (((scratch_k, scratch_v), 0.5), (other, 1.0)):
+        _overlay(sk, sv, key, key, torch.zeros(4, dtype=torch.int32), positions,
+                 seq_lens, offsets, scale, scale)
+    assert not torch.equal(_bits(scratch_k), _bits(other[0]))

@@ -679,3 +679,35 @@ def test_the_new_kernels_do_not_change_the_existing_launches():
         assert hasattr(qsa_ops, name)
     for name in ("_gather_dequant_nvfp4_kernel", "_store_nvfp4_kernel"):
         assert hasattr(kernels, name)
+
+
+def test_the_fp16_chunk_overlay_lowers_to_sm70():
+    # Plan 071 B' first-chunk lever: one row of one head per program, 256 values.
+    kernel = kernels._overlay_fp16_chunk_kernel
+    runtime = {
+        **{n: "*fp16" for n in ("key_ptr", "value_ptr", "k_out_ptr", "v_out_ptr")},
+        "token_to_req_ptr": "*i32",
+        "positions_ptr": "*i64",
+        "seq_lens_ptr": "*i32",
+        "page_offsets_ptr": "*i32",
+        "k_scale": "fp32",
+        "v_scale": "fp32",
+        **{
+            n: "i32"
+            for n in (
+                "stride_key_row",
+                "stride_key_head",
+                "stride_value_row",
+                "stride_value_head",
+                "stride_out_page",
+                "stride_out_token",
+                "stride_out_head",
+                "num_requests",
+                "scratch_pages",
+            )
+        },
+    }
+    constexprs = {"PAGE_SIZE": 2784, "TABLE_WIDTH": 96, "HEAD_DIM": 256}
+    compiled = _compile(kernel, _with_constexprs(kernel, runtime), constexprs, 2)
+    _check(compiled, max_registers=48, max_stack=0)
+    assert not re.search(r"^\s*(atom|red)\.", compiled.asm["ptx"], re.MULTILINE)

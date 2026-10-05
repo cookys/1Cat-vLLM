@@ -128,6 +128,8 @@ class FakeFlashV100:
                     kv_cache_dtype=kv_cache_dtype,
                     k_ptr=k_cache.data_ptr(),
                     v_ptr=v_cache.data_ptr(),
+                    k_snapshot=k_cache.clone(),
+                    v_snapshot=v_cache.clone(),
                 ),
             )
         )
@@ -254,6 +256,7 @@ class Batch:
         nv.reshape_and_cache_nvfp4_reference(
             key, value, cache, slots, k_scale=K_SCALE, v_scale=V_SCALE
         )
+        self._key, self._value, self._slots = key, value, slots
         pages = -(-seq_len // BLOCK)
         order = torch.randperm(blocks, generator=generator)[:pages].int()
         table = torch.full((1, pages + 2), -1, dtype=torch.int32)
@@ -281,12 +284,35 @@ class Batch:
         self.requests = torch.zeros(rows, dtype=torch.int32, device=DEVICE)
         self.q = torch.randn(rows, 6, HEAD, generator=generator).half().to(DEVICE)
         self.gate = torch.randn(rows, 6, HEAD, generator=generator).half().to(DEVICE)
-        self.rows, self.seq_len = rows, seq_len
+        self.rows, self.seq_len, self.first_row = rows, seq_len, first_row
 
-    def run(self, *, gate=True, scratch_tokens=None, max_sequence_length="seq", **kw):
+    def current(self):
+        """The chunk's FP16 K and V before quantization, ``[rows, 1, 256]`` each."""
+        inverse = torch.empty_like(self._slots)
+        inverse[self._slots] = torch.arange(self._slots.numel())
+        table = self.table.cpu()[0]
+        positions = self.positions.cpu()
+        flat = table[positions // BLOCK].long() * BLOCK + positions % BLOCK
+        source = inverse[flat]
+        return (
+            self._key[source].to(DEVICE).contiguous(),
+            self._value[source].to(DEVICE).contiguous(),
+        )
+
+    def run(
+        self,
+        *,
+        gate=True,
+        scratch_tokens=None,
+        max_sequence_length="seq",
+        current=False,
+        **kw,
+    ):
         if max_sequence_length == "seq":
             max_sequence_length = self.seq_len
         out = torch.empty_like(self.q)
+        if current:
+            kw["current_key"], kw["current_value"] = self.current()
         result = qsa_ops.qsa_sparse_paged_attention(
             self.q,
             self.cache[:, 0],
@@ -315,8 +341,10 @@ class Batch:
             capacity_tokens=tokens or self.seq_len,
         )
 
-    def reference(self, *, gate=True) -> torch.Tensor:
-        """Dense FP32 attention over the valid top-k entries, layer scales applied."""
+    def reference(self, *, gate=True, current=False) -> torch.Tensor:
+        """Dense FP32 attention over the valid top-k entries, layer scales applied.
+
+        With ``current`` the chunk's own tokens use their FP16 pre-quantization K/V."""
         keys, values = nv.gather_dequant_nvfp4_kv(
             self.cache.cpu(),
             self.table.cpu(),
@@ -329,6 +357,12 @@ class Batch:
         keep = nv.nvfp4_entry_validity(
             self.indices.cpu(), self.requests.cpu(), self.table.cpu(), 24, BLOCK
         )
+        if current:
+            key_cur, value_cur = (x.cpu().float() for x in self.current())
+            mine = (self.indices.cpu() >= self.first_row) & keep
+            local = (self.indices.cpu() - self.first_row).clamp(min=0)
+            keys = torch.where(mine[..., None, None], key_cur[local], keys)
+            values = torch.where(mine[..., None, None], value_cur[local], values)
         out = torch.zeros(self.rows, 6, HEAD)
         for row in range(self.rows):
             k, v = keys[row][keep[row]][:, 0], values[row][keep[row]][:, 0]
@@ -747,3 +781,153 @@ def test_forward_qsa_passes_the_host_side_longest_sequence_for_nvfp4(monkeypatch
     metadata.max_seq_len = None  # a metadata without it passes nothing
     run("nvfp4")
     assert "max_sequence_length" not in seen[-1]
+
+
+# ----------------------------------------------- the first-chunk FP16 lever
+
+
+def _scratch_rows(batch, snapshot):
+    """The scratch tokens of the chunk's positions, ``[rows, 256]``, from a snapshot
+    (``[pages, block, 1, 256]``) of the scratch taken inside the grouped kernel."""
+    flat = snapshot.reshape(-1, HEAD)
+    # Request 0 owns scratch pages 0.. in order, so a logical position is its row.
+    return flat[batch.positions.cpu()]
+
+
+def test_the_current_knob_defaults_on(monkeypatch) -> None:
+    monkeypatch.delenv(
+        "VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH_CURRENT_FP16", raising=False
+    )
+    assert qsa_nvfp4.nvfp4_prefill_current_fp16_enabled() is True
+    monkeypatch.setenv("VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH_CURRENT_FP16", "0")
+    assert qsa_nvfp4.nvfp4_prefill_current_fp16_enabled() is False
+
+
+def test_with_the_lever_on_the_chunks_own_scratch_rows_are_fp16_exact(
+    knob, fake_cuda
+) -> None:
+    batch = Batch(rows=64, seq_len=600, seed=11)
+    batch.reserve()
+    batch.run(nvfp4_fused_reader=True, current=True)
+    snapshot = fake_cuda.calls[1][1]
+    rows_k = _scratch_rows(batch, snapshot["k_snapshot"].reshape(-1, BLOCK, 1, HEAD))
+    rows_v = _scratch_rows(batch, snapshot["v_snapshot"].reshape(-1, BLOCK, 1, HEAD))
+    key, value = (x.cpu() for x in batch.current())
+    want_k = (key[:, 0].float() / K_SCALE).half()
+    want_v = (value[:, 0].float() / V_SCALE).half()
+    assert torch.equal(rows_k.view(torch.int16), want_k.view(torch.int16))
+    assert torch.equal(rows_v.view(torch.int16), want_v.view(torch.int16))
+
+
+def test_with_the_lever_off_the_chunks_rows_equal_the_gather_dequant(
+    knob, fake_cuda, monkeypatch
+) -> None:
+    monkeypatch.setenv("VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH_CURRENT_FP16", "0")
+    batch = Batch(rows=64, seq_len=600, seed=11)
+    batch.reserve()
+    batch.run(nvfp4_fused_reader=True, current=True)  # the K/V are passed and ignored
+    snapshot = fake_cuda.calls[1][1]
+    rows_k = _scratch_rows(batch, snapshot["k_snapshot"].reshape(-1, BLOCK, 1, HEAD))
+    keys, values = nv.gather_dequant_nvfp4_kv(
+        batch.cache.cpu(),
+        batch.table.cpu(),
+        batch.requests.cpu()[:1],
+        batch.positions.cpu().int().view(1, -1),
+        k_scale=1.0,
+        v_scale=1.0,
+    )
+    assert torch.equal(rows_k.view(torch.int16), keys[0, :, 0].view(torch.int16))
+    rows_v = _scratch_rows(batch, snapshot["v_snapshot"].reshape(-1, BLOCK, 1, HEAD))
+    assert torch.equal(rows_v.view(torch.int16), values[0, :, 0].view(torch.int16))
+
+
+def test_the_earlier_tokens_stay_nvfp4_with_the_lever_on(knob, fake_cuda) -> None:
+    batch = Batch(rows=64, seq_len=600, seed=12)
+    batch.reserve()
+    batch.run(nvfp4_fused_reader=True, current=True)
+    snapshot = fake_cuda.calls[1][1]["k_snapshot"].reshape(-1, HEAD)
+    prefix = batch.first_row
+    keys, _ = nv.gather_dequant_nvfp4_kv(
+        batch.cache.cpu(),
+        batch.table.cpu(),
+        batch.requests.cpu()[:1],
+        torch.arange(prefix, dtype=torch.int32).view(1, -1),
+        k_scale=1.0,
+        v_scale=1.0,
+    )
+    assert torch.equal(
+        snapshot[:prefix].view(torch.int16), keys[0, :, 0].view(torch.int16)
+    )
+
+
+def test_the_lever_changes_the_chunk_attention_the_way_the_reference_says(
+    knob, fake_cuda
+) -> None:
+    batch = Batch(rows=64, seq_len=600, seed=13)
+    batch.reserve()
+    out_on = batch.run(nvfp4_fused_reader=True, current=True)
+    assert _rel_l2(out_on, batch.reference(current=True)) < 2e-3
+    # It really differs from the NVFP4 round trip (power of the check above).
+    assert _rel_l2(batch.reference(current=True), batch.reference()) > 2e-3
+
+
+def test_the_lever_does_not_touch_the_stored_cache(knob, fake_cuda) -> None:
+    batch = Batch(rows=64, seq_len=600, seed=14)
+    batch.reserve()
+    before = batch.cache.clone()
+    batch.run(nvfp4_fused_reader=True, current=True)
+    assert torch.equal(batch.cache, before)
+
+
+def test_an_unscaled_overlay_is_caught(knob, fake_cuda, monkeypatch) -> None:
+    from vllm.models.qwen4_exp.nvidia.ops import nvfp4_kv_triton as kernels
+
+    original = kernels.overlay_fp16_chunk_triton
+
+    def unscaled(*args, k_scale, v_scale, **kwargs):
+        return original(*args, k_scale=1.0, v_scale=1.0, **kwargs)
+
+    monkeypatch.setattr(qsa_nvfp4, "overlay_fp16_chunk_triton", unscaled)
+    batch = Batch(rows=64, seq_len=600, seed=15)
+    batch.reserve()
+    out = batch.run(nvfp4_fused_reader=True, current=True)
+    assert _rel_l2(out, batch.reference(current=True)) > 2e-3
+
+
+def test_forward_qsa_hands_over_the_fp16_chunk_kv_for_nvfp4(monkeypatch) -> None:
+    seen: list[dict] = []
+    monkeypatch.setattr(
+        qsa_ops,
+        "qsa_sparse_paged_attention",
+        lambda *a, **k: seen.append(k) or a[6],
+    )
+    q = torch.zeros(4, 6, HEAD, dtype=torch.float16)
+    key = torch.ones(5, 1, HEAD, dtype=torch.float16)  # padded rows beyond the tokens
+    value = torch.full((5, 1, HEAD), 2.0, dtype=torch.float16)
+    cache = torch.zeros(3, 2, BLOCK, 1, nv.nvfp4_kv_row_bytes(HEAD), dtype=torch.uint8)
+    layer = SimpleNamespace(
+        topk_indices_buffer=torch.zeros(4, TOPK, dtype=torch.int32),
+        qsa_dcp_sharded=False,
+        _k_scale_float=K_SCALE,
+        _v_scale_float=V_SCALE,
+    )
+    metadata = SimpleNamespace(
+        num_actual_tokens=4, block_table=torch.zeros(1, 3, dtype=torch.int32)
+    )
+    impl = object.__new__(owner_module.Qwen4ExpQSAFlashAttentionImpl)
+    impl.kv_cache_dtype = "nvfp4"
+    impl.alibi_slopes = None
+    impl.sinks = None
+    impl.sliding_window = (-1, -1)
+    impl.forward_qsa(
+        layer,
+        q,
+        key,
+        value,
+        cache,
+        metadata,
+        torch.zeros_like(q),
+        token_to_req=torch.zeros(4, dtype=torch.int32),
+    )
+    assert seen[-1]["current_key"].shape == (4, 1, HEAD)
+    assert seen[-1]["current_value"].shape == (4, 1, HEAD)

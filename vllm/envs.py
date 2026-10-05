@@ -143,6 +143,7 @@ if TYPE_CHECKING:
     VLLM_SM70_QSA_NVFP4_FUSED_READER: bool = False
     VLLM_SM70_QSA_NVFP4_PREFILL_MIN_ROWS: int = 64
     VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH: bool = False
+    VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH_CURRENT_FP16: bool = True
     VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH_TOKENS: str | None = None
     VLLM_SM70_QSA_TOPK_LIBRARY: str | None = None
     VLLM_SM70_QSA_XQA_PAGE4: str | None = None
@@ -17648,6 +17649,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="experimental",
         declared_default="False",
         effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("QSA sparse attention/indexer",),
+        user_visible=True,
+    ),
+    "VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH_CURRENT_FP16": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH_CURRENT_FP16", "1"))
+        ),
+        description=(
+            "With the NVFP4 prefill scratch route on, the scratch rows of the "
+            "chunk's own tokens come from the FP16 K/V projections before "
+            "quantization (divided by the layer scale, as the route folds it), so "
+            "attention inside a chunk sees FP16-exact K/V and only reads of earlier "
+            "chunks carry the NVFP4 error. The stored cache is unchanged. Default "
+            "on when the scratch route is on; set 0 to read the chunk's own tokens "
+            "back from NVFP4 (the pre-existing behaviour, for A/B). Only read when "
+            "VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH is 1."
+        ),
+        category="experimental",
+        declared_default="True",
+        effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("QSA sparse attention/indexer",),
         user_visible=True,

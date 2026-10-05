@@ -42,6 +42,7 @@ from vllm.triton_utils import tl, triton
 __all__ = [
     "PREFIX_DECODE_TILE_TOKENS",
     "dequant_nvfp4_prefix_triton",
+    "overlay_fp16_chunk_triton",
     "gather_dequant_nvfp4_kv_triton",
     "gather_dequant_nvfp4_sides_triton",
     "store_nvfp4_kv_triton",
@@ -545,6 +546,139 @@ def dequant_nvfp4_prefix_triton(
         TILE=PREFIX_DECODE_TILE_TOKENS,
         HAS_START=start_tokens is not None,
         num_warps=4,
+    )
+
+
+@triton.jit
+def _overlay_fp16_chunk_kernel(
+    key_ptr,
+    value_ptr,
+    token_to_req_ptr,
+    positions_ptr,
+    seq_lens_ptr,
+    page_offsets_ptr,
+    k_out_ptr,
+    v_out_ptr,
+    k_scale,
+    v_scale,
+    stride_key_row,
+    stride_key_head,
+    stride_value_row,
+    stride_value_head,
+    stride_out_page,
+    stride_out_token,
+    stride_out_head,
+    num_requests,
+    scratch_pages,
+    PAGE_SIZE: tl.constexpr,
+    TABLE_WIDTH: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+) -> None:
+    """Write one chunk row's FP16 K and V, over the layer scales, into the scratch.
+
+    Grid ``(rows, heads)``. The scratch holds ``K / k_scale`` (the NVFP4 decode without
+    the layer scale, which the attention folds back), so the pre-quantization FP16 K/V
+    of the chunk's own tokens go in as ``fp16(fp32(x) / scale)``. A row whose request
+    is invalid, whose position is outside ``[0, seq_len)`` or beyond the table, or
+    whose scratch page does not fit, writes nothing.
+    """
+    row = tl.program_id(0)
+    head = tl.program_id(1)
+    request = tl.load(token_to_req_ptr + row)
+    position = tl.load(positions_ptr + row)
+    safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
+    seq_len = tl.load(seq_lens_ptr + safe_request)
+    page = (tl.maximum(position, 0) // PAGE_SIZE).to(tl.int32)
+    offset = (tl.maximum(position, 0) % PAGE_SIZE).to(tl.int32)
+    scratch_page = tl.load(page_offsets_ptr + safe_request) + page
+    valid = (
+        (request >= 0)
+        & (request < num_requests)
+        & (position >= 0)
+        & (position < seq_len)
+        & (page < TABLE_WIDTH)
+        & (scratch_page < scratch_pages)
+    )
+    dims = tl.arange(0, HEAD_DIM)
+    out = (
+        scratch_page.to(tl.int64) * stride_out_page
+        + offset * stride_out_token
+        + head * stride_out_head
+        + dims
+    )
+    key = tl.load(key_ptr + row * stride_key_row + head * stride_key_head + dims)
+    value = tl.load(
+        value_ptr + row * stride_value_row + head * stride_value_head + dims
+    )
+    tl.store(k_out_ptr + out, (key.to(tl.float32) / k_scale).to(tl.float16), mask=valid)
+    tl.store(
+        v_out_ptr + out, (value.to(tl.float32) / v_scale).to(tl.float16), mask=valid
+    )
+
+
+def overlay_fp16_chunk_triton(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    token_to_req: torch.Tensor,
+    positions: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_offsets: torch.Tensor,
+    scratch_k: torch.Tensor,
+    scratch_v: torch.Tensor,
+    *,
+    k_scale: float,
+    v_scale: float,
+    table_width: int,
+) -> None:
+    """Overwrite the scratch rows of this chunk's tokens with its FP16 K/V.
+
+    ``key``/``value`` are the ``[rows, heads, head_size]`` FP16 projections that
+    ``do_kv_cache_update`` quantizes (any row stride, unit last stride);
+    ``positions`` are the logical positions (int64) of the rows. Call it after
+    ``dequant_nvfp4_prefix_triton`` so the chunk's own tokens read FP16 instead of
+    their NVFP4 round trip. The stored cache is not touched. On a GPU the division is
+    Triton's fp32 divide, within 2 ulp of IEEE, so a value on an FP16 rounding tie of
+    ``x / scale`` could differ from the torch reference by one FP16 ulp.
+    """
+    rows, heads, head_size = key.shape
+    if value.shape != key.shape or key.dtype != torch.float16 or (
+        value.dtype != torch.float16
+    ):
+        raise ValueError("chunk K and V must be float16 with the same shape")
+    if key.stride(2) != 1 or value.stride(2) != 1:
+        raise ValueError("chunk K and V need a unit last stride")
+    if scratch_k.shape[2:] != (heads, head_size) or not (
+        scratch_k.is_contiguous() and scratch_v.is_contiguous()
+    ):
+        raise ValueError("scratch geometry differs from the chunk")
+    if not (k_scale > 0.0 and v_scale > 0.0):
+        raise ValueError("layer scales must be positive")
+    if rows == 0:
+        return
+    _overlay_fp16_chunk_kernel[(rows, heads)](
+        key,
+        value,
+        token_to_req,
+        positions,
+        seq_lens,
+        page_offsets,
+        scratch_k,
+        scratch_v,
+        float(k_scale),
+        float(v_scale),
+        key.stride(0),
+        key.stride(1),
+        value.stride(0),
+        value.stride(1),
+        scratch_k.stride(0),
+        scratch_k.stride(1),
+        scratch_k.stride(2),
+        seq_lens.shape[0],
+        scratch_k.shape[0],
+        PAGE_SIZE=scratch_k.shape[1],
+        TABLE_WIDTH=table_width,
+        HEAD_DIM=head_size,
+        num_warps=2,
     )
 
 
