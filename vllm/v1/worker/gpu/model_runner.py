@@ -41,6 +41,7 @@ from vllm.distributed.parallel_state import (
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping
+from vllm.model_executor.layers.fused_moe import expert_routing_dump
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
@@ -232,6 +233,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         f"{self.speculative_config.method} with pipeline parallel "
                         "is not supported."
                     )
+
+        # Diagnostic expert-routing dump (VLLM_SM70_EXPERT_ROUTING_DUMP_DIR): must
+        # exist before the CUDA graphs are captured so that the staging copies
+        # are recorded into them; None (nothing allocated) when the env is unset.
+        self._expert_routing_dump = self._maybe_enable_expert_routing_dump()
 
         # Draft tokens propagation - for spec-dec + struct outputs.
         self.draft_tokens_handler = DraftTokensHandler(self.device)
@@ -434,6 +440,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self._sm70_v2_mtp_profile_last_totals = dict(totals)
         self._sm70_v2_mtp_profile_last_calls = calls
 
+    def _maybe_enable_expert_routing_dump(
+        self,
+    ) -> "expert_routing_dump.ExpertRoutingDumper | None":
+        if not envs.VLLM_SM70_EXPERT_ROUTING_DUMP_DIR:
+            return None
+        text_config = self.model_config.hf_text_config
+        num_draft_layers = 0
+        if self.speculative_config is not None:
+            num_draft_layers = int(
+                getattr(text_config, "mtp_num_hidden_layers", 0) or 0
+            )
+        return expert_routing_dump.maybe_enable(
+            num_target_layers=int(getattr(text_config, "num_hidden_layers", 0) or 0),
+            num_draft_layers=num_draft_layers,
+            num_draft_steps=self.num_speculative_steps,
+            top_k=int(getattr(text_config, "num_experts_per_tok", 0) or 0),
+            num_experts=int(getattr(text_config, "num_experts", 0) or 0),
+            device=self.device,
+            max_num_seqs=self.max_num_reqs,
+            meta_extra={
+                "model": str(self.model_config.model),
+                "tp": int(self.parallel_config.tensor_parallel_size),
+                "num_speculative_tokens": int(self.num_speculative_steps),
+            },
+        )
+
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
         self.req_states.max_model_len = max_model_len
@@ -509,6 +541,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.speculator is not None:
                 prepare_communication_buffer_for_model(self.speculator.model)
 
+        if self._expert_routing_dump is not None:
+            draft_model = getattr(self.speculator, "model", None)
+            self._expert_routing_dump.bind_routers(
+                [self.model] + ([draft_model] if draft_model is not None else [])
+            )
+
         # Initialize the components that require the model.
         self.model_state = init_model_state(
             self.vllm_config, self.model, self.encoder_cache, self.device
@@ -568,6 +606,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
+        if expert_routing_dump.ACTIVE is not None:
+            expert_routing_dump.ACTIVE.set_kv_info(
+                getattr(kv_cache_config, "num_blocks", None),
+                getattr(self.cache_config, "block_size", None),
+            )
 
         block_table_max_model_len = self.max_model_len
         if self.is_encoder_decoder:
@@ -1822,6 +1865,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self._sm70_v2_mtp_profile_finish(
             mtp_profile_ctx, "target_forward", mtp_target_start
         )
+        if expert_routing_dump.ACTIVE is not None and not dummy_run:
+            # Queue the asynchronous readback of this step's staged routing.
+            expert_routing_dump.ACTIVE.record_target_step(input_batch)
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
@@ -2130,6 +2176,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # attention metadata. Drop both target and draft managers first, and
         # the sampling graph, whose manager also holds the sampler and model
         # state references.
+        expert_routing_dump.shutdown()
         self.cudagraph_manager = None
         self.sampling_graph = None
         if self._ple_offload_connector is not None:

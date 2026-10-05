@@ -13,6 +13,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.fused_moe import expert_routing_dump
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -453,6 +454,11 @@ class EagleSpeculator:
         dumper = self._draft_hidden_dump
         if dumper is not None and self._dump_this_round:
             dumper.dump_step(step, num_reqs, self.draft_tokens)
+        routing = expert_routing_dump.ACTIVE
+        if routing is not None and self._dump_this_round:
+            # VLLM_SM70_EXPERT_ROUTING_DUMP_DIR: asynchronous readback of the
+            # draft MoE layer's staged top-k ids (no host sync).
+            routing.record_draft_step(step, num_reqs)
 
     def _mtp_prefill_begin(self) -> None:
         if self.share_mtp_topk_indices:
