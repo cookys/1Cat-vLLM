@@ -9,9 +9,13 @@ The routing is random, not measured: meta.json says ``synthetic: true``.  It
 goes through the real dumper, so file names, key names, dtypes and shapes are the
 final ones.  Six step indices at nominal c=2, MTP4 (5 rows per request):
 
-    0 1 2 5   pure decode, 2 active requests, 10 rows
+    0 1 2 5   pure decode, 2 active requests, 10 rows (+ 2 padding rows)
     3         dropped (layer 17 never staged): a hole in step_idx
     4         mixed: one decoding request (5 rows) + a 4-row prefill chunk
+
+Every step carries 2 CUDA-graph padding rows (row_is_padding True); in step 2 one
+of them has a repeated expert id in layer 5, so it is blanked and counted in
+padded_rows_invalid (the step stays valid).
 """
 
 from __future__ import annotations
@@ -66,7 +70,7 @@ def build(out_dir: str) -> None:
         },
     )
     start = 100
-    for kind, per_req, prefilling in STEPS:
+    for step_no, (kind, per_req, prefilling) in enumerate(STEPS):
         n = sum(per_req)
         pad = 2
         batch = types.SimpleNamespace(
@@ -85,6 +89,8 @@ def build(out_dir: str) -> None:
             if kind == "hole" and layer == 17:
                 continue
             ids = _ids(n + pad, gen)
+            if step_no == 2 and layer == 5:
+                ids[n + 1, 3] = ids[n + 1, 0]  # a bad padding row
             dumper.stage(
                 dumper.slot_for(f"model.layers.{layer}.mlp.experts"),
                 ids,

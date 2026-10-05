@@ -25,6 +25,7 @@ DTYPES = {
     "request_uid": np.int32,
     "position": np.int32,
     "token_is_prefill": np.bool_,
+    "row_is_padding": np.bool_,
     "target_topk": np.int16,
     "target_topk_weight": np.float16,
     "draft_topk": np.int16,
@@ -57,7 +58,9 @@ def test_fixture_files_index_and_meta_use_the_final_keys():
     assert meta["synthetic"] is True
     assert meta["tp_rank"] == 0 and meta["target_layers"] == 48
     assert meta["concurrency"] == 2 and meta["tp"] == 4
-    assert meta["num_speculative_tokens"] == 4 and meta["padding_traffic"] == "counted"
+    assert meta["num_speculative_tokens"] == 4
+    assert meta["padding_traffic"] == "recorded" and meta["dump_padded"] is True
+    assert meta["padded_rows_invalid"] == 1
     assert meta["valid_steps"] == 5 and meta["dropped_steps"] == 1
     assert meta["dropped_rows"] == 10
     assert meta["valid_steps"] == sum(e["valid_steps"] for e in index)
@@ -81,6 +84,7 @@ def test_fixture_arrays_have_the_final_names_dtypes_and_shapes():
             "request_uid": (s, mf),
             "position": (s, mf),
             "token_is_prefill": (s, mf),
+            "row_is_padding": (s, mf),
             "target_topk": (s, mf, 48, 10),
             "target_topk_weight": (s, mf, 48, 10),
             "draft_topk": (s, 4, mf, 1, 10),
@@ -101,18 +105,32 @@ def test_fixture_content_serves_the_analyser_contract():
     pure = (phase == 0) & (active == 2)
     assert pure.sum() == 4  # >= 2 pure-decode steps at nominal c=2
     assert sorted(phase.tolist()) == [0, 0, 0, 0, 2]  # one mixed, never pure
+    invalid_padding = 0
     for z in arrays.values():
         for i in range(len(z["step_idx"])):
             n = int(z["num_tokens"][i])
-            assert z["padded_num_tokens"][i] > n  # padded count kept apart
+            padded = int(z["padded_num_tokens"][i])
+            assert padded == n + 2  # two CUDA-graph padding rows per step
+            assert z["target_topk"].shape[1] >= padded
             ids = z["target_topk"][i, :n]
             assert (ids >= 0).all() and (ids < 512).all()
             srt = np.sort(ids, axis=-1)
             assert (srt[..., 1:] != srt[..., :-1]).all()  # 10 distinct per row
-            assert (z["target_topk"][i, n:] == -1).all()
+            # padding rows: flagged, no request/position, ids kept unless invalid
+            assert not z["row_is_padding"][i, :n].any()
+            assert z["row_is_padding"][i, n:].all()
+            assert (z["request_uid"][i, n:] == -1).all()
+            assert (z["position"][i, n:] == -1).all()
+            assert not z["token_is_prefill"][i, n:].any()
+            pad_rows = z["target_topk"][i, n:padded]
+            blank = (pad_rows == -1).all(axis=(1, 2))
+            invalid_padding += int(blank.sum())
+            assert ((pad_rows >= 0).all(axis=(1, 2)) | blank).all()
+            assert (z["target_topk"][i, padded:] == -1).all()
             if z["step_phase"][i] == 2:
                 assert z["token_is_prefill"][i, :n].sum() == 4
             assert list(z["draft_num_rows"][i]) == [n, 2, 2, 2]
+    assert invalid_padding == 1  # == meta["padded_rows_invalid"]
 
 
 def test_regenerating_the_fixture_reproduces_the_routing(tmp_path):

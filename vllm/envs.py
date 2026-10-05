@@ -458,6 +458,7 @@ if TYPE_CHECKING:
     VLLM_SM70_EXPERT_ROUTING_DUMP_MAX_ROWS: int = 0
     VLLM_SM70_EXPERT_ROUTING_DUMP_RANKS: str = "all"
     VLLM_SM70_EXPERT_ROUTING_DUMP_IDS: bool = False
+    VLLM_SM70_EXPERT_ROUTING_DUMP_PADDED: bool = True
     VLLM_SM70_EXPERT_ROUTING_DUMP_LABEL: str | None = None
     VLLM_SM70_EXPERT_ROUTING_DUMP_CONCURRENCY: str | None = None
     VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH: int = 0
@@ -6504,6 +6505,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="debug",
         declared_default="False",
         effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+    ),
+    "VLLM_SM70_EXPERT_ROUTING_DUMP_PADDED": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_EXPERT_ROUTING_DUMP_PADDED", "1"))),
+        description=(
+            "Also record the top-k of the CUDA-graph padding rows of every "
+            "target step (rows num_tokens..padded_num_tokens-1, flagged by "
+            "row_is_padding): the MoE kernels select experts and read their "
+            "weights for those rows too. Default 1 (meta padding_traffic "
+            "'recorded'); 0 records only the real rows ('counted')."
+        ),
+        category="debug",
+        declared_default="True",
+        effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
     ),
@@ -16962,6 +16978,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_SM70_EXPERT_ROUTING_DUMP_MAX_ROWS",
         "VLLM_SM70_EXPERT_ROUTING_DUMP_RANKS",
         "VLLM_SM70_EXPERT_ROUTING_DUMP_IDS",
+        "VLLM_SM70_EXPERT_ROUTING_DUMP_PADDED",
         "VLLM_SM70_EXPERT_ROUTING_DUMP_LABEL",
         "VLLM_SM70_EXPERT_ROUTING_DUMP_CONCURRENCY",
         "VLLM_DP_MASTER_IP",

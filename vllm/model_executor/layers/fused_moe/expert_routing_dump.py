@@ -60,7 +60,11 @@ Row ``i`` of a target layer is token ``i`` of the batch: requests are ordered as
 (one for a plain decode, ``1 + drafts`` for a verification step, a chunk for a
 prefill).  ``num_tokens`` is the real row count, never the CUDA-graph padded
 one; the padded count is in ``padded_num_tokens`` because the MoE kernels
-process (and move expert weights for) the padded rows too.  Draft step 0 (the
+process (and move expert weights for) the padded rows too.  With
+``VLLM_SM70_EXPERT_ROUTING_DUMP_PADDED=1`` (default) the top-k of those padding
+rows is recorded as well (``row_is_padding`` True, uid/position -1); a padding
+row with missing or invalid ids is blanked to -1 and counted in
+``padded_rows_invalid`` without dropping the step.  Draft step 0 (the
 draft prefill) runs on the same rows; draft steps >= 1 run one row per request,
 in batch order.  ``draft_num_rows`` records the valid row count of every draft
 step.
@@ -121,11 +125,19 @@ ROUND_DEFINITION = (
     "U(s,l)=|unique(target_topk[s,:num_tokens[s],l,:])|"
 )
 ROW_LAYOUT = (
-    "target rows = batch tokens (requests in batch order, tokens_per_request "
-    "rows each); num_tokens = real rows (never the padded count); draft step 0 "
-    "uses the same rows, draft steps >= 1 use one row per request; "
-    "draft_num_rows[s, d] = valid rows of draft step d; "
-    "draft_topk[s, d, row, l, :] = draft step d, draft MoE layer l; padding -1"
+    "target rows 0..num_tokens-1 = batch tokens (requests in batch order); "
+    "num_tokens = real rows (never the padded count). Rows >= num_tokens have "
+    "row_is_padding True; with padding_traffic 'recorded' the rows "
+    "num_tokens..min(padded_num_tokens, max_rows)-1 carry the router's top-k "
+    "of the CUDA-graph padding rows (request_uid/position -1, "
+    "token_is_prefill False), a row whose ids were missing or invalid is -1 "
+    "(counted in padded_rows_invalid) and rows past that are -1 as well, so "
+    "physical traffic = rows with ids >= 0; with 'counted' no padded row is "
+    "recorded. Draft arrays hold REAL rows only (padding of the draft graphs "
+    "is not recorded): draft step 0 uses the same rows as the target, draft "
+    "steps >= 1 use one row per request; draft_num_rows[s, d] = valid rows of "
+    "draft step d; draft_topk[s, d, row, l, :] = draft step d, draft MoE layer "
+    "l; padding -1"
 )
 SHARED_EXPERT_NOTE = (
     "unconditional: computed for every token of every layer, output scaled by "
@@ -150,6 +162,7 @@ NPZ_ARRAYS = (
     "request_uid",
     "position",
     "token_is_prefill",
+    "row_is_padding",
     "target_topk",
     "target_topk_weight",
     "draft_topk",
@@ -187,6 +200,7 @@ META_KEYS = (
     "max_rows",
     "with_weights",
     "dump_ids",
+    "dump_padded",
     "dump_dir",
     "kv_pool_blocks",
     "block_size",
@@ -197,6 +211,7 @@ META_KEYS = (
     "valid_steps",
     "dropped_steps",
     "dropped_rows",
+    "padded_rows_invalid",
     "files_written",
     "write_errors",
     "created_unix_ns",
@@ -290,6 +305,7 @@ class _Run:
         self.valid_steps = 0
         self.dropped_steps = 0
         self.dropped_rows = 0
+        self.padded_rows_invalid = 0
         self.files_written = 0
         self.write_errors = 0
         self.pending_steps = 0  # drops not yet attributed to an index line
@@ -376,6 +392,7 @@ class ExpertRoutingDumper:
         with_weights: bool,
         device: torch.device | str,
         dump_ids: bool = False,
+        record_padded: bool = True,
         concurrency: int | str | None = None,
         cell_label: str | None = None,
         meta_extra: dict[str, Any] | None = None,
@@ -390,6 +407,7 @@ class ExpertRoutingDumper:
         self.max_rows = max_rows
         self.with_weights = with_weights
         self.dump_ids = dump_ids
+        self.record_padded = record_padded
         extra = {k: v for k, v in (meta_extra or {}).items() if k in _META_EXTRA_KEYS}
         self._extra = extra
         device = torch.device(device)
@@ -669,7 +687,10 @@ class ExpertRoutingDumper:
             self._open_slot = None
             n_real = int(input_batch.num_tokens)
             padded = int(getattr(input_batch, "num_tokens_after_padding", 0) or n_real)
-            clear_rows = min(max(padded, n_real), self.max_rows)
+            padded = max(padded, n_real)
+            clear_rows = min(padded, self.max_rows)
+            # rows read back: the real ones, plus the padding rows when asked
+            m_copy = clear_rows if self.record_padded else n_real
             if n_real > self.max_rows:
                 self._drop(run, 1, n_real, "more rows than max_rows")
                 self._t_ids[:clear_rows].fill_(-1)
@@ -685,11 +706,12 @@ class ExpertRoutingDumper:
             if self._filled == 0:
                 ring.run = run
             s = self._filled
-            m = n_real
-            ring.t_ids[s, :m].copy_(self._t_ids[:m], non_blocking=True)
+            ring.t_ids[s, :m_copy].copy_(self._t_ids[:m_copy], non_blocking=True)
             if ring.t_w is not None and self._t_w is not None:
-                ring.t_w[s, :m].copy_(self._t_w[:m], non_blocking=True)
-            ring.pos[s, :m].copy_(input_batch.positions[:m], non_blocking=True)
+                ring.t_w[s, :m_copy].copy_(self._t_w[:m_copy], non_blocking=True)
+            ring.pos[s, :n_real].copy_(
+                input_batch.positions[:n_real], non_blocking=True
+            )
             self._t_ids[:clear_rows].fill_(-1)
             ring.d_rows[s, :] = 0
             prefilling = np.asarray(input_batch.is_prefilling_np, dtype=bool)
@@ -705,6 +727,7 @@ class ExpertRoutingDumper:
                     "step_idx": step_idx,
                     "wall_ns": time.time_ns(),
                     "num_tokens": n_real,
+                    "rows": m_copy,
                     "padded": padded,
                     "uids": tuple(self._uid(run, r) for r in req_ids),
                     "tokens_per_req": np.array(
@@ -836,12 +859,17 @@ class ExpertRoutingDumper:
                     self._free_rings.put(ring)
                 self._jobs.task_done()
 
+    def _valid_rows(self, ids: np.ndarray) -> np.ndarray:
+        """ids [rows, layers, k] -> bool [rows]: every layer has k distinct,
+        in-range ids for that row."""
+        in_range = ((ids >= 0) & (ids < self.num_experts)).all(axis=(1, 2))
+        ordered = np.sort(ids, axis=-1)
+        distinct = (ordered[..., 1:] != ordered[..., :-1]).all(axis=(1, 2))
+        return in_range & distinct
+
     def _valid_step(self, ids: np.ndarray) -> bool:
         """ids [rows, layers, k]: every id in range and ten distinct per row."""
-        if ids.size == 0 or (ids < 0).any() or (ids >= self.num_experts).any():
-            return False
-        ordered = np.sort(ids, axis=-1)
-        return bool((ordered[..., 1:] != ordered[..., :-1]).all())
+        return ids.shape[0] > 0 and bool(self._valid_rows(ids).all())
 
     def _write_file(self, ring: _Ring) -> None:
         run = ring.run
@@ -884,7 +912,7 @@ class ExpertRoutingDumper:
             return
 
         recs = [ring.recs[s] for s in keep]
-        m_file = max(r["num_tokens"] for r in recs)
+        m_file = max(r["rows"] for r in recs)
         target = np.full((count, m_file, lt, k), -1, dtype=np.int16)
         target_w = (
             np.full((count, m_file, lt, k), -1.0, dtype=np.float16)
@@ -896,13 +924,27 @@ class ExpertRoutingDumper:
         position = np.full((count, m_file), -1, dtype=np.int32)
         uid = np.full((count, m_file), -1, dtype=np.int32)
         token_prefill = np.zeros((count, m_file), dtype=bool)
+        row_padding = np.zeros((count, m_file), dtype=bool)
         shared = np.zeros((count, m_file, lt), dtype=bool)
         missing_draft_rows = 0
+        padded_invalid = 0
         for i, (s, rec) in enumerate(zip(keep, recs)):
             m = rec["num_tokens"]
-            target[i, :m] = t_ids_host[s, :m]
+            rows = rec["rows"]
+            row_padding[i, m:] = True
+            target[i, :rows] = t_ids_host[s, :rows]
             if target_w is not None and t_w_host is not None:
-                target_w[i, :m] = t_w_host[s, :m]
+                target_w[i, :rows] = t_w_host[s, :rows]
+            if rows > m:
+                # padding rows: a bad row (id missing, out of range or repeated
+                # in any layer) is blanked and counted, never a dropped step
+                ok = self._valid_rows(target[i, m:rows])
+                bad = ~ok
+                if bad.any():
+                    target[i, m:rows][bad] = -1
+                    if target_w is not None:
+                        target_w[i, m:rows][bad] = -1.0
+                    padded_invalid += int(bad.sum())
             position[i, :m] = pos_host[s, :m]
             shared[i, :m] = True
             owner = np.repeat(np.arange(len(rec["uids"])), rec["tokens_per_req"])[:m]
@@ -915,9 +957,10 @@ class ExpertRoutingDumper:
                     block = d_ids_host[s, d, :r, :ld]
                     draft[i, d, :r] = block
                     missing_draft_rows += int((block < 0).any(axis=(1, 2)).sum())
-        if missing_draft_rows:
+        if missing_draft_rows or padded_invalid:
             with self._lock:
                 run.dropped_rows += missing_draft_rows
+                run.padded_rows_invalid += padded_invalid
             pending_rows += missing_draft_rows
 
         step_idx = np.array([r["step_idx"] for r in recs], dtype=np.int32)
@@ -931,6 +974,7 @@ class ExpertRoutingDumper:
             "request_uid": uid,
             "position": position,
             "token_is_prefill": token_prefill,
+            "row_is_padding": row_padding,
             "target_topk": target,
             "draft_topk": draft,
             "draft_num_rows": draft_rows,
@@ -986,7 +1030,7 @@ class ExpertRoutingDumper:
                 "cell_label": run.cell_label,
                 "synthetic": bool(self._extra.get("synthetic", False)),
                 "round_definition": ROUND_DEFINITION,
-                "padding_traffic": "counted",
+                "padding_traffic": "recorded" if self.record_padded else "counted",
                 "tp_rank": self.rank,
                 "tp": self._extra.get("tp"),
                 "model": self._extra.get("model"),
@@ -1004,6 +1048,7 @@ class ExpertRoutingDumper:
                 "max_rows": self.max_rows,
                 "with_weights": self.with_weights,
                 "dump_ids": self.dump_ids,
+                "dump_padded": self.record_padded,
                 "dump_dir": run.run_dir,
                 "kv_pool_blocks": self._kv_pool_blocks,
                 "block_size": self._block_size,
@@ -1014,6 +1059,7 @@ class ExpertRoutingDumper:
                 "valid_steps": run.valid_steps,
                 "dropped_steps": run.dropped_steps,
                 "dropped_rows": run.dropped_rows,
+                "padded_rows_invalid": run.padded_rows_invalid,
                 "files_written": run.files_written,
                 "write_errors": run.write_errors,
                 "created_unix_ns": run.created_ns,
@@ -1126,6 +1172,7 @@ def maybe_enable(
         with_weights=envs.VLLM_SM70_EXPERT_ROUTING_DUMP_WEIGHTS,
         device=device,
         dump_ids=envs.VLLM_SM70_EXPERT_ROUTING_DUMP_IDS,
+        record_padded=envs.VLLM_SM70_EXPERT_ROUTING_DUMP_PADDED,
         concurrency=_parse_concurrency(envs.VLLM_SM70_EXPERT_ROUTING_DUMP_CONCURRENCY),
         cell_label=envs.VLLM_SM70_EXPERT_ROUTING_DUMP_LABEL,
         meta_extra=meta_extra,

@@ -47,6 +47,7 @@ def make_dumper(
     rank=0,
     draft_layers=LD,
     draft_steps=KD,
+    record_padded=False,
     **kwargs,
 ):
     return erd.ExpertRoutingDumper(
@@ -60,6 +61,7 @@ def make_dumper(
         steps_per_file=steps,
         max_rows=max_rows,
         with_weights=weights,
+        record_padded=record_padded,
         device="cpu",
         meta_extra={"model": "unit-test", "tp": 4, **kwargs.pop("meta_extra", {})},
         **kwargs,
@@ -382,7 +384,7 @@ def test_dump_env_vars_are_not_compile_cache_factors(monkeypatch):
         for n in envs.environment_variables
         if n.startswith("VLLM_SM70_EXPERT_ROUTING_DUMP_")
     ]
-    assert len(names) == 8
+    assert len(names) == 9
     base = envs.compile_factors()
     for n in names:
         assert n not in base
@@ -432,6 +434,7 @@ def test_round_trip_multiple_files_and_exact_schema(tmp_path):
             "request_uid": (np.int32, (s_count, m_file)),
             "position": (np.int32, (s_count, m_file)),
             "token_is_prefill": (np.bool_, (s_count, m_file)),
+            "row_is_padding": (np.bool_, (s_count, m_file)),
             "target_topk": (np.int16, (s_count, m_file, LT, K)),
             "target_topk_weight": (np.float16, (s_count, m_file, LT, K)),
             "draft_topk": (np.int16, (s_count, KD, m_file, LD, K)),
@@ -447,6 +450,7 @@ def test_round_trip_multiple_files_and_exact_schema(tmp_path):
             assert z["step_idx"][j] == step + j and z["num_tokens"][j] == n
             assert z["padded_num_tokens"][j] == n + 3  # padding is its own field
             assert z["active_requests"][j] == 2 and z["step_phase"][j] == 0
+            assert not z["row_is_padding"][j, :n].any()
             for layer in range(LT):
                 ids, w = expected[layer]
                 np.testing.assert_array_equal(
@@ -484,7 +488,7 @@ def test_round_trip_multiple_files_and_exact_schema(tmp_path):
     assert meta["target_layers"] == LT and meta["draft_layers"] == LD
     assert meta["num_experts"] == NEXP and meta["top_k"] == K
     assert meta["num_draft_steps"] == KD and meta["num_speculative_tokens"] == KD
-    assert meta["padding_traffic"] == "counted"
+    assert meta["padding_traffic"] == "counted" and meta["padded_rows_invalid"] == 0
     assert meta["round_definition"] == erd.ROUND_DEFINITION
     assert meta["valid_steps"] == 7 and meta["dropped_steps"] == 0
     assert meta["dropped_rows"] == 0 and meta["files_written"] == 3
@@ -573,6 +577,129 @@ def test_close_is_idempotent_and_stops_recording(tmp_path):
     assert erd.ACTIVE is None
     run_step(d, fake_batch([1]), 1)  # ignored after close
     assert len(index_lines(tmp_path)) == 1
+
+
+# ------------------------------------------------------------- padded rows
+def test_padded_rows_are_recorded_with_a_mask_when_the_knob_is_on(tmp_path):
+    d = make_dumper(tmp_path, steps=3, max_rows=32, record_padded=True)
+    truth = []
+    for i in range(3):
+        batch = fake_batch([5, 5], pad=2)
+        truth.append(run_step(d, batch, i)[0])
+    d.close()
+    z = load(tmp_path, npz_files(tmp_path)[0])
+    assert z["target_topk"].shape == (3, 12, LT, K)  # Mmax = padded rows
+    assert list(z["num_tokens"]) == [10] * 3  # the real count is untouched
+    assert list(z["padded_num_tokens"]) == [12] * 3
+    assert z["row_is_padding"].dtype == np.bool_
+    assert not z["row_is_padding"][:, :10].any() and z["row_is_padding"][:, 10:].all()
+    for i in range(3):
+        for layer in range(LT):
+            np.testing.assert_array_equal(
+                z["target_topk"][i, :, layer],
+                truth[i][layer][0][:12].numpy().astype(np.int16),
+            )
+            np.testing.assert_array_equal(
+                z["target_topk_weight"][i, :, layer],
+                truth[i][layer][1][:12].numpy().astype(np.float16),
+            )
+    # padding rows carry no request, position or phase
+    assert (z["request_uid"][:, 10:] == -1).all()
+    assert (z["position"][:, 10:] == -1).all()
+    assert not z["token_is_prefill"][:, 10:].any()
+    assert z["shared_expert_used"][:, :10].all()
+    meta = meta_of(tmp_path)
+    assert meta["padding_traffic"] == "recorded" and meta["dump_padded"] is True
+    assert meta["padded_rows_invalid"] == 0 and meta["dropped_steps"] == 0
+
+
+def test_knob_off_records_only_real_rows_and_says_counted(tmp_path):
+    d = make_dumper(tmp_path, steps=3, max_rows=32, record_padded=False)
+    for i in range(3):
+        run_step(d, fake_batch([5, 5], pad=2), i)
+    d.close()
+    z = load(tmp_path, npz_files(tmp_path)[0])
+    assert z["target_topk"].shape == (3, 10, LT, K)  # real rows only
+    assert list(z["padded_num_tokens"]) == [12] * 3  # still counted
+    assert not z["row_is_padding"].any()
+    meta = meta_of(tmp_path)
+    assert meta["padding_traffic"] == "counted" and meta["dump_padded"] is False
+
+
+def test_padded_knob_comes_from_the_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("VLLM_SM70_EXPERT_ROUTING_DUMP_DIR", str(tmp_path / "a"))
+    monkeypatch.delenv("VLLM_SM70_EXPERT_ROUTING_DUMP_PADDED", raising=False)
+    assert erd.maybe_enable(**enable_kwargs()).record_padded is True  # default 1
+    erd.ACTIVE.close()
+    monkeypatch.setenv("VLLM_SM70_EXPERT_ROUTING_DUMP_DIR", str(tmp_path / "b"))
+    monkeypatch.setenv("VLLM_SM70_EXPERT_ROUTING_DUMP_PADDED", "0")
+    assert erd.maybe_enable(**enable_kwargs()).record_padded is False
+
+
+def test_a_bad_padding_row_is_blanked_counted_and_never_drops_the_step(tmp_path):
+    d = make_dumper(tmp_path, steps=2, max_rows=32, record_padded=True)
+    batch = fake_batch([5, 5], pad=3)  # padding rows 10, 11, 12
+    stage_all_layers(d, batch, 0)
+    dup = synth_ids(13, 7)
+    dup[10, 4] = dup[10, 0]  # repeated expert id in a padding row
+    dup[12, 2] = NEXP + 5  # out-of-range id in another one
+    stg(d, "model.layers.1.mlp.experts", dup, synth_w(13, 7))
+    d.record_target_step(batch)
+    d.close()
+    z = load(tmp_path, npz_files(tmp_path)[0])
+    assert list(z["step_idx"]) == [0]  # the step is kept
+    assert (z["target_topk"][0, 10] == -1).all()  # whole row blanked, all layers
+    assert (z["target_topk"][0, 12] == -1).all()
+    assert (z["target_topk_weight"][0, 10] == -1.0).all()
+    assert (z["target_topk"][0, 11] >= 0).all()  # the good padding row stays
+    assert z["row_is_padding"][0, 10:].all()  # still flagged as padding
+    assert (z["target_topk"][0, :10, 1] >= 0).all()  # real rows untouched
+    meta = meta_of(tmp_path)
+    assert meta["padded_rows_invalid"] == 2
+    assert meta["valid_steps"] == 1 and meta["dropped_steps"] == 0
+
+
+def test_padding_rows_the_layers_never_wrote_count_as_invalid(tmp_path):
+    d = make_dumper(tmp_path, steps=2, max_rows=32, record_padded=True)
+    batch = fake_batch([5], pad=3)  # the layers only saw the 5 real rows
+    for layer in range(LT):
+        stg(
+            d,
+            f"model.layers.{layer}.mlp.experts",
+            synth_ids(5, layer),
+            synth_w(5, layer),
+        )
+    d.record_target_step(batch)
+    d.close()
+    z = load(tmp_path, npz_files(tmp_path)[0])
+    assert z["target_topk"].shape[1] == 8
+    assert (z["target_topk"][0, 5:] == -1).all() and z["row_is_padding"][0, 5:].all()
+    assert meta_of(tmp_path)["padded_rows_invalid"] == 3
+    assert meta_of(tmp_path)["valid_steps"] == 1
+
+
+def test_padding_beyond_max_rows_is_cut_but_the_true_count_is_kept(tmp_path):
+    d = make_dumper(tmp_path, steps=2, max_rows=12, record_padded=True)
+    batch = fake_batch([5, 5], pad=8)  # padded 18 > max_rows 12
+    stage_all_layers(d, batch, 0)
+    d.record_target_step(batch)
+    d.close()
+    z = load(tmp_path, npz_files(tmp_path)[0])
+    assert z["target_topk"].shape[1] == 12
+    assert list(z["padded_num_tokens"]) == [18] and list(z["num_tokens"]) == [10]
+    assert z["row_is_padding"][0, 10:].all()
+    assert meta_of(tmp_path)["valid_steps"] == 1
+
+
+def test_padding_reads_only_the_padded_prefix_per_step(tmp_path):
+    """Size of a step: rows * layers * k * 4 bytes (ids + weights), no more."""
+    d = make_dumper(tmp_path, steps=2, max_rows=64, record_padded=True)
+    batch = fake_batch([5], pad=0)  # exact capture size: nothing to pad
+    run_step(d, batch, 0)
+    d.close()
+    z = load(tmp_path, npz_files(tmp_path)[0])
+    assert z["target_topk"].shape[1] == 5 and not z["row_is_padding"].any()
+    assert list(z["padded_num_tokens"]) == [5]
 
 
 # --------------------------------------------------- phase and request uids
