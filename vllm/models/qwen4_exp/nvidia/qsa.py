@@ -408,7 +408,12 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             )
             return output
 
-        qsa_metadata: dict[str, torch.Tensor] = {}
+        qsa_metadata: dict[str, torch.Tensor | int] = {}
+        max_sequence_length = getattr(attn_metadata, "max_seq_len", None)
+        if self.kv_cache_dtype == NVFP4_KV_CACHE_DTYPE and max_sequence_length:
+            # Host-side longest sequence of the batch: lets the NVFP4 prefill scratch
+            # route prove its scratch is big enough without a device synchronization.
+            qsa_metadata["max_sequence_length"] = int(max_sequence_length)
         if query_positions is not None:
             qsa_metadata["query_positions"] = query_positions[:num_tokens]
         if sequence_lengths is not None:
@@ -742,6 +747,13 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         _verify_main_kv_storage_dtype(
             self.kv_cache_dtype, self.kv_cache_torch_dtype, model_config.dtype
         )
+        # The NVFP4 prefill scratch (plan 071 B') has one page per cache block of the
+        # longest context. The config objects are kept, not their values, because the
+        # platform may still settle the block size after the layers are built; the
+        # values are read when the scratch is reserved
+        # (_reserve_nvfp4_prefill_scratch).
+        self._nvfp4_cache_config = cache_config
+        self._nvfp4_model_config = model_config
         self.kv_sharing_target_layer_name = None
         self.kv_cache = torch.tensor([])
         set_default_quant_scales(self, register_buffer=True)
@@ -894,6 +906,19 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             dcp_sharded=dcp_sharded,
         )
 
+    def _reserve_nvfp4_prefill_scratch(self, device: torch.device) -> None:
+        """Reserve the per-rank FP16 scratch of the NVFP4 prefill route (071 B')."""
+        from .ops.qsa_nvfp4 import reserve_nvfp4_prefill_scratch
+
+        reserve_nvfp4_prefill_scratch(
+            device=device,
+            kv_cache_dtype=self.kv_cache_dtype,
+            block_size=int(self._nvfp4_cache_config.block_size),
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.head_dim,
+            max_model_len=int(self._nvfp4_model_config.max_model_len),
+        )
+
     def _project_qkv_gate(
         self,
         qkv: torch.Tensor,
@@ -935,6 +960,11 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         if isinstance(metadata, list):
             metadata = metadata[0]
         if not isinstance(metadata, dict):
+            # The worker's profile run lands here, before the KV pool is sized. The
+            # NVFP4 prefill scratch is reserved now so its bytes count as torch memory
+            # in use; reserved later (during serving) it would take memory the pool
+            # already claimed. A no-op unless VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH=1.
+            self._reserve_nvfp4_prefill_scratch(output.device)
             output.zero_()
             return
         main_metadata = cast(FlashAttentionMetadata, metadata[self.layer_name])

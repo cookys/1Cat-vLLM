@@ -141,6 +141,9 @@ if TYPE_CHECKING:
     VLLM_SM70_QSA_INDEXER_SCORE_TILE_MB: str | None = None
     VLLM_SM70_QSA_MTP_TOPK: bool = True
     VLLM_SM70_QSA_NVFP4_FUSED_READER: bool = False
+    VLLM_SM70_QSA_NVFP4_PREFILL_MIN_ROWS: int = 64
+    VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH: bool = False
+    VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH_TOKENS: str | None = None
     VLLM_SM70_QSA_TOPK_LIBRARY: str | None = None
     VLLM_SM70_QSA_XQA_PAGE4: str | None = None
     VLLM_SM70_QSA_XQA_PAGE4_MIN_ROWS: str | None = None
@@ -17612,6 +17615,57 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("QSA sparse attention/indexer",),
         user_visible=True,
+    ),
+    "VLLM_SM70_QSA_NVFP4_PREFILL_MIN_ROWS": env_var(
+        lambda: int(os.getenv("VLLM_SM70_QSA_NVFP4_PREFILL_MIN_ROWS", "64")),
+        description=(
+            "Smallest number of query rows of a prefill chunk that takes the NVFP4 "
+            "prefill scratch route. Smaller batches (decode, MTP verify) keep the "
+            "fused reader. Only read when VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH is 1; "
+            "the default matches the grouped page4 route's own minimum."
+        ),
+        category="tuning",
+        declared_default="64",
+        effective_default="64",
+        automatic_conditions=(),
+        acceleration_paths=("QSA sparse attention/indexer",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH", "0"))),
+        description=(
+            "Prefill chunks of an NVFP4 QSA main K/V cache decode the written prefix "
+            "once per layer into a resident FP16 scratch and run the FP16 grouped "
+            "page4 CUDA route on it, instead of the fused Triton reader. Decode keeps "
+            "the fused reader. The scratch holds max_model_len x 1 KiB per rank "
+            "(about 128 MiB at 131072) and is reserved during the profile run, so the "
+            "KV pool is sized without it. Default off: unmeasured on a GPU. Meant "
+            "to run with VLLM_SM70_QSA_NVFP4_FUSED_READER=1, whose reader serves "
+            "decode and every chunk this route declines (scratch too small or "
+            "not reserved, no grouped route in the CUDA extension, stream being "
+            "captured, fewer rows than the minimum)."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("QSA sparse attention/indexer",),
+        user_visible=True,
+    ),
+    "VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH_TOKENS": env_var(
+        lambda: os.getenv("VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH_TOKENS"),
+        description=(
+            "Overrides the token capacity of the NVFP4 prefill scratch, which "
+            "otherwise follows max_model_len. A context longer than the capacity "
+            "falls back to the fused reader for that chunk. Only read when "
+            "VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH is 1."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None; the scratch follows max_model_len.",
+        automatic_conditions=(),
+        acceleration_paths=("QSA sparse attention/indexer",),
+        user_visible=False,
     ),
     "VLLM_SM70_QSA_TOPK_LIBRARY": env_var(
         lambda: os.getenv("VLLM_SM70_QSA_TOPK_LIBRARY"),

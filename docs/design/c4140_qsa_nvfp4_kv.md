@@ -571,3 +571,110 @@ no-MTP、`--max-model-len 131072`、推測解碼關。判讀、原始檔路徑�
 - **品質探針**（對 fp16，視窗平均 ΔNLL，nats/token，30 窗）：8K −0.00005 [−0.01048, +0.00789]、32K −0.00307 [−0.01155, +0.00394]，**PASS**（≤ +0.01）。
   首 chunk（2K）+0.0213 [−0.0043, +0.0509]，E4M3 對照臂也有 +0.0182 [+0.0014, +0.0369]，**未決**：量化 KV 在第一個 chunk 內先寫後讀是兩種格式共同的懲罰，16 窗解不開兩者之差（plan 071 §5）。
 - **結論**：融合 reader（步驟 C）是下一個里程碑，prefill 與 decode 都要它（gather 加 FP16 reader 的路徑過不了閘門 4）；M2（MTP4 draft）排在它之後；3-bit（TQ3／TQ3.5）依 plan 071 §5.1 的規則**不排**。
+
+## 2026-10-05 選項 B′：prefill 經 FP16 scratch 走 grouped page4（只有 CPU，所有 GPU 數字都是沒數據）
+
+起因：W0（Q1.4b）量到 FP16 grouped 對 E4M3 grouped 的 prefill 比值 f = 0.976（16K）／0.948（64K），所以 llm-playground
+`doc/plan/071-prefill-fused-reader-design.md` 的選項 B′ 成立。現況的 fused Triton reader 對 E4M3 只有 0.58–0.60，缺口是那個逐列、255 暫存器的 reader
+本身，不是 gather 迴圈。B′ 的設計預估是 f × (1 − scratch 解碼成本) ≈ 0.92–0.95（**估計，沒有任何 GPU 量測**）。
+
+### 資料流（每個 QSA 層、每個 prefill chunk）
+
+1. `nvfp4_prefix_scratch_table`（`ops/qsa_nvfp4.py`）：每個 request 擁有 `ceil(seq_len / block)` 個連續 scratch 頁，起點是頁數的 exclusive cumsum；
+   `compact[r, j] = offset[r] + j`，其餘 `-1`。全在裝置端，沒有同步。
+2. `dequant_nvfp4_prefix_triton`（`ops/nvfp4_kv_triton.py`，kernel `_dequant_nvfp4_prefix_kernel`）把整段已寫入的前綴解碼成 FP16，
+   寫進兩個連續張量 `[pages, block, heads, 256]`（K、V 分開，`stride(0) = block × 256`，正是 `_qsa_xqa_page4_shape_supported` 接受的 FP16 cache 版面）。
+   解碼用 fused reader 的 `_nvfp4_tile_halves`，**不乘層級 scale**，所以和 gather 逐位元相同；
+   序號 ≥ `seq_len` 的位置與沒有對映的頁一律寫精確 `+0.0`（grouped kernel 會把整個 4-token 微區塊載進 smem，頁尾殘留的 E4M3 NaN scale 會毒化 `P @ V`）。
+   寫出用 int32 視圖（兩個 FP16 打成一個字），不是間隔 2 的 2 位元組 store。
+3. 既有的 `grouped_sparse_page4_plan_fwd` 與 `grouped_sparse_page4_fwd` 照舊，只是 K/V 來源換成 scratch、block table 換成 `compact`、
+   `kv_cache_dtype="auto"`（FP16 路徑**忽略** `k_scale`／`v_scale`，`fdp.cu` 的 `e4m3_kv ? k_scale : 1.0f`）。
+   K 的層級 scale 折進 softmax scale（`256**-0.5 × k_scale`，在 host 端 double 算完再轉 float）；`rows % 8` 的餘列走既有的 XQA page4 batch，吃同一個 scale。
+   兩條 CUDA 路徑一律傳 `k_scale = v_scale = 1.0`，所以不論它們會不會忽略 scale，都不會折兩次。
+4. V 的層級 scale 與 output gate 由一個新的逐元素 kernel `_qsa_output_scale_gate_kernel` 一次套用（沒有 gate 時只乘 scale），一次 FP16 捨入。
+   既有的 `_qsa_output_gate_kernel` 與 split-K、merge kernel 一個位元組都沒改。
+
+### 開關與路由
+
+| 環境變數 | 預設 | 作用 |
+|---|---|---|
+| `VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH` | 0 | 開 B′。關著時行為與先前逐位元相同（既有 NVFP4 測試全過，見下） |
+| `VLLM_SM70_QSA_NVFP4_PREFILL_MIN_ROWS` | 64 | 小於此列數（decode、MTP verify）仍走 fused／gather reader |
+| `VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH_TOKENS` | `max_model_len` | scratch 容量覆寫 |
+
+`qsa_sparse_paged_attention` 在 fused reader 之前呼叫 `qsa_sparse_attention_nvfp4_prefill`，它回傳 `None` 時**什麼都沒寫**，呼叫端照原本會走的 reader 執行。
+回退（`None`）的條件：列數不足、沒有 `query_positions`／`sequence_lengths`、scratch 沒預留、stream 正在 capture、cache 幾何與 scratch 不同、
+`block_table.shape[0] × ceil(max_seq_len / block)` 超過 scratch 頁數、`max_sequence_length` 未知（`forward_qsa` 以 `attn_metadata.max_seq_len` 傳入）、
+形狀超出 page4 契約、平台不是 SM70、擴充沒有 grouped／XQA page4。**回退一律是 fused（或 `FUSED_READER=0` 時的 gather），不是新路徑。**
+
+serve log 的路由證據（每個 process 各一次，`logger.info_once`）：
+
+```text
+QSA NVFP4 KV read routes: decode and small batches use the fused Triton reader (VLLM_SM70_QSA_NVFP4_FUSED_READER=1); chunks of >=64 rows use the prefill scratch route (decode once to FP16 + grouped page4) (VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH=1).
+QSA NVFP4 prefill scratch reserved: 48 pages x 2784 tokens (133632 tokens, 130.5 MiB per rank) on cuda:0; reserved before the KV pool is sized.
+QSA NVFP4 prefill scratch route active: prefix decoded once to FP16 (48 pages x 2784 tokens, 130.5 MiB) + grouped page4 (first chunk: 5568 rows).
+QSA NVFP4 prefill scratch route declined (<reason>); using the NVFP4 reader.
+```
+
+第一行也修掉先前 decode fused knob 沒有路由證據的問題（FUSED_READER 的狀態現在一定會出現一次）。第四行每個不同原因各出現一次。
+
+### scratch 的記帳（怎麼讓 KV 池定案時看得到它）
+
+- 大小 = `ceil(capacity_tokens / block) × block × heads × head × 2（K、V）× 2 B`，每 rank、全部 12 個 QSA 層共用一份（層循序執行、各自解碼自己讀的內容）。
+  block 2784：65536 → 65.25 MiB、131072 → **130.5 MiB**、262144 → 258.3 MiB（block 2864：64.3／128.7／257.3 MiB）。
+- **profile run 在 `Qwen4ExpQSAAttention._run_qsa` 的 `metadata` 不是 dict 時直接 `output.zero_(); return`**（設計文件點出的 `qsa.py:937-939` 早退）。
+  預留就放在這個早退分支裡（`_reserve_nvfp4_prefill_scratch` → `ensure_nvfp4_prefill_scratch`），所以這些位元組在 KV 池定案之前就是 torch 已配置的記憶體。
+  層在 `__init__` 只保存 `cache_config`／`model_config` 的參考，在預留當下才讀 `block_size` 與 `max_model_len`（平台可能在層建好之後才定 block size）。
+- 路由本身**絕不配置**：沒預留就回退並發一則 `warning_once`。這是刻意的：池已經定案後才配的 scratch 沒有被記帳，會吃掉池已經認領的記憶體。
+- 用零初始化（不是 `empty`）：planner 的 padding 微區塊可能指到 scratch 第 0 頁，`0 × 垃圾` 必須有限。
+- **沒數據**：「KV 池少了預期的位元組數」只能在 GPU 上用啟動 log 對照驗證（W2 的池大小對照）；CPU 只驗得到「預留發生在早退分支、且在路由之前」。
+
+### 增量解碼的規則（watermark）
+
+每層、每 chunk 把整段前綴重解碼一次是預設且唯一在 production 會發生的行為。kernel 有 `start_tokens`（每個 request 一個），
+`Nvfp4ScratchWatermark` 只在能**證明**時才給非零的起點，條件全部成立才給：
+
+- 上一次寫 scratch 的是同一個 owner（層）；
+- request id 的 tuple 完全相同、順序相同（`None` 一律不信：cache hit、被搶佔重算、實體頁重用，沒有 id 就分不出來）；
+- `query_start == 上次記錄的 seq_len`；
+- 該 request 的 scratch 起始頁沒有移動（前面的 request 多一頁會推移後面的）。
+
+scratch 是 12 層共用的，所以「上一次寫的是同一層」在 production 幾乎不成立，且 `forward_qsa` 目前不傳 request id（`None`），**實際上永遠是全量重解碼**。
+每層一份 scratch 要 12 倍記憶體（約 1.5 GiB/rank），不做。設計文件估的全量解碼成本是 0.1–0.3 µs/token（**估計，沒量**），所以這個規則現在是正確性保險，不是效能功能。
+
+### 數值
+
+- scratch 內容對 gather 逐位元相同（含層級 scale ≠ 1 的快取、毒化位元組、共用實體頁、未對映／超出範圍的頁）：CPU 直譯器測過。
+- attention 本體是 CUDA grouped kernel 自己的算術，與 Triton FP16 split-K 的歸約順序、P 的 FP16 捨入不同，**不逐位元相同**；
+  V scale 在 kernel 輸出（已捨入 FP16）之後才套，比 gather 路由多一次 FP16 捨入（相對 2⁻¹¹ 量級）。
+  起始容許 relL2 ≤ 2e-3（沿用 `FUSED_REL_L2_TOLERANCE`），那是借來的數，不是證據。
+- 因為與 fused、gather 都不逐位元相同，nvfp4 的探針、prefill ABBA、SWE-34 都必須在 B′ 最終路徑上重量（plan 071 §8 owner 決定，沒變）。
+
+### 驗證狀態
+
+CPU（`TRITON_INTERPRET=1`、`CUDA_VISIBLE_DEVICES=`）：
+
+- `tests/models/qwen4_exp/test_nvfp4_kv_prefill_scratch.py`：scratch 表手算、解碼對 gather 逐位元（單頁、整頁、單 token、多 request、頁尾、多 head）、層級 scale 不在解碼內、
+  毒化、共用頁、不寫出自己的 scratch 槽、增量 = 全量、watermark 規則、突變案例（nibble 順序、scale 位置、頁尾不補零、compact 表差一頁、offset 沒加、層級 scale 乘進解碼）。
+  另外對真 kernel 做過 4 個突變（nibble 偶奇互換、scale `//16`、去掉 `seq_len` 遮罩、K 解碼乘 0.5），第一個 parity 案例就失敗。
+- `tests/models/qwen4_exp/test_nvfp4_kv_prefill_route.py`：以 torch 替身取代 `grouped_sparse_page4_*` 與 `decode_paged_xqa_fwd`，驗證接線與 scale 算術
+  （K scale 折一次、V scale 折一次、`rows % 8` 餘列走 XQA 且同 scale、knob 關時不進入口、各種回退、預留位置、log 證據）。**替身不是 CUDA kernel**。
+- 編譯閘門（`test_nvfp4_kv_sm70_compile.py`，ptxas sm_70，不用 GPU）：解碼 kernel 4 warps、每程式 8 token：88 暫存器、無 stack、4096 B shared、無 atomic、4 位元組 store；
+  scale／gate kernel 10／15 暫存器；既有 split-K 的 PTX md5 不變。
+- `benchmarks/sm70_nvfp4_kv_kernel_check.py --arms gather fused prefill_scratch`（需要 prefill 大小的 `--rows`）：`SCRATCH_MATCHES_GATHER`（逐位元＋頁尾為零）、
+  兩個突變對 scratch 解碼必須被抓、GPU 上多做 route 對 fused／gather 的容許、計時臂 `prefill_scratch_decode`／`prefill_scratch_route`／`prefill_fused`／`prefill_e4m3`。CPU 自檢仍 PASS。
+
+**沒數據（全部）**：任何 GPU 上的時間（解碼 kernel、整條路由、對 E4M3 的比值）、grouped kernel 吃外部 scratch 的實際結果與 relL2、
+scratch 對池大小的實際影響、解碼 kernel 的 tile 大小（8 token）是否合適、1 位元組載入的有效頻寬、
+多 request／混合 batch、128K 以上、`--max-num-batched-tokens 8352` 槓桿、聯集大小 U、MTP draft 層（M2）。
+
+### 要先在 GPU 上看的（W1，閒置一張卡）
+
+```bash
+cd /data/src/1cat-wt-fable-bprime && CUDA_VISIBLE_DEVICES=<idle> PYTHONPATH=$PWD /data/venvs/1cat-p070/bin/python \
+  benchmarks/sm70_nvfp4_kv_kernel_check.py --arms gather fused prefill_scratch --rows 1 5 512 2048 5568 \
+  --context 65536 --out /data/bench/nvfp4_kv_kernel_check_bprime.json
+```
+
+先看 `SCRATCH_MATCHES_GATHER`、`SCRATCH_ROUTE_WITHIN_TOLERANCE`、`PREFILL_ROUNDTRIP_US`；再用 `VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH=1` 的 chain19 新臂量 prefill 對 E4M3，
+並比對啟動池大小（預期少了上面的位元組數）。

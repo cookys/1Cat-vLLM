@@ -57,6 +57,26 @@ The chain, per case (one NVFP4 or E4M3 block size and one row count):
    be FLAGGED through the fused route (``<mutation> fused_decode``). The timed arm is
    ``decode_fused_nvfp4_B<block>``.
 
+6. The prefill scratch route (``--arms prefill_scratch``, plan 071 option B'; not in the
+   default arms because it needs a prefill-sized ``--rows``, 64 or more for the CUDA
+   part). One prefill chunk: ``rows`` consecutive positions at the end of one
+   ``--context``-token request, selected the way the grouped planner reads them (4-token
+   groups plus a tail). ``prefill_scratch_decode`` decodes the whole prefix once into
+   an FP16 scratch (``dequant_nvfp4_prefix_triton``) and ``SCRATCH_MATCHES_GATHER``
+   requires it to equal ``gather_dequant_nvfp4_kv`` at unit layer scale bit for bit on
+   every token, and to be exact +0.0 past the sequence length; the two mutated caches pushed
+   through the same decode must differ (``<mutation> scratch_decode``). On a GPU
+   the route itself (scratch decode + FP16 grouped page4 + V scale) runs on the chunk:
+   ``SCRATCH_VS_FUSED`` (the whole chunk) and ``SCRATCH_VS_GATHER`` (the first 64 rows,
+   the gather route is slow) must be within ``FUSED_REL_L2_TOLERANCE``
+   (``SCRATCH_ROUTE_WITHIN_TOLERANCE``; UNKNOWN, and not required, off a GPU). Timed
+   arms: ``prefill_scratch_decode_nvfp4_B<block>`` (table + decode kernel alone),
+   ``prefill_scratch_route_nvfp4_B<block>`` (the whole route, GPU), ``prefill_fused_
+   nvfp4_B<block>`` (the Triton fused reader on the same chunk) and
+   ``prefill_e4m3_B<block>`` (the E4M3 grouped route on the same chunk shape, GPU);
+   ``PREFILL_ROUNDTRIP_US`` gives scratch route and fused over E4M3. NOT established by
+   any CPU run: every one of those times.
+
 Geometry. Read from ``--config`` for ``--tp`` ranks, as the engine builds it: head
 size, query heads per rank, KV heads per rank (replicated below the TP size),
 selection width ``indexer_budget + indexer_compress_ratio - 1``. The production
@@ -167,7 +187,13 @@ E4M3_MAX = 448.0
 # L2 of about 3e-4 is the rounding level (2**-11 per element); 2e-3 leaves a margin
 # and still fails a wrong nibble, scale or layer-scale placement (those are O(0.1..1)).
 FUSED_REL_L2_TOLERANCE = 2e-3
-ARMS = ("gather", "fused")
+DEFAULT_ARMS = ("gather", "fused")
+ARMS = ("gather", "fused", "prefill_scratch")
+# The CUDA part of the scratch route is a prefill route: the grouped page4 planner
+# works on groups of 8 rows and the knob's default minimum is 64.
+PREFILL_ROUTE_MIN_ROWS = 64
+# The gather route (31 rows per launch group) is compared on this many rows only.
+PREFILL_VS_GATHER_ROWS = 64
 RESULT_KEYS = ("store", "gather", "zero_fill", "decode_path", "decode_quality")
 # The measured attention error must lie within this factor of the CPU model's.
 BAND_LOW, BAND_HIGH = 0.7, 1.4
@@ -420,6 +446,54 @@ def build_selection(
                     bad = block < 0 or block >= layout.num_blocks
             illegal[row, col] = bad
     return Selection(indices, table, token_to_req, illegal, tuple(empty))
+
+
+@dataclass(frozen=True)
+class PrefillSelection:
+    indices: torch.Tensor  # int32 [rows, topk]
+    table: torch.Tensor  # int32 [1, pages]: request 0 only
+    token_to_req: torch.Tensor  # int32 [rows], all zero
+    positions: torch.Tensor  # int64 [rows], the last ``rows`` positions
+    seq_lens: torch.Tensor  # int32 [1]
+
+
+def build_prefill_selection(
+    layout: Layout, table: torch.Tensor, rows: int, topk: int, seed: int
+) -> PrefillSelection:
+    """One prefill chunk of request 0: causal 4-token groups plus the partial tail.
+
+    Row ``r`` sits at position ``seq_len - rows + r`` and sees ``position + 1`` tokens.
+    It selects up to ``(topk - 3) // 4`` random complete 4-token groups below that, in
+    ascending order, then the 1-3 tokens of its last partial group at the slot after
+    them: the layout the grouped planner reads (``2051 = 512 * 4 + 3``). Every entry is
+    legal and causal; the rest of the row is ``-1``.
+    """
+    seq_len = layout.tokens_per_request
+    if rows > seq_len:
+        raise ValueError(f"a chunk of {rows} rows needs --context of at least {rows}")
+    generator = torch.Generator().manual_seed(seed)
+    positions = torch.arange(seq_len - rows, seq_len, dtype=torch.int64)
+    max_groups = max(0, (topk - 3) // 4)
+    indices = torch.full((rows, topk), -1, dtype=torch.int32)
+    for row, position in enumerate(positions.tolist()):
+        visible = position + 1
+        full = visible // 4
+        count = min(full, max_groups)
+        groups = torch.randperm(full, generator=generator)[:count].sort().values
+        span = (groups[:, None] * 4 + torch.arange(4)).reshape(-1)
+        indices[row, : span.numel()] = span.to(torch.int32)
+        tail = min(visible - full * 4, topk - span.numel())
+        if tail > 0:
+            indices[row, count * 4 : count * 4 + tail] = (
+                full * 4 + torch.arange(tail)
+            ).to(torch.int32)
+    return PrefillSelection(
+        indices,
+        table[:1].clone(),
+        torch.zeros(rows, dtype=torch.int32),
+        positions,
+        torch.tensor([seq_len], dtype=torch.int32),
+    )
 
 
 # ------------------------------------------------------------------ statistics
@@ -685,6 +759,20 @@ def fused_within_tolerance(fused: dict[str, Any]) -> bool:
     )
 
 
+def scratch_decode_matches_gather(prefill: dict[str, Any]) -> bool:
+    """The scratch decode equals the gather bit for bit, and its tail is +0.0."""
+    decode = prefill["decode"]
+    return bool(decode["different"] == 0 and decode["tail_zero_ok"])
+
+
+def scratch_route_within_tolerance(route: dict[str, Any]) -> bool:
+    """The whole scratch route against the fused reader and the gather route."""
+    return bool(
+        route["vs_fused"]["rel_l2"] <= FUSED_REL_L2_TOLERANCE
+        and route["vs_gather"]["rel_l2"] <= FUSED_REL_L2_TOLERANCE
+    )
+
+
 def compute_verdict(results: Sequence[dict[str, Any]]) -> dict[str, Any]:
     """Verdict lines from the per-case results.
 
@@ -717,6 +805,22 @@ def compute_verdict(results: Sequence[dict[str, Any]]) -> dict[str, Any]:
     )
     if any("fused" in r for r in nvfp4):
         verdict["FUSED_MATCHES_GATHER"] = over("fused", fused_within_tolerance)
+    if any("prefill_scratch" in r for r in nvfp4):
+        verdict["SCRATCH_MATCHES_GATHER"] = over(
+            "prefill_scratch", scratch_decode_matches_gather
+        )
+        routed = [
+            r
+            for r in nvfp4
+            if "vs_fused" in ((r.get("prefill_scratch") or {}).get("route") or {})
+        ]
+        if any(
+            not scratch_route_within_tolerance(r["prefill_scratch"]["route"])
+            for r in routed
+        ):
+            verdict["SCRATCH_ROUTE_WITHIN_TOLERANCE"] = "NO"
+        else:
+            verdict["SCRATCH_ROUTE_WITHIN_TOLERANCE"] = "YES" if routed else "UNKNOWN"
     verdict["errors"] = {r["case"]: r["error"] for r in results if r.get("error")}
     ratios: dict[str, float] = {}
     for rows in sorted({r["rows"] for r in results}):
@@ -760,6 +864,27 @@ def decode_roundtrip_lines(timings: dict[str, dict[str, Any]]) -> list[str]:
                 + " ratio "
                 + "/".join(f"{f / g:.2f}" for f, g in zip(fused, fp4, strict=False))
             )
+        scratch = [
+            v["median"]
+            for k, v in arms.items()
+            if k.startswith("prefill_scratch_route")
+        ]
+        prefill_fused = [
+            v["median"] for k, v in arms.items() if k.startswith("prefill_fused")
+        ]
+        prefill_e4m3 = [v for k, v in arms.items() if k.startswith("prefill_e4m3")]
+        if (scratch or prefill_fused) and prefill_e4m3:
+            base = prefill_e4m3[0]["median"]
+            lines.append(
+                f"PREFILL_ROUNDTRIP_US {group}: e4m3 {base:.1f} scratch route "
+                + ("/".join(f"{x:.1f}" for x in scratch) or "n/a")
+                + " fused "
+                + ("/".join(f"{x:.1f}" for x in prefill_fused) or "n/a")
+                + " ratio to e4m3 (scratch route, fused) "
+                + ("/".join(f"{x / base:.2f}" for x in scratch) or "n/a")
+                + ", "
+                + ("/".join(f"{x / base:.2f}" for x in prefill_fused) or "n/a")
+            )
     return lines
 
 
@@ -777,9 +902,34 @@ def format_verdict(
         "ZERO_FILL_OK",
         "DECODE_PATH_IDENTICAL",
         "FUSED_MATCHES_GATHER",
+        "SCRATCH_MATCHES_GATHER",
+        "SCRATCH_ROUTE_WITHIN_TOLERANCE",
     ):
         if key in verdict:
             lines.append(f"{key}: {verdict[key]}")
+    for r in results:
+        scratch = r.get("prefill_scratch")
+        if not scratch:
+            continue
+        d = scratch["decode"]
+        lines.append(
+            f"SCRATCH_DECODE {r['case']}: {d['different']} of {d['elements']} "
+            f"elements differ from the gather, tail +0.0 "
+            f"{_yes_no(d['tail_zero_ok'])}"
+        )
+        route = scratch.get("route") or {}
+        if "skipped" in route:
+            lines.append(f"SCRATCH_ROUTE {r['case']}: skipped ({route['skipped']})")
+        for name, key in (
+            ("SCRATCH_VS_FUSED", "vs_fused"),
+            ("SCRATCH_VS_GATHER", "vs_gather"),
+        ):
+            if key in route:
+                e = route[key]
+                lines.append(
+                    f"{name} {r['case']}: max|d| {e['max_abs']:.3g} "
+                    f"mean|d| {e['mean_abs']:.3g} relL2 {e['rel_l2']:.3g}"
+                )
     for r in results:
         if (
             r.get("store")
@@ -864,11 +1014,16 @@ def compute_self_check(
     *,
     no_timing: bool = False,
     fused_arm: bool | None = None,
+    prefill_arm: bool | None = None,
+    prefill_route_required: bool = False,
 ) -> dict[str, Any]:
     """The positive controls, negative controls and stages, and the overall verdict.
 
     ``fused_arm`` says whether the fused reader was asked for (``--arms``); ``None``
     infers it from the results, which cannot see a fused arm that raised everywhere.
+    ``prefill_arm`` is the same for the prefill scratch route; its CUDA part must have
+    run (``SCRATCH_ROUTE_WITHIN_TOLERANCE``) only when ``prefill_route_required``
+    (the run is on a GPU).
     """
     nvfp4 = [r for r in results if r["kind"] == "nvfp4"]
     e4m3 = [r for r in results if r["kind"] == "e4m3"]
@@ -903,6 +1058,38 @@ def compute_self_check(
             nvfp4, lambda r: r.get("fused"), fused_within_tolerance, "PASS", "FAIL"
         )
 
+    prefill_run = (
+        any("prefill_scratch" in r for r in nvfp4)
+        if prefill_arm is None
+        else prefill_arm
+    )
+    if prefill_run:
+        positive["SCRATCH_MATCHES_GATHER"] = _over(
+            nvfp4,
+            lambda r: r.get("prefill_scratch"),
+            scratch_decode_matches_gather,
+            "PASS",
+            "FAIL",
+        )
+        if prefill_route_required:
+            applicable = [
+                r
+                for r in nvfp4
+                if not ((r.get("prefill_scratch") or {}).get("route") or {}).get(
+                    "not_applicable"
+                )
+            ]
+            positive["SCRATCH_ROUTE_WITHIN_TOLERANCE"] = _over(
+                applicable,
+                lambda r: (r.get("prefill_scratch") or {})
+                .get("route", {})
+                .get("vs_fused")
+                and r["prefill_scratch"]["route"],
+                scratch_route_within_tolerance,
+                "PASS",
+                "FAIL",
+            )
+
     negative: dict[str, str] = {}
     for mutation in MUTATIONS:
         for link in LINKS:
@@ -921,6 +1108,17 @@ def compute_self_check(
                     m
                 ),
                 lambda c, m=mutation: _control_flagged(m, "decode", c),
+                "FLAGGED",
+                "MISSED",
+            )
+    if prefill_run:
+        for mutation in MUTATIONS:
+            negative[f"{mutation} scratch_decode"] = _over(
+                nvfp4,
+                lambda r, m=mutation: (
+                    ((r.get("prefill_scratch") or {}).get("controls") or {}).get(m)
+                ),
+                lambda c: c["decode"]["different"] > 0,
                 "FLAGGED",
                 "MISSED",
             )
@@ -962,6 +1160,8 @@ def compute_self_check(
     }
     if fused_run:
         stages["decode_fused"] = ran(nvfp4, "fused")
+    if prefill_run:
+        stages["prefill_scratch"] = ran(nvfp4, "prefill_scratch")
     reasons = [f"{n} {v}" for n, v in positive.items() if v != "PASS"]
     reasons += [f"{n} {v}" for n, v in negative.items() if v != "FLAGGED"]
     reasons += [f"stage {n} {v}" for n, v in stages.items() if v != "RAN"]
@@ -1016,8 +1216,9 @@ def load_kernels() -> dict[str, Any]:
     from vllm.models.qwen4_exp.nvidia.ops import nvfp4_kv as nv
     from vllm.models.qwen4_exp.nvidia.ops import nvfp4_kv_triton as nvt
     from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
+    from vllm.models.qwen4_exp.nvidia.ops import qsa_nvfp4 as qsa_nvfp4_ops
 
-    return {"ops": ops, "nv": nv, "nvt": nvt, "qsa": qsa_ops}
+    return {"ops": ops, "nv": nv, "nvt": nvt, "qsa": qsa_ops, "qn": qsa_nvfp4_ops}
 
 
 def _sync() -> None:
@@ -1073,9 +1274,11 @@ class CaseRun:
         k_scale: float,
         v_scale: float,
         fused: bool = False,
+        prefill_scratch: bool = False,
     ) -> None:
         self.case, self.geometry, self.k = case, geometry, kernels
         self.fused = fused
+        self.prefill_scratch = prefill_scratch
         self.seed, self.k_scale, self.v_scale = seed, k_scale, v_scale
         self.device = torch.device(WORKER_DEVICE)
         self.layout = plan_layout(case.block_size, case.rows, geometry.topk, context)
@@ -1105,6 +1308,11 @@ class CaseRun:
             seed + 3,
             inject_illegal=True,
         )
+        self.prefill: PrefillSelection | None = None
+        if prefill_scratch:
+            self.prefill = build_prefill_selection(
+                self.layout, self.table, case.rows, geometry.topk, seed + 4
+            )
 
     # -- helpers ---------------------------------------------------------
     def _dev(self, x: torch.Tensor) -> torch.Tensor:
@@ -1312,6 +1520,10 @@ class CaseRun:
                 quantized,
                 baseline,
             )
+        if self.prefill_scratch:
+            result["prefill_scratch"] = self._run_prefill_scratch(
+                nv, nvt, reference, cache
+            )
         self._cache = cache
         # What the FP16 kernel alone reads once the gather is done (timing only).
         self._k_deq = self._dev(
@@ -1377,6 +1589,186 @@ class CaseRun:
             "zero_fill_ok": all(not unit_out[row].any() for row in sel.empty_rows),
             "controls": controls,
         }
+
+    # -- the prefill scratch route (plan 071 option B') --------------------
+    def _prefill_call(self, rows: slice = slice(None), **kwargs) -> torch.Tensor:
+        """``qsa_sparse_paged_attention`` on the prefill chunk (``rows`` of it)."""
+        p = self.prefill
+        assert p is not None
+        return self.k["qsa"].qsa_sparse_paged_attention(
+            self._dev(self.q[rows]),
+            kwargs.pop("k_cache"),
+            kwargs.pop("v_cache"),
+            self._dev(p.indices[rows]),
+            self._dev(p.table),
+            self._dev(p.token_to_req[rows]),
+            query_positions=self._dev(p.positions[rows]),
+            sequence_lengths=self._dev(p.seq_lens),
+            max_sequence_length=int(p.seq_lens[0]),
+            **kwargs,
+        )
+
+    def _scratch_geometry(self) -> tuple[int, int, int]:
+        p = self.prefill
+        assert p is not None
+        seq_len = int(p.seq_lens[0])
+        return seq_len, self.layout.block_size, -(-seq_len // self.layout.block_size)
+
+    def _decode_prefix(self, nvt, qn, cache: torch.Tensor):
+        """Scratch decode of request 0's whole prefix; returns the CPU K and V."""
+        p, g = self.prefill, self.geometry
+        assert p is not None
+        seq_len, block, pages = self._scratch_geometry()
+        table, lens = self._dev(p.table), self._dev(p.seq_lens)
+        _, offsets = qn.nvfp4_prefix_scratch_table(table, lens, block, pages)
+        shape = (pages, block, g.kv_heads, g.head_dim)
+        # A sentinel, not zeros: a slot the kernel forgets to write must show.
+        scratch_k = torch.full(shape, 7.0, dtype=torch.float16, device=self.device)
+        scratch_v = torch.full(shape, 7.0, dtype=torch.float16, device=self.device)
+        nvt.dequant_nvfp4_prefix_triton(
+            cache[:, 0],
+            cache[:, 1],
+            table,
+            lens,
+            offsets,
+            scratch_k,
+            scratch_v,
+            max_pages=pages,
+        )
+        _sync()
+        return scratch_k.cpu(), scratch_v.cpu()
+
+    def _compare_scratch(self, nv, reference: torch.Tensor, scratch) -> dict[str, Any]:
+        """Bit comparison with the gather at unit layer scale; the tail must be +0.0."""
+        p, g = self.prefill, self.geometry
+        assert p is not None
+        seq_len, block, pages = self._scratch_geometry()
+        want_k, want_v = nv.gather_dequant_nvfp4_kv(
+            reference,
+            p.table,
+            torch.zeros(1, dtype=torch.int32),
+            torch.arange(seq_len, dtype=torch.int32).view(1, -1),
+            k_scale=1.0,
+            v_scale=1.0,
+        )
+        different = 0
+        tail_ok = True
+        for got, want in zip(scratch, (want_k, want_v), strict=True):
+            flat = got.reshape(pages * block, g.kv_heads, g.head_dim)
+            different += int(
+                (flat[:seq_len].view(torch.int16) != want[0].view(torch.int16)).sum()
+            )
+            tail_ok &= not bool(flat[seq_len:].view(torch.int16).any())
+        return {
+            "elements": 2 * seq_len * g.kv_heads * g.head_dim,
+            "different": different,
+            "tail_zero_ok": tail_ok,
+        }
+
+    def _route_reason(self) -> str | None:
+        """Why the CUDA part of the route cannot run here, or None."""
+        if self.device.type != "cuda":
+            return "not a CUDA device: the grouped page4 route is a V100 kernel"
+        if self.case.rows < PREFILL_ROUTE_MIN_ROWS:
+            return (
+                f"{self.case.rows} rows (the route starts at {PREFILL_ROUTE_MIN_ROWS})"
+            )
+        return self.k["qsa"]._qsa_nvfp4_prefill_extension_reason()
+
+    def _install_scratch(self):
+        """This case's scratch as the device's, reserving it on first use."""
+        qn, g = self.k["qn"], self.geometry
+        seq_len, block, _ = self._scratch_geometry()
+        if getattr(self, "_scratch", None) is None:
+            self._scratch = qn.ensure_nvfp4_prefill_scratch(
+                self.device,
+                block_size=block,
+                num_kv_heads=g.kv_heads,
+                head_size=g.head_dim,
+                capacity_tokens=seq_len,
+            )
+        qn.install_nvfp4_prefill_scratch(self.device, self._scratch)
+
+    def _route_call(self, cache: torch.Tensor) -> torch.Tensor | None:
+        """The whole scratch route on the chunk (``None`` when it declines)."""
+        p = self.prefill
+        assert p is not None
+        self._install_scratch()
+        q = self._dev(self.q)
+        return self.k["qn"].qsa_sparse_attention_nvfp4_prefill(
+            q,
+            cache[:, 0],
+            cache[:, 1],
+            self._dev(p.indices),
+            self._dev(p.table),
+            self._dev(p.token_to_req),
+            torch.empty_like(q),
+            None,
+            self.k_scale,
+            self.v_scale,
+            query_positions=self._dev(p.positions),
+            sequence_lengths=self._dev(p.seq_lens),
+            max_sequence_length=int(p.seq_lens[0]),
+        )
+
+    def _run_prefill_scratch(self, nv, nvt, reference, cache) -> dict[str, Any]:
+        qn = self.k["qn"]
+        out: dict[str, Any] = {
+            "decode": self._compare_scratch(
+                nv, reference, self._decode_prefix(nvt, qn, cache)
+            )
+        }
+        out["controls"] = {
+            mutation: {
+                "decode": self._compare_scratch(
+                    nv,
+                    reference,
+                    self._decode_prefix(
+                        nvt,
+                        qn,
+                        self._dev(
+                            mutate_cache(reference, mutation, nv.nvfp4_kv_split_views)
+                        ),
+                    ),
+                )
+            }
+            for mutation in MUTATIONS
+        }
+        reason = self._route_reason()
+        if reason is not None:
+            # A chunk too short for the CUDA route is not a failure of the route: the
+            # self-check on a GPU only asks the route of the cases that can run it.
+            out["route"] = {
+                "skipped": reason,
+                "not_applicable": self.case.rows < PREFILL_ROUTE_MIN_ROWS,
+            }
+            return out
+        routed = self._route_call(cache)
+        if routed is None:
+            out["route"] = {"skipped": "the route declined the chunk (see the log)"}
+            return out
+        scales = {"k_scale": self.k_scale, "v_scale": self.v_scale}
+        fused = self._prefill_call(
+            k_cache=cache[:, 0],
+            v_cache=cache[:, 1],
+            kv_cache_dtype="nvfp4",
+            nvfp4_fused_reader=True,
+            **scales,
+        )
+        subset = slice(0, min(self.case.rows, PREFILL_VS_GATHER_ROWS))
+        gathered = self._prefill_call(
+            subset,
+            k_cache=cache[:, 0],
+            v_cache=cache[:, 1],
+            kv_cache_dtype="nvfp4",
+            nvfp4_fused_reader=False,
+            **scales,
+        )
+        out["route"] = {
+            "vs_fused": error_stats(routed.cpu(), fused.cpu()),
+            "vs_gather": error_stats(routed[subset].cpu(), gathered.cpu()),
+        }
+        return out
 
     # -- the E4M3 control ------------------------------------------------
     def run_e4m3(self) -> dict[str, Any]:
@@ -1558,6 +1950,8 @@ class CaseRun:
                     v_scale=vs,
                     nvfp4_fused_reader=True,
                 )
+            if self.prefill is not None:
+                arms.update(self._prefill_timing_arms(label, cache, ks, vs))
         else:
             k_cache, v_cache, ks, vs = self._e4m3
             scratch_k, scratch_v = torch.zeros_like(k_cache), torch.zeros_like(v_cache)
@@ -1576,6 +1970,74 @@ class CaseRun:
                 kv_cache_dtype="fp8_e4m3",
                 k_scale=ks,
                 v_scale=vs,
+            )
+            if self.prefill is not None and self._route_reason() is None:
+                # The same chunk shape through the E4M3 grouped page4 route: the
+                # number the scratch route is measured against.
+                p = self.prefill
+                chunk = (
+                    self._dev(p.indices),
+                    self._dev(p.table),
+                    self._dev(p.token_to_req),
+                )
+                positions, seq_lens = self._dev(p.positions), self._dev(p.seq_lens)
+                arms[f"prefill_e4m3_{label}"] = lambda: attention(
+                    q,
+                    k_cache,
+                    v_cache,
+                    *chunk,
+                    query_positions=positions,
+                    sequence_lengths=seq_lens,
+                    kv_cache_dtype="fp8_e4m3",
+                    k_scale=ks,
+                    v_scale=vs,
+                )
+        return arms
+
+    def _prefill_timing_arms(
+        self, label: str, cache: torch.Tensor, ks: float, vs: float
+    ) -> dict[str, Callable[[], Any]]:
+        """Closures of the prefill chunk: scratch decode, whole route, fused reader."""
+        p, qn, nvt = self.prefill, self.k["qn"], self.k["nvt"]
+        assert p is not None
+        _, block, pages = self._scratch_geometry()
+        table, lens = self._dev(p.table), self._dev(p.seq_lens)
+        scratch = tuple(
+            torch.zeros(
+                (pages, block, self.geometry.kv_heads, self.geometry.head_dim),
+                dtype=torch.float16,
+                device=self.device,
+            )
+            for _ in "kv"
+        )
+
+        def decode_only() -> None:
+            _, offsets = qn.nvfp4_prefix_scratch_table(table, lens, block, pages)
+            nvt.dequant_nvfp4_prefix_triton(
+                cache[:, 0],
+                cache[:, 1],
+                table,
+                lens,
+                offsets,
+                scratch[0],
+                scratch[1],
+                max_pages=pages,
+            )
+
+        arms: dict[str, Callable[[], Any]] = {
+            f"prefill_scratch_decode_nvfp4_{label}": decode_only,
+            f"prefill_fused_nvfp4_{label}": lambda: self._prefill_call(
+                k_cache=cache[:, 0],
+                v_cache=cache[:, 1],
+                kv_cache_dtype="nvfp4",
+                nvfp4_fused_reader=True,
+                k_scale=ks,
+                v_scale=vs,
+            ),
+        }
+        if self._route_reason() is None:
+            arms[f"prefill_scratch_route_nvfp4_{label}"] = lambda: self._route_call(
+                cache
             )
         return arms
 
@@ -1606,6 +2068,7 @@ def run_all(
                 k_scale=args.k_scale,
                 v_scale=args.v_scale,
                 fused="fused" in getattr(args, "arms", ("gather",)),
+                prefill_scratch="prefill_scratch" in getattr(args, "arms", ("gather",)),
             )
             entry.update(run.run_nvfp4() if case.kind == "nvfp4" else run.run_e4m3())
             runs[case.label] = run
@@ -1656,9 +2119,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--arms",
         nargs="+",
         choices=ARMS,
-        default=list(ARMS),
-        help="NVFP4 decode routes to verify and time: the gather route (production) "
-        "and/or the fused reader; `--arms gather` is the run without the fused reader",
+        default=list(DEFAULT_ARMS),
+        help="NVFP4 routes to verify and time: the gather route (production), the "
+        "fused reader and/or the prefill scratch route (plan 071 option B'; needs a "
+        "prefill-sized --rows); `--arms gather` is the run without the fused reader",
     )
     parser.add_argument("--rows", type=int, nargs="+", default=list(DEFAULT_ROWS))
     parser.add_argument("--context", type=int, default=8192, help="tokens per request")
@@ -1748,7 +2212,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         results, timings = run_all(cases, geometry, kernels, args)
     verdict = compute_verdict(results)
     check = compute_self_check(
-        results, timings, no_timing=args.no_timing, fused_arm="fused" in args.arms
+        results,
+        timings,
+        no_timing=args.no_timing,
+        fused_arm="fused" in args.arms,
+        prefill_arm="prefill_scratch" in args.arms,
+        prefill_route_required=WORKER_DEVICE.startswith("cuda"),
     )
     lines = format_verdict(verdict, results)
     for group, arms in timings.items():

@@ -158,6 +158,28 @@ def _qsa_grouped_page4_supported(
     )
 
 
+def _qsa_nvfp4_prefill_extension_reason() -> str | None:
+    """Why the NVFP4 prefill scratch route cannot run here; ``None`` when it can.
+
+    It needs the grouped page4 planner and kernel for an FP16 cache and the XQA page4
+    batch (the ``rows % 8`` remainder) in the Flash-V100 extension, on an SM70 device,
+    with the page4 routes not switched off by their environment variables.
+    """
+    if not current_platform.is_device_capability(70):
+        return "not an SM70 device"
+    if not (_SM70_QSA_XQA_PAGE4 and _SM70_QSA_GROUPED_PAGE4):
+        return "VLLM_SM70_QSA_XQA_PAGE4 or VLLM_SM70_QSA_GROUPED_PAGE4 is off"
+    try:
+        from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda
+    except ImportError:
+        return "Flash-V100 cannot be imported"
+    if not _qsa_grouped_page4_supported(flash_attn_v100_cuda, "auto"):
+        return "this Flash-V100 build has no grouped page4 route"
+    if not hasattr(flash_attn_v100_cuda, "decode_paged_xqa_fwd"):
+        return "this Flash-V100 build has no XQA page4 route"
+    return None
+
+
 @triton.jit(do_not_specialize=["num_requests"])
 def _qsa_mqa_paged_kernel(
     q_ptr,
@@ -1084,6 +1106,68 @@ def _qsa_output_gate_kernel(
     tl.store(
         output_ptr + row * stride_output_row + head * stride_output_head + dim_offsets,
         output * tl.sigmoid(gate),
+    )
+
+
+@triton.jit
+def _qsa_output_scale_gate_kernel(
+    output_ptr,
+    output_gate_ptr,
+    stride_output_row,
+    stride_output_head,
+    stride_output_gate_row,
+    stride_output_gate_head,
+    scale,
+    HEAD_DIM: tl.constexpr,
+    HAS_GATE: tl.constexpr,
+) -> None:
+    """``output = output * scale [* sigmoid(gate)]`` with one FP16 rounding."""
+    row = tl.program_id(0)
+    head = tl.program_id(1)
+    dim_offsets = tl.arange(0, HEAD_DIM)
+    output = (
+        tl.load(
+            output_ptr
+            + row * stride_output_row
+            + head * stride_output_head
+            + dim_offsets
+        ).to(tl.float32)
+        * scale
+    )
+    if HAS_GATE:
+        gate = tl.load(
+            output_gate_ptr
+            + row * stride_output_gate_row
+            + head * stride_output_gate_head
+            + dim_offsets
+        ).to(tl.float32)
+        output = output * tl.sigmoid(gate)
+    tl.store(
+        output_ptr + row * stride_output_row + head * stride_output_head + dim_offsets,
+        output,
+    )
+
+
+def _qsa_output_scale_gate(
+    output: torch.Tensor, output_gate: torch.Tensor | None, scale: float
+) -> None:
+    """The V layer scale and the output gate of the NVFP4 prefill scratch route.
+
+    The grouped CUDA kernel of an FP16 cache ignores ``v_scale``; applying it here, in
+    FP32 on the kernel's FP16 output, adds no launch when a gate follows anyway.
+    """
+    gate = output if output_gate is None else output_gate
+    _qsa_output_scale_gate_kernel[(output.shape[0], output.shape[1])](
+        output,
+        gate,
+        output.stride(0),
+        output.stride(1),
+        gate.stride(0),
+        gate.stride(1),
+        float(scale),
+        HEAD_DIM=output.shape[2],
+        HAS_GATE=output_gate is not None,
+        num_warps=4,
     )
 
 
@@ -2161,6 +2245,7 @@ def _qsa_sparse_paged_attention_sm70_grouped_page4(
     k_scale: float,
     v_scale: float,
     flash_attn_v100_cuda,
+    softmax_scale: float | None = None,
 ) -> torch.Tensor:
     grouped_pages, token_masks, grouped_sequence_lengths, lse = (
         _qsa_grouped_page4_workspace(q)
@@ -2202,7 +2287,7 @@ def _qsa_sparse_paged_attention_sm70_grouped_page4(
         token_masks,
         grouped_sequence_lengths,
         lse,
-        q.shape[2] ** -0.5,
+        q.shape[2] ** -0.5 if softmax_scale is None else softmax_scale,
         kv_cache_dtype,
         k_scale,
         v_scale,
@@ -2229,6 +2314,7 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4_batch(
     k_scale: float,
     v_scale: float,
     flash_attn_v100_cuda,
+    softmax_scale: float | None = None,
 ) -> torch.Tensor:
     virtual_block_table, xqa_sequence_lengths = _qsa_xqa_page4_block_table(
         logical_indices,
@@ -2261,7 +2347,7 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4_batch(
         max_logits,
         exp_sums,
         active_num_partitions,
-        q.shape[2] ** -0.5,
+        q.shape[2] ** -0.5 if softmax_scale is None else softmax_scale,
         partition_size,
         num_partitions,
         kv_cache_dtype,
@@ -2292,6 +2378,7 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
     kv_cache_dtype: str,
     k_scale: float,
     v_scale: float,
+    softmax_scale: float | None = None,
 ) -> torch.Tensor | None:
     try:
         from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda
@@ -2330,6 +2417,7 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
                 k_scale,
                 v_scale,
                 flash_attn_v100_cuda,
+                softmax_scale,
             )
         if grouped_rows == q.shape[0]:
             return out
@@ -2355,6 +2443,7 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
             k_scale,
             v_scale,
             flash_attn_v100_cuda,
+            softmax_scale,
         )
         return out
 
@@ -2387,6 +2476,7 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
                 k_scale,
                 v_scale,
                 flash_attn_v100_cuda,
+                softmax_scale,
             )
         return out
 
@@ -2404,6 +2494,7 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
         k_scale,
         v_scale,
         flash_attn_v100_cuda,
+        softmax_scale,
     )
 
 
@@ -2448,12 +2539,20 @@ def qsa_sparse_paged_attention(
     v_scale: float = 1.0,
     lse: torch.Tensor | None = None,
     nvfp4_fused_reader: bool | None = None,
+    max_sequence_length: int | None = None,
 ) -> torch.Tensor:
     """Run sparse GQA, optionally returning base-2 LSE for a cross-rank merge.
 
     ``nvfp4_fused_reader`` picks the route of an NVFP4 cache: ``False`` gathers the
     selected rows to FP16 first, ``True`` decodes them inside the split-K kernel,
     ``None`` follows ``VLLM_SM70_QSA_NVFP4_FUSED_READER`` (off by default).
+
+    With ``VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH=1`` a batch of at least
+    ``VLLM_SM70_QSA_NVFP4_PREFILL_MIN_ROWS`` rows first tries the prefill scratch route
+    (``qsa_nvfp4.qsa_sparse_attention_nvfp4_prefill``, plan 071 option B'), and runs the
+    route above when that declines. ``max_sequence_length`` is the host-side longest
+    sequence of the batch; without it the scratch route cannot prove its scratch is big
+    enough and declines.
 
     LSE callers may supply FP32 output to avoid rounding each rank's partial
     result. Apply output gating after the cross-rank merge, not per rank.
@@ -2559,9 +2658,33 @@ def qsa_sparse_paged_attention(
 
     k_block_scales = v_block_scales = None
     if kv_nvfp4:
-        from .qsa_nvfp4 import nvfp4_fused_reader_enabled
+        from .qsa_nvfp4 import (
+            log_nvfp4_route_knobs,
+            nvfp4_fused_reader_enabled,
+            nvfp4_prefill_scratch_enabled,
+            qsa_sparse_attention_nvfp4_prefill,
+        )
 
         kv_nvfp4_fused = nvfp4_fused_reader_enabled(nvfp4_fused_reader)
+        log_nvfp4_route_knobs(kv_nvfp4_fused)
+        if lse is None and nvfp4_prefill_scratch_enabled():
+            routed = qsa_sparse_attention_nvfp4_prefill(
+                q,
+                k_cache,
+                v_cache,
+                logical_indices,
+                block_table,
+                token_to_req,
+                out,
+                output_gate_view,
+                k_scale,
+                v_scale,
+                query_positions=query_positions,
+                sequence_lengths=sequence_lengths,
+                max_sequence_length=max_sequence_length,
+            )
+            if routed is not None:
+                return routed
     if kv_nvfp4 and kv_nvfp4_fused:
         # The split-K kernel below reads the packed data bytes and block scales
         # straight from the pages. The CUDA page4 routes never see an NVFP4 cache.

@@ -563,3 +563,119 @@ def test_the_fused_branch_leaves_the_existing_split_k_launches_unchanged():
     for name, compiled in digests.items():
         digest = hashlib.md5(_ptx_body(compiled).encode()).hexdigest()
         assert digest == PRE_FUSED_PTX_MD5[name], name
+
+
+# --------------------------------------------------------------------------- #
+# Plan 071 option B': the prefix decode into the FP16 scratch, and the V-scale/gate
+# kernel of the scratch route. Measured with Triton 3.6.0's ptxas (4 warps).
+# --------------------------------------------------------------------------- #
+PREFIX_DECODE = {
+    **{
+        name: "*u8"
+        for name in ("k_data_ptr", "k_scale_ptr", "v_data_ptr", "v_scale_ptr")
+    },
+    **{
+        name: "*i32"
+        for name in (
+            "block_table_ptr",
+            "seq_lens_ptr",
+            "page_offsets_ptr",
+            "start_tokens_ptr",
+            "k_out_ptr",
+            "v_out_ptr",
+        )
+    },
+    **{
+        name: "i32"
+        for name in (
+            "stride_data_block",
+            "stride_data_token",
+            "stride_data_head",
+            "stride_scale_block",
+            "stride_scale_token",
+            "stride_scale_head",
+            "stride_table_req",
+            "stride_out_page",
+            "stride_out_token",
+            "stride_out_head",
+            "num_blocks",
+            "num_requests",
+            "scratch_pages",
+        )
+    },
+}
+# 88 registers, no stack, 4 KiB of shared memory at 8 tokens per program.
+PREFIX_DECODE_MAX_REGISTERS = 96
+PREFIX_DECODE_MAX_SHARED = 8192
+
+
+def _prefix_decode(page_size, *, num_warps=4, has_start=True, table_width=96):
+    kernel = kernels._dequant_nvfp4_prefix_kernel
+    constexprs = {
+        "PAGE_SIZE": page_size,
+        "TABLE_WIDTH": table_width,
+        "HEADS": 1,
+        "HALF": 128,
+        "TILE": kernels.PREFIX_DECODE_TILE_TOKENS,
+        "HAS_START": has_start,
+    }
+    return _compile(
+        kernel, _with_constexprs(kernel, PREFIX_DECODE), constexprs, num_warps
+    )
+
+
+@pytest.mark.parametrize("has_start", [False, True])
+@pytest.mark.parametrize("page_size", [1392, 1568, 1616, 2784, 2864])
+def test_the_prefix_decode_lowers_to_sm70_without_spilling(page_size, has_start):
+    compiled = _prefix_decode(page_size, has_start=has_start)
+    _check(compiled, max_registers=PREFIX_DECODE_MAX_REGISTERS, max_stack=0)
+    assert compiled.metadata.shared <= PREFIX_DECODE_MAX_SHARED
+
+
+def test_the_prefix_decode_uses_no_atomics_so_it_is_deterministic():
+    ptx = _prefix_decode(2784).asm["ptx"]
+    assert not re.search(r"^\s*(atom|red)\.", ptx, re.MULTILINE)
+
+
+def test_the_prefix_decode_stores_whole_words_not_half_words():
+    # The scratch is written through int32 views: 4-byte stores (st.global.b32 or
+    # a vector of them), never the 2-byte stores at stride two of the gather kernel.
+    ptx = _prefix_decode(2784).asm["ptx"]
+    stores = re.findall(r"^\s*(?:@%p\d+\s+)?st\.global[\w.]*", ptx, re.MULTILINE)
+    assert stores and not any(".b16" in s or ".u16" in s for s in stores)
+
+
+def test_the_scale_gate_kernel_lowers_to_sm70():
+    kernel = qsa_ops._qsa_output_scale_gate_kernel
+    runtime = {
+        "output_ptr": "*fp16",
+        "output_gate_ptr": "*fp16",
+        "scale": "fp32",
+        **{
+            name: "i32"
+            for name in (
+                "stride_output_row",
+                "stride_output_head",
+                "stride_output_gate_row",
+                "stride_output_gate_head",
+            )
+        },
+    }
+    for has_gate in (False, True):
+        compiled = _compile(
+            kernel,
+            _with_constexprs(kernel, runtime),
+            {"HEAD_DIM": 256, "HAS_GATE": has_gate},
+            4,
+        )
+        _check(compiled, max_registers=32, max_stack=0)
+
+
+def test_the_new_kernels_do_not_change_the_existing_launches():
+    # The scratch route adds kernels; it must not touch the split-K ones. The md5 test
+    # above (PRE_FUSED_PTX_MD5) pins their PTX; this one pins that the two modules
+    # still expose them under the same names.
+    for name in ("_qsa_sparse_paged_gqa_splitk_kernel", "_qsa_merge_splitk_kernel"):
+        assert hasattr(qsa_ops, name)
+    for name in ("_gather_dequant_nvfp4_kernel", "_store_nvfp4_kernel"):
+        assert hasattr(kernels, name)

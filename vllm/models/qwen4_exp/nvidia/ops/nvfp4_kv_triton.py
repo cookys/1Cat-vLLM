@@ -9,6 +9,9 @@ Plan 071. Both are tested against the pure-torch reference in ``nvfp4_kv.py``:
   ``reshape_and_cache_flash``). It evaluates a group in the operation order of
   upstream's SM100 store, with a software E4M3 encoder and a software E2M1
   rounding, so nothing uses an FP4/FP8 instruction.
+* ``dequant_nvfp4_prefix_triton`` (plan 071, option B') decodes the whole written
+  prefix of each request once into an FP16 scratch laid out like an FP16 paged
+  cache, for the grouped page4 CUDA route; see ``qsa_nvfp4.py``.
 * ``gather_dequant_nvfp4_kv_triton`` reads the packed pages of the selected
   top-k tokens and writes dequantized K and V rows, with the validity and
   zero-fill rule of the QSA sparse kernel. It is the unpack-and-scale half of
@@ -37,6 +40,8 @@ from vllm.models.qwen4_exp.nvidia.ops.nvfp4_kv import (
 from vllm.triton_utils import tl, triton
 
 __all__ = [
+    "PREFIX_DECODE_TILE_TOKENS",
+    "dequant_nvfp4_prefix_triton",
     "gather_dequant_nvfp4_kv_triton",
     "gather_dequant_nvfp4_sides_triton",
     "store_nvfp4_kv_triton",
@@ -320,6 +325,227 @@ def gather_dequant_nvfp4_sides_triton(
         num_warps=2,
     )
     return keys, values
+
+
+# Tokens per program of the prefix decode: 8 rows of 128 data bytes per side. Measured
+# with the sm_70 ptxas (4 warps): 4 tokens 48 registers, 8 tokens 88, 16 tokens 153; no
+# spill in any of them. Not tuned on a GPU.
+PREFIX_DECODE_TILE_TOKENS = 8
+
+
+@triton.jit
+def _dequant_nvfp4_prefix_kernel(
+    k_data_ptr,
+    k_scale_ptr,
+    v_data_ptr,
+    v_scale_ptr,
+    block_table_ptr,
+    seq_lens_ptr,
+    page_offsets_ptr,
+    start_tokens_ptr,
+    k_out_ptr,
+    v_out_ptr,
+    stride_data_block,
+    stride_data_token,
+    stride_data_head,
+    stride_scale_block,
+    stride_scale_token,
+    stride_scale_head,
+    stride_table_req,
+    stride_out_page,
+    stride_out_token,
+    stride_out_head,
+    num_blocks,
+    num_requests,
+    scratch_pages,
+    PAGE_SIZE: tl.constexpr,
+    TABLE_WIDTH: tl.constexpr,
+    HEADS: tl.constexpr,
+    HALF: tl.constexpr,
+    TILE: tl.constexpr,
+    HAS_START: tl.constexpr,
+) -> None:
+    """One program decodes ``TILE`` tokens of one head of one page of one request.
+
+    Grid ``(tiles_per_page * HEADS, max_pages, requests)``. The outputs are int32
+    views of the FP16 scratch (two FP16 values per word, the even element in the low
+    half), so each row is written with 4-byte stores instead of 2-byte stores at a
+    stride of two. The arithmetic is ``_nvfp4_tile_halves``, the decode of the
+    fused reader, without the layer scale; the gather kernel above decodes the same
+    way, so the scratch equals the gathered K/V bit for bit.
+
+    A token is live when its logical page is mapped to a block inside the cache and
+    its position is below the request's sequence length. Every other slot of a
+    page the request owns (the tail of the last page, an unmapped page) is written
+    as +0.0: the grouped kernel loads whole 4-token microblocks, and a stale E4M3
+    NaN scale byte there would survive the zero probability of ``P @ V``.
+    ``HAS_START`` skips the tiles that end at or before the request's start token
+    (already decoded by an earlier chunk); a tile that straddles it is decoded
+    whole, which rewrites identical values.
+    """
+    tile_head = tl.program_id(0)
+    page = tl.program_id(1)
+    request = tl.program_id(2)
+    head = tile_head % HEADS
+    tile = tile_head // HEADS
+
+    seq_len = tl.load(seq_lens_ptr + request)
+    pages = tl.minimum(
+        (tl.maximum(seq_len, 0) + PAGE_SIZE - 1) // PAGE_SIZE, TABLE_WIDTH
+    )
+    page_in_request = page < pages
+    scratch_page = tl.load(page_offsets_ptr + request) + page
+    in_scratch = scratch_page < scratch_pages
+
+    in_page = tile * TILE + tl.arange(0, TILE)
+    token = page * PAGE_SIZE + in_page
+    if HAS_START:
+        start = tl.load(start_tokens_ptr + request)
+    else:
+        start = -1
+    new_tile = page * PAGE_SIZE + tl.minimum(tile * TILE + TILE, PAGE_SIZE) > start
+
+    physical = tl.load(
+        block_table_ptr
+        + request * stride_table_req
+        + tl.minimum(page, TABLE_WIDTH - 1),
+        mask=page_in_request,
+        other=-1,
+    )
+    mapped = page_in_request & (physical >= 0) & (physical < num_blocks)
+    block = tl.maximum(physical, 0).to(tl.int64)
+    live = mapped & (token < seq_len) & (in_page < PAGE_SIZE)
+    store = page_in_request & in_scratch & (in_page < PAGE_SIZE) & new_tile
+
+    byte = tl.arange(0, HALF)[None, :]
+    live_2d = live[:, None] & (byte >= 0)
+    data_offset = (
+        block * stride_data_block
+        + in_page[:, None] * stride_data_token
+        + head * stride_data_head
+        + byte
+    )
+    scale_offset = (
+        block * stride_scale_block
+        + in_page[:, None] * stride_scale_token
+        + head * stride_scale_head
+        + byte // 8
+    )
+    out_offset = (
+        scratch_page.to(tl.int64) * stride_out_page
+        + in_page[:, None] * stride_out_token
+        + head * stride_out_head
+        + byte
+    )
+    store_2d = store[:, None] & (byte >= 0)
+
+    k_packed = tl.load(k_data_ptr + data_offset, mask=live_2d, other=0).to(tl.int32)
+    k_scales = tl.load(k_scale_ptr + scale_offset, mask=live_2d, other=0)
+    k_even, k_odd = _nvfp4_tile_halves(k_packed, k_scales)
+    k_word = (k_even.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF) | (
+        k_odd.to(tl.int16, bitcast=True).to(tl.int32) << 16
+    )
+    tl.store(k_out_ptr + out_offset, k_word, mask=store_2d)
+
+    v_packed = tl.load(v_data_ptr + data_offset, mask=live_2d, other=0).to(tl.int32)
+    v_scales = tl.load(v_scale_ptr + scale_offset, mask=live_2d, other=0)
+    v_even, v_odd = _nvfp4_tile_halves(v_packed, v_scales)
+    v_word = (v_even.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF) | (
+        v_odd.to(tl.int16, bitcast=True).to(tl.int32) << 16
+    )
+    tl.store(v_out_ptr + out_offset, v_word, mask=store_2d)
+
+
+def dequant_nvfp4_prefix_triton(
+    k_side: torch.Tensor,
+    v_side: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_offsets: torch.Tensor,
+    scratch_k: torch.Tensor,
+    scratch_v: torch.Tensor,
+    *,
+    start_tokens: torch.Tensor | None = None,
+    max_pages: int,
+) -> None:
+    """Decode tokens ``0..seq_len-1`` of every request into the FP16 scratch.
+
+    ``k_side``/``v_side`` are the 4-D uint8 halves of the cache. The scratch is two
+    contiguous FP16 tensors ``[pages, block_size, heads, head_size]`` (the layout of
+    an FP16 paged cache); request ``r`` page ``j`` lands in scratch page
+    ``page_offsets[r] + j`` (``nvfp4_prefix_scratch_table`` builds the offsets). The
+    layer scales are not applied. ``max_pages`` is a host-side upper bound of the
+    pages of any request; programs past a request's own page count do nothing.
+    ``start_tokens`` (int32 per request) skips what an earlier chunk decoded.
+    No host synchronization, so it can be captured in a CUDA graph.
+    """
+    k_data, k_scales = nvfp4_side_views(k_side)
+    v_data, v_scales = nvfp4_side_views(v_side)
+    num_blocks, block_size, heads, _ = k_side.shape
+    if v_side.shape != k_side.shape:
+        raise ValueError("K and V cache sides must have the same shape")
+    head_size = k_data.shape[-1] * 2
+    if head_size % NVFP4_KV_GROUP_SIZE:
+        raise ValueError("NVFP4 KV head size must be a multiple of 16")
+    for name, tensor in (("block table", block_table), ("seq_lens", seq_lens)):
+        if tensor.dtype != torch.int32:
+            raise TypeError(f"{name} must be int32")
+    if page_offsets.dtype != torch.int32 or (
+        start_tokens is not None and start_tokens.dtype != torch.int32
+    ):
+        raise TypeError("page offsets and start tokens must be int32")
+    if block_table.stride(1) != 1:
+        raise ValueError("block table needs a unit inner stride")
+    if k_data.stride(3) != 1 or k_scales.stride(3) != 1:
+        raise ValueError("cache rows must be contiguous in their last dimension")
+    if v_data.stride() != k_data.stride() or v_scales.stride() != k_scales.stride():
+        raise ValueError("K and V cache sides must share their strides")
+    expected = (scratch_k.shape[0], block_size, heads, head_size)
+    for name, scratch in (("K", scratch_k), ("V", scratch_v)):
+        if scratch.dtype != torch.float16 or tuple(scratch.shape) != expected:
+            raise ValueError(
+                f"{name} scratch must be float16 {expected}, got "
+                f"{scratch.dtype} {tuple(scratch.shape)}"
+            )
+        if not scratch.is_contiguous():
+            raise ValueError(f"{name} scratch must be contiguous")
+    if max_pages <= 0 or block_table.shape[0] == 0:
+        return
+
+    k_words, v_words = scratch_k.view(torch.int32), scratch_v.view(torch.int32)
+    tiles = triton.cdiv(block_size, PREFIX_DECODE_TILE_TOKENS)
+    _dequant_nvfp4_prefix_kernel[(tiles * heads, max_pages, block_table.shape[0])](
+        k_data,
+        k_scales,
+        v_data,
+        v_scales,
+        block_table,
+        seq_lens,
+        page_offsets,
+        start_tokens if start_tokens is not None else seq_lens,
+        k_words,
+        v_words,
+        k_data.stride(0),
+        k_data.stride(1),
+        k_data.stride(2),
+        k_scales.stride(0),
+        k_scales.stride(1),
+        k_scales.stride(2),
+        block_table.stride(0),
+        k_words.stride(0),
+        k_words.stride(1),
+        k_words.stride(2),
+        num_blocks,
+        block_table.shape[0],
+        scratch_k.shape[0],
+        PAGE_SIZE=block_size,
+        TABLE_WIDTH=block_table.shape[1],
+        HEADS=heads,
+        HALF=head_size // 2,
+        TILE=PREFIX_DECODE_TILE_TOKENS,
+        HAS_START=start_tokens is not None,
+        num_warps=4,
+    )
 
 
 @triton.jit

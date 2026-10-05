@@ -1059,3 +1059,256 @@ def test_one_small_case_runs_the_fused_arm_end_to_end_on_cpu_tensors(chk, monkey
     assert verdict["FUSED_MATCHES_GATHER"] == "YES"
     check = chk.compute_self_check(results, timings, fused_arm=True)
     assert check["verdict"] == "PASS", chk.format_self_check(check, results)
+
+
+# ------------------------------------------------------ the prefill scratch arm
+def _scratch_block(different=0, tail=True, route=None):
+    block = {
+        "decode": {"elements": 100, "different": different, "tail_zero_ok": tail},
+        "controls": {
+            "nibble_order_swapped": {"decode": {"different": 40}},
+            "scale_placement_wrong": {"decode": {"different": 30}},
+        },
+    }
+    if route is not None:
+        block["route"] = route
+    return block
+
+
+def _route_block(fused=3e-4, gather=3e-4):
+    stats = {"max_abs": 1e-3, "mean_abs": 1e-4, "reference_norm": 1.0}
+    return {
+        "vs_fused": {**stats, "rel_l2": fused},
+        "vs_gather": {**stats, "rel_l2": gather},
+    }
+
+
+def _passing_scratch_run(route=None):
+    results, timings = _passing_run()
+    results[0]["prefill_scratch"] = _scratch_block(route=route)
+    timings["M=1"]["prefill_scratch_decode_nvfp4_B32"] = {"median": 5.0}
+    return results, timings
+
+
+def test_the_prefill_scratch_arm_is_opt_in_and_the_default_arms_are_unchanged(chk):
+    assert chk.parse_args([]).arms == ["gather", "fused"]
+    assert chk.parse_args(["--arms", "prefill_scratch"]).arms == ["prefill_scratch"]
+    assert "prefill_scratch" in chk.ARMS and "prefill_scratch" not in chk.DEFAULT_ARMS
+
+
+def test_a_run_without_the_scratch_arm_has_no_scratch_lines(chk):
+    results, timings = _passing_run()
+    verdict = chk.compute_verdict(results)
+    assert "SCRATCH_MATCHES_GATHER" not in verdict
+    assert not any(
+        line.startswith("SCRATCH") for line in chk.format_verdict(verdict, results)
+    )
+    check = chk.compute_self_check(results, timings, prefill_arm=False)
+    assert check["verdict"] == "PASS" and "prefill_scratch" not in check["stages"]
+
+
+def test_a_matching_scratch_decode_passes_and_prints_its_lines(chk):
+    results, timings = _passing_scratch_run()
+    verdict = chk.compute_verdict(results)
+    assert verdict["SCRATCH_MATCHES_GATHER"] == "YES"
+    assert verdict["SCRATCH_ROUTE_WITHIN_TOLERANCE"] == "UNKNOWN"  # no route off a GPU
+    lines = chk.format_verdict(verdict, results)
+    assert "SCRATCH_MATCHES_GATHER: YES" in lines
+    assert any(
+        line.startswith("SCRATCH_DECODE nvfp4-B32-M1: 0 of 100") for line in lines
+    )
+    check = chk.compute_self_check(results, timings, prefill_arm=True)
+    assert check["verdict"] == "PASS", check["reasons"]
+    assert check["positive"]["SCRATCH_MATCHES_GATHER"] == "PASS"
+    assert "SCRATCH_ROUTE_WITHIN_TOLERANCE" not in check["positive"]  # not on a GPU
+    assert check["negative"]["nibble_order_swapped scratch_decode"] == "FLAGGED"
+    assert check["negative"]["scale_placement_wrong scratch_decode"] == "FLAGGED"
+    assert check["stages"]["prefill_scratch"] == "RAN"
+
+
+@pytest.mark.parametrize(
+    "block",
+    [{"different": 1}, {"tail": False}],
+    ids=["a_value_differs_from_the_gather", "tail_not_zero"],
+)
+def test_a_scratch_decode_that_differs_from_the_gather_fails(chk, block):
+    results, timings = _passing_scratch_run()
+    results[0]["prefill_scratch"] = _scratch_block(**block)
+    assert chk.compute_verdict(results)["SCRATCH_MATCHES_GATHER"] == "NO"
+    check = _fail_reasons(chk, results, timings, prefill_arm=True)
+    assert check["positive"]["SCRATCH_MATCHES_GATHER"] == "FAIL"
+
+
+def test_a_scratch_mutation_the_comparison_cannot_see_is_missed(chk):
+    results, timings = _passing_scratch_run()
+    results[0]["prefill_scratch"]["controls"]["scale_placement_wrong"] = {
+        "decode": {"different": 0}
+    }
+    check = _fail_reasons(chk, results, timings, prefill_arm=True)
+    assert check["negative"]["scale_placement_wrong scratch_decode"] == "MISSED"
+
+
+def test_a_requested_scratch_arm_that_never_ran_fails(chk):
+    results, timings = _passing_run()  # no "prefill_scratch" anywhere
+    check = _fail_reasons(chk, results, timings, prefill_arm=True)
+    assert check["stages"]["prefill_scratch"] == "SKIPPED"
+    assert check["positive"]["SCRATCH_MATCHES_GATHER"] == "SKIPPED"
+
+
+def test_the_route_is_required_on_a_gpu_and_judged_by_both_tolerances(chk):
+    results, timings = _passing_scratch_run(route=_route_block())
+    assert chk.compute_verdict(results)["SCRATCH_ROUTE_WITHIN_TOLERANCE"] == "YES"
+    lines = chk.format_verdict(chk.compute_verdict(results), results)
+    for name in ("SCRATCH_VS_FUSED", "SCRATCH_VS_GATHER"):
+        assert any(
+            line.startswith(f"{name} nvfp4-B32-M1: max|d|") for line in lines
+        )
+    check = chk.compute_self_check(
+        results, timings, prefill_arm=True, prefill_route_required=True
+    )
+    assert check["verdict"] == "PASS", check["reasons"]
+    assert check["positive"]["SCRATCH_ROUTE_WITHIN_TOLERANCE"] == "PASS"
+    for bad in (_route_block(fused=5e-3), _route_block(gather=5e-3)):
+        results[0]["prefill_scratch"]["route"] = bad
+        assert chk.compute_verdict(results)["SCRATCH_ROUTE_WITHIN_TOLERANCE"] == "NO"
+        failed = chk.compute_self_check(
+            results, timings, prefill_arm=True, prefill_route_required=True
+        )
+        assert failed["positive"]["SCRATCH_ROUTE_WITHIN_TOLERANCE"] == "FAIL"
+
+
+def test_a_route_that_was_skipped_fails_a_gpu_run_but_not_a_cpu_run(chk):
+    results, timings = _passing_scratch_run(route={"skipped": "no extension"})
+    lines = chk.format_verdict(chk.compute_verdict(results), results)
+    assert "SCRATCH_ROUTE nvfp4-B32-M1: skipped (no extension)" in lines
+    cpu = chk.compute_self_check(results, timings, prefill_arm=True)
+    assert cpu["verdict"] == "PASS"
+    gpu = chk.compute_self_check(
+        results, timings, prefill_arm=True, prefill_route_required=True
+    )
+    assert gpu["verdict"] == "FAIL"
+    assert gpu["positive"]["SCRATCH_ROUTE_WITHIN_TOLERANCE"] == "SKIPPED"
+
+
+def test_the_prefill_roundtrip_line_ratios_the_routes_to_e4m3(chk):
+    timings = {
+        "M=5568": {
+            "prefill_scratch_route_nvfp4_B2784": {"median": 900.0},
+            "prefill_fused_nvfp4_B2784": {"median": 1500.0},
+            "prefill_e4m3_B1616": {"median": 1000.0},
+            "decode_nvfp4_B2784": {"median": 300.0},
+        }
+    }
+    lines = chk.decode_roundtrip_lines(timings)
+    assert lines == [
+        "PREFILL_ROUNDTRIP_US M=5568: e4m3 1000.0 scratch route 900.0 fused 1500.0 "
+        "ratio to e4m3 (scratch route, fused) 0.90, 1.50"
+    ]
+
+
+def test_the_prefill_selection_is_causal_grouped_and_ends_in_the_tail(chk):
+    layout = chk.plan_layout(32, 9, 16, 100)
+    table = chk.make_block_table(layout, 0)
+    selection = chk.build_prefill_selection(layout, table, 9, 16, 3)
+    seq_len = layout.tokens_per_request
+    assert selection.positions.tolist() == list(range(seq_len - 9, seq_len))
+    assert selection.seq_lens.tolist() == [seq_len]
+    assert selection.table.shape == (1, layout.pages)
+    assert not selection.token_to_req.any()
+    for row, position in enumerate(selection.positions.tolist()):
+        entries = selection.indices[row].tolist()
+        live = [e for e in entries if e >= 0]
+        assert all(e <= position for e in live), "an entry past the row's position"
+        visible = position + 1
+        full, tail = visible // 4, visible % 4
+        groups = (len(live) - tail) // 4
+        assert groups == min(full, (16 - 3) // 4)
+        for g in range(groups):
+            first = entries[4 * g]
+            assert first % 4 == 0 and entries[4 * g : 4 * g + 4] == list(
+                range(first, first + 4)
+            )
+        assert entries[: 4 * groups] == sorted(entries[: 4 * groups])
+        if tail:
+            # The slot after the groups holds the partial group, from its first token.
+            want = [full * 4 + t for t in range(tail)]
+            assert entries[4 * groups : 4 * groups + tail] == want
+        assert all(e == -1 for e in entries[4 * groups + tail :])
+
+
+def test_a_chunk_longer_than_the_context_is_refused(chk):
+    layout = chk.plan_layout(32, 9, 16, 100)
+    with pytest.raises(ValueError, match="--context"):
+        chk.build_prefill_selection(
+            layout,
+            chk.make_block_table(layout, 0),
+            layout.tokens_per_request + 1,
+            16,
+            0,
+        )
+
+
+@pytest.mark.skipif(not INTERPRETER, reason="needs TRITON_INTERPRET=1")
+def test_one_small_case_runs_the_scratch_arm_end_to_end_on_cpu(chk, monkeypatch):
+    from vllm.v1.attention.backends import fa_utils
+
+    fa_utils.get_flash_attn_version = lambda *args, **kwargs: 2
+    monkeypatch.setattr(chk, "WORKER_DEVICE", "cpu")
+    args = Namespace(
+        seed=0,
+        context=100,
+        k_scale=chk.DEFAULT_K_SCALE,
+        v_scale=chk.DEFAULT_V_SCALE,
+        no_timing=False,
+        rounds=2,
+        iters=1,
+        warmup=1,
+        arms=["gather", "fused", "prefill_scratch"],
+    )
+    geometry = chk.Geometry(head_dim=256, q_heads=6, kv_heads=1, topk=16, source="test")
+    cases = chk.plan_cases([32], 32, [9])
+    with torch.inference_mode():
+        results, timings = chk.run_all(
+            cases, geometry, chk.load_kernels(), args, lambda m: None
+        )
+    assert not any(r.get("error") for r in results), results
+    nvfp4 = next(r for r in results if r["kind"] == "nvfp4")
+    scratch = nvfp4["prefill_scratch"]
+    assert scratch["decode"]["different"] == 0 and scratch["decode"]["tail_zero_ok"]
+    assert all(c["decode"]["different"] > 0 for c in scratch["controls"].values())
+    assert "skipped" in scratch["route"]  # the grouped CUDA route needs a GPU
+    assert "prefill_scratch_decode_nvfp4_B32" in timings["M=9"]
+    assert "prefill_fused_nvfp4_B32" in timings["M=9"]
+    assert not any("prefill_scratch_route" in name for name in timings["M=9"])
+    verdict = chk.compute_verdict(results)
+    assert verdict["SCRATCH_MATCHES_GATHER"] == "YES"
+    check = chk.compute_self_check(results, timings, fused_arm=True, prefill_arm=True)
+    assert check["verdict"] == "PASS", chk.format_self_check(check, results)
+
+
+def test_a_chunk_too_short_for_the_cuda_route_is_not_held_against_the_route(chk):
+    # --rows 1 5 512: the 1- and 5-row cases only prove the decode; the route is asked
+    # of the 512-row case alone.
+    results, timings = _passing_run()
+    short = results[0]
+    short["prefill_scratch"] = _scratch_block(
+        route={"skipped": "1 rows (the route starts at 64)", "not_applicable": True}
+    )
+    long = _passing_nvfp4(rows=512, label="nvfp4-B32-M512")
+    long["prefill_scratch"] = _scratch_block(route=_route_block())
+    results.append(long)
+    timings["M=512"] = {"prefill_scratch_route_nvfp4_B32": {"median": 9.0}}
+    check = chk.compute_self_check(
+        results, timings, prefill_arm=True, prefill_route_required=True
+    )
+    assert check["verdict"] == "PASS", check["reasons"]
+    assert check["positive"]["SCRATCH_ROUTE_WITHIN_TOLERANCE"] == "PASS"
+    # Only short cases: the route was never established, which a GPU run must say.
+    only_short = chk.compute_self_check(
+        results[:2],
+        {"M=1": timings["M=1"]},
+        prefill_arm=True,
+        prefill_route_required=True,
+    )
+    assert only_short["positive"]["SCRATCH_ROUTE_WITHIN_TOLERANCE"] == "SKIPPED"
+    assert only_short["verdict"] == "FAIL"
