@@ -1387,3 +1387,476 @@ def test_an_exported_serving_environment_does_not_move_the_decode_controls(
     assert any(line.startswith("ROUTE_KNOBS ambient") for line in logs), logs
     assert os.environ["VLLM_SM70_QSA_NVFP4_FUSED_READER"] == "1"
     assert os.environ["VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH"] == "1"
+
+
+# ------------------------------------------------- host memory (W1b, 2026-10-05)
+# W1b ran ``--rows 5 64 5568`` in a 48G fence and was OOM-killed building the 5568-row
+# case: the CPU reference of the gather (``gather_dequant_nvfp4_kv``) costs ~18.6 bytes
+# per output element, ~19 KiB per row at topk 2051 x head_dim 256 for K alone, so
+# 5568 rows needed ~51 GiB. The references now run on ``--ref-rows`` rows, a chunk at a
+# time; the kernels and the timings still run on every row.
+GIB = float(1 << 30)
+
+
+def _geometry(chk, topk=2051):
+    return chk.Geometry(head_dim=256, q_heads=6, kv_heads=1, topk=topk, source="test")
+
+
+def _fa_patch():
+    from vllm.v1.attention.backends import fa_utils
+
+    fa_utils.get_flash_attn_version = lambda *args, **kwargs: 2
+
+
+def _case_run(chk, monkeypatch, rows, *, topk=2051, block=2784, context=8192, **kwargs):
+    """A CaseRun and the reference cache bytes of its K/V, built on the CPU."""
+    monkeypatch.setattr(chk, "WORKER_DEVICE", "cpu")
+    _fa_patch()
+    kernels = chk.load_kernels()
+    run = chk.CaseRun(
+        chk.Case("nvfp4", block, rows),
+        _geometry(chk, topk),
+        kernels,
+        seed=0,
+        context=context,
+        k_scale=chk.DEFAULT_K_SCALE,
+        v_scale=chk.DEFAULT_V_SCALE,
+        **kwargs,
+    )
+    nv = kernels["nv"]
+    shape = (
+        run.layout.num_blocks,
+        2,
+        run.layout.block_size,
+        1,
+        nv.nvfp4_kv_row_bytes(256),
+    )
+    reference = torch.zeros(shape, dtype=torch.uint8)
+    nv.reshape_and_cache_nvfp4_reference(
+        run.key,
+        run.value,
+        reference,
+        run.slots,
+        k_scale=run.k_scale,
+        v_scale=run.v_scale,
+    )
+    return run, nv, reference
+
+
+def _legacy_gather_check(nv, reference, sel, dev_k, dev_v, ks, vs):
+    """The gather comparison of the kernel check at 017cbeb88, verbatim: the reference
+    over the whole batch, then K, V and their FP32 copies, all in host RAM."""
+    ref_keys, ref_values = nv.gather_dequant_nvfp4_kv(
+        reference, sel.table, sel.token_to_req, sel.indices, k_scale=ks, v_scale=vs
+    )
+    keys, values = dev_k.clone(), dev_v.clone()  # ``.cpu()`` of the device output
+    different = int((keys != ref_keys).sum() + (values != ref_values).sum())
+    elements = keys.numel() + values.numel()
+    max_abs = float(
+        max(
+            (keys.float() - ref_keys.float()).abs().max(),
+            (values.float() - ref_values.float()).abs().max(),
+        )
+    )
+    illegal = sel.illegal[..., None, None].expand_as(keys)
+    zeros_ok = bool((keys[illegal] == 0).all() and (values[illegal] == 0).all())
+    return {"different": different, "elements": elements, "max_abs": max_abs}, zeros_ok
+
+
+def _peak_delta(fn):
+    """Peak host RSS above the RSS at the start of ``fn``, or None without /proc."""
+    import gc
+
+    gc.collect()
+    try:
+        with open("/proc/self/clear_refs", "w") as handle:
+            handle.write("5")  # reset VmHWM to the current RSS
+    except OSError:
+        return None
+    start = _rss("VmRSS")
+    fn()
+    return _rss("VmHWM") - start
+
+
+def _rss(field):
+    with open("/proc/self/status") as status:
+        for line in status:
+            if line.startswith(field + ":"):
+                return int(line.split()[1]) * 1024
+    raise AssertionError(field)
+
+
+def test_the_new_options_parse_with_safe_defaults(chk):
+    args = chk.parse_args([])
+    assert args.ref_rows == chk.DEFAULT_REF_ROWS == 256
+    assert args.ref_chunk == chk.REF_CHUNK_ROWS == 64
+    assert args.max_host_gb == chk.DEFAULT_MAX_HOST_GB == 24.0
+    args = chk.parse_args(["--ref-rows", "0", "--max-host-gb", "0", "--ref-chunk", "8"])
+    assert (args.ref_rows, args.max_host_gb, args.ref_chunk) == (0, 0.0, 8)
+    for bad in (["--ref-rows", "-1"], ["--max-host-gb", "-1"], ["--ref-chunk", "0"]):
+        with pytest.raises(SystemExit):
+            chk.parse_args(bad)
+
+
+def test_reference_rows_are_every_row_up_to_the_limit_then_a_fixed_subset(chk):
+    assert chk.reference_rows(5, 256) == [0, 1, 2, 3, 4]
+    assert chk.reference_rows(256, 256) == list(range(256))
+    assert chk.reference_rows(5568, 0) == list(range(5568))  # 0: no limit
+    for rows, limit in ((257, 256), (1024, 256), (5568, 256), (5568, 64), (100, 10)):
+        chosen = chk.reference_rows(rows, limit)
+        assert chosen == sorted(set(chosen)) and len(chosen) <= limit
+        # the rows the builder treats specially, and both ends of both requests
+        assert {0, 1, rows - 2, rows - 1} <= set(chosen)
+        assert chosen == chk.reference_rows(rows, limit)  # deterministic
+        # spread over the whole batch, not a prefix
+        assert max(b - a for a, b in zip(chosen, chosen[1:], strict=False)) <= 2 * (
+            rows // max(1, limit - 4)
+        ) + 2
+    assert len(chk.reference_rows(5568, 256)) >= 250
+
+
+@pytest.mark.parametrize("inject", [False, True])
+@pytest.mark.parametrize("rows,block,context", [(1, 4, 40), (3, 4, 40), (7, 8, 90)])
+def test_the_vectorized_illegal_mask_equals_the_per_entry_loop(
+    chk, rows, block, context, inject
+):
+    layout = chk.plan_layout(block, rows, 16, context)
+    table = chk.make_block_table(layout, 0)
+    sel = chk.build_selection(layout, table, rows, 16, 5, inject_illegal=inject)
+    # the loop 017cbeb88 used, as the oracle
+    expected = torch.zeros(sel.indices.shape, dtype=torch.bool)
+    for row in range(rows):
+        request = int(sel.token_to_req[row])
+        for col in range(16):
+            token = int(sel.indices[row, col])
+            bad = request < 0 or request >= layout.requests or token < 0
+            if not bad:
+                page = token // layout.block_size
+                bad = page >= layout.pages
+                if not bad:
+                    block_id = int(sel.table[request, page])
+                    bad = block_id < 0 or block_id >= layout.num_blocks
+            expected[row, col] = bad
+    assert torch.equal(sel.illegal, expected)
+    assert bool(sel.illegal.any()) == inject
+
+
+def test_the_per_row_byte_model_explains_the_w1b_oom(chk):
+    g = _geometry(chk)
+    n = 5568 * g.topk
+    legacy_reference = chk.ref_gather_peak_bytes(n, 1, 256)
+    # one 5568-row reference gather alone, ~51 GiB: past the fence's 48 GiB
+    assert 48 * GIB < legacy_reference < 54 * GIB
+    # and the K side alone holds 11.4M entries x 256 x 2 B = 5.4 GiB of FP16
+    assert abs(n * 256 * 2 / GIB - 5.45) < 0.05
+    new = chk.host_mem_model("nvfp4", 5568, g, 2784, 8192, prefill=True)
+    assert new["peak"] < 2.5 * GIB  # the whole case, not 51 GiB
+    # linear in rows without the cap, flat with it
+    for rows in (1024, 5568):
+        capped = chk.host_mem_model("nvfp4", rows, g, 2784, 8192)["peak"]
+        assert capped < 2.5 * GIB
+    uncapped = [
+        chk.host_mem_model("nvfp4", rows, g, 2784, 8192, ref_rows=0)["peak"]
+        for rows in (1024, 2048)
+    ]
+    assert 1.7 < uncapped[1] / uncapped[0] < 2.1
+    # the E4M3 control never builds a gather reference
+    assert chk.host_mem_model("e4m3", 5568, g, 1616, 8192)["peak"] < 1.5 * GIB
+
+
+@pytest.mark.skipif(not INTERPRETER, reason="needs TRITON_INTERPRET=1")
+@pytest.mark.parametrize("rows", [64, 256])
+def test_the_model_matches_the_measured_peak_rss(chk, monkeypatch, rows):
+    """Measured (VmHWM) against the model within 30 %, for the code that died at 5568
+    (the whole-batch reference and its comparison) and for the code that replaces it."""
+    run, nv, reference = _case_run(chk, monkeypatch, rows, prefill_scratch=True)
+    g, sel = run.geometry, run.dirty
+    ks, vs = run.k_scale, run.v_scale
+    entries = rows * g.topk
+    elements = entries * 256
+    # What the GPU holds in the real run: zero host bytes (a stride-0 view here), and
+    # for the old code the ``.cpu()`` copies it made.
+    dev = torch.zeros((1, g.topk, 1, 256), dtype=torch.float16).expand(rows, -1, -1, -1)
+    legacy_dev = torch.zeros((rows, g.topk, 1, 256), dtype=torch.float16)
+
+    legacy = _peak_delta(
+        lambda: _legacy_gather_check(nv, reference, sel, legacy_dev, legacy_dev, ks, vs)
+    )
+    new = _peak_delta(
+        lambda: (
+            run._gather_diff(dev, dev, *run._ref_gather(nv, reference, sel)),
+            run._zero_fill_ok(dev, dev, sel.illegal),
+        )
+    )
+    if legacy is None or new is None:
+        pytest.skip("no /proc/self/clear_refs")
+    legacy_model = max(
+        chk.ref_gather_peak_bytes(entries, 1, 256),
+        20 * elements,  # keys, values, ref x2 in FP16, plus three FP32 temporaries
+    )
+    parts = chk.host_mem_model("nvfp4", rows, g, 2784, 8192, prefill=True)
+    assert 0.7 < legacy_model / legacy < 1.3, (legacy_model / GIB, legacy / GIB)
+    assert 0.7 < parts["reference_phase"] / new < 1.3, (
+        parts["reference_phase"] / GIB,
+        new / GIB,
+    )
+    # the point of the change: at 256 rows the old path is already ~2.5x the new one
+    if rows == 256:
+        assert legacy > 2 * new
+
+
+@pytest.mark.skipif(not INTERPRETER, reason="needs TRITON_INTERPRET=1")
+def test_the_chunked_reference_equals_the_whole_batch_reference_bitwise(chk, monkeypatch):
+    # M <= 64 at the production geometry: every row, several chunks
+    run, nv, reference = _case_run(chk, monkeypatch, 64, ref_chunk=24)
+    sel = run.dirty
+    assert run.checked == list(range(64))
+    got_k, got_v = run._ref_gather(nv, reference, sel)
+    want_k, want_v = nv.gather_dequant_nvfp4_kv(
+        reference,
+        sel.table,
+        sel.token_to_req,
+        sel.indices,
+        k_scale=run.k_scale,
+        v_scale=run.v_scale,
+    )
+    assert torch.equal(got_k.view(torch.int16), want_k.view(torch.int16))
+    assert torch.equal(got_v.view(torch.int16), want_v.view(torch.int16))
+    # the comparison reports what the old formulas report, on a perturbed output
+    dev_k, dev_v = want_k.clone(), want_v.clone()
+    dev_k[3, 5, 0, 7] += 1.0
+    dev_v[63, 2000, 0, 255] += 0.5  # the last row, the last chunk
+    dev_k[0, 0, 0, 0] = 9.0  # row 0 entry 0 is illegal: must also trip zero-fill
+    old, old_zero = _legacy_gather_check(
+        nv, reference, sel, dev_k, dev_v, run.k_scale, run.v_scale
+    )
+    assert old["different"] == 3 and not old_zero
+    assert run._gather_diff(dev_k, dev_v, got_k, got_v) == old
+    assert run._zero_fill_ok(dev_k, dev_v, sel.illegal) == old_zero
+    assert run._zero_fill_ok(want_k, want_v, sel.illegal)
+    # a nonzero illegal entry in the last chunk is seen too (row 63 is the empty row)
+    bad = want_k.clone()
+    bad[63, int(sel.illegal[63].nonzero()[0]), 0, 0] = 1.0
+    assert not run._zero_fill_ok(bad, want_v, sel.illegal)
+
+
+@pytest.mark.skipif(not INTERPRETER, reason="needs TRITON_INTERPRET=1")
+def test_a_subset_reference_equals_the_whole_batch_reference_on_those_rows(
+    chk, monkeypatch
+):
+    rows, limit = 130, 20
+    run, nv, reference = _case_run(chk, monkeypatch, rows, topk=512, ref_rows=limit, ref_chunk=7)
+    sel = run.dirty
+    assert run.checked == chk.reference_rows(rows, limit) and len(run.checked) <= limit
+    got_k, got_v = run._ref_gather(nv, reference, sel)
+    want_k, want_v = nv.gather_dequant_nvfp4_kv(
+        reference,
+        sel.table,
+        sel.token_to_req,
+        sel.indices,
+        k_scale=run.k_scale,
+        v_scale=run.v_scale,
+    )
+    pick = torch.tensor(run.checked)
+    assert got_k.shape[0] == len(run.checked)
+    assert torch.equal(got_k.view(torch.int16), want_k[pick].view(torch.int16))
+    assert torch.equal(got_v.view(torch.int16), want_v[pick].view(torch.int16))
+    # a difference in a checked row is counted, one in an unchecked row is not (that is
+    # the cost of the subset; the report says how many rows were checked)
+    unchecked = next(r for r in range(rows) if r not in run.checked)
+    dev_k = want_k.clone()
+    dev_k[run.checked[5], 100, 0, 3] += 1.0
+    dev_k[unchecked, 100, 0, 3] += 1.0
+    result = run._gather_diff(dev_k, want_v, got_k, got_v)
+    assert result["different"] == 1
+    assert result["elements"] == 2 * len(run.checked) * 512 * 256
+    # but the zero-fill check sees every row
+    illegal = sel.illegal.nonzero()
+    row, col = int(illegal[-1][0]), int(illegal[-1][1])  # the empty last row
+    poisoned = want_k.clone()
+    poisoned[row, col, 0, 0] = 1.0
+    assert not run._zero_fill_ok(poisoned, want_v, sel.illegal)
+
+
+def test_a_case_over_the_host_limit_is_skipped_not_run(chk, monkeypatch):
+    monkeypatch.setattr(chk, "WORKER_DEVICE", "cpu")
+    args = Namespace(
+        seed=0,
+        context=8192,
+        k_scale=chk.DEFAULT_K_SCALE,
+        v_scale=chk.DEFAULT_V_SCALE,
+        no_timing=False,
+        rounds=1,
+        iters=1,
+        warmup=0,
+        arms=["gather", "fused", "prefill_scratch"],
+        ref_rows=chk.DEFAULT_REF_ROWS,
+        max_host_gb=0.001,  # nothing fits
+    )
+    cases = chk.plan_cases([2784], 1616, [5, 5568])
+    logs: list[str] = []
+    # no kernels needed: a skipped case never builds a CaseRun
+    results, timings = chk.run_all(cases, _geometry(chk), {}, args, logs.append)
+    assert [r["case"] for r in results] == [c.label for c in cases]
+    assert all(r.get("skipped") and not r.get("error") for r in results)
+    assert timings == {}
+    estimates = [line for line in logs if line.startswith("HOST_MEM_EST: rows=")]
+    assert len(estimates) == len(cases)
+    assert estimates[0].startswith("HOST_MEM_EST: rows=5 est_peak_GB=")
+    assert any(line.startswith("HOST_MEM_EST: rows=5568 est_peak_GB=") for line in logs)
+    assert sum(line.startswith("SKIPPED ") for line in logs) == len(cases)
+    est = results[0]["host_mem_est"]
+    assert est["rows"] == 5 and est["est_peak_gib"] > 0 and est["max_host_gb"] == 0.001
+    assert est["model_gib"]["peak"] > 0
+    verdict = chk.compute_verdict(results)
+    assert verdict["skipped"].keys() == {r["case"] for r in results}
+    assert verdict["GATHER_MATCHES_REFERENCE"] == "UNKNOWN"
+    lines = chk.format_verdict(verdict, results)
+    assert any(line.startswith("CASE_SKIPPED nvfp4-B2784-M5568:") for line in lines)
+    check = chk.compute_self_check(results, timings)
+    assert check["verdict"] == "FAIL"
+    assert any("skipped by the host-memory guard" in r for r in check["reasons"])
+    json.dumps(results)  # the estimate goes into the JSON report
+
+
+def test_the_default_limit_lets_the_5568_row_case_through(chk, monkeypatch):
+    """With the defaults the 5568-row case is estimated well under the 24 GiB limit
+    (the estimate adds this process's own RSS to the model)."""
+    monkeypatch.setattr(chk, "WORKER_DEVICE", "cpu")
+    args = Namespace(
+        seed=0,
+        context=8192,
+        k_scale=chk.DEFAULT_K_SCALE,
+        v_scale=chk.DEFAULT_V_SCALE,
+        no_timing=True,
+        rounds=1,
+        iters=1,
+        warmup=0,
+        arms=["gather", "fused", "prefill_scratch"],
+    )
+    cases = chk.plan_cases([2784, 2864], 1616, [5568])
+    logs: list[str] = []
+    # kernels={} makes the CaseRun raise (reported per case) after the guard passed
+    results, _ = chk.run_all(cases, _geometry(chk), {}, args, logs.append)
+    assert not any(line.startswith("SKIPPED ") for line in logs), logs
+    for r in results:
+        assert r["host_mem_est"]["est_peak_gib"] < chk.DEFAULT_MAX_HOST_GB
+        assert r["ref_rows"]["total"] == 5568 and 250 <= r["ref_rows"]["checked"] <= 256
+
+
+@pytest.mark.skipif(not INTERPRETER, reason="needs TRITON_INTERPRET=1")
+def test_a_batch_over_the_reference_limit_runs_end_to_end_and_says_how_many_rows(
+    chk, monkeypatch
+):
+    _fa_patch()
+    monkeypatch.setattr(chk, "WORKER_DEVICE", "cpu")
+    args = Namespace(
+        seed=0,
+        context=100,
+        k_scale=chk.DEFAULT_K_SCALE,
+        v_scale=chk.DEFAULT_V_SCALE,
+        no_timing=True,
+        rounds=1,
+        iters=1,
+        warmup=0,
+        arms=["gather"],
+        ref_rows=5,
+        ref_chunk=2,
+    )
+    geometry = _geometry(chk, topk=16)
+    cases = chk.plan_cases([32], 32, [9])
+    logs: list[str] = []
+    with torch.inference_mode():
+        results, _ = chk.run_all(cases, geometry, chk.load_kernels(), args, logs.append)
+    assert not any(r.get("error") for r in results), results
+    nvfp4 = next(r for r in results if r["kind"] == "nvfp4")
+    checked = chk.reference_rows(9, 5)
+    assert nvfp4["ref_rows"] == {"checked": len(checked), "total": 9}
+    assert len(checked) < 9
+    assert nvfp4["gather"]["elements"] == 2 * len(checked) * 16 * 256
+    assert nvfp4["gather"]["different"] == 0
+    assert nvfp4["zero_fill"]["ok"]
+    verdict = chk.compute_verdict(results)
+    assert verdict["GATHER_MATCHES_REFERENCE"] == "YES"
+    assert verdict["ZERO_FILL_OK"] == "YES"
+    assert verdict["REFERENCE_ROWS"]["nvfp4-B32-M9"] == f"{len(checked)}/9"
+    lines = chk.format_verdict(verdict, results)
+    assert any(
+        line.startswith(f"REFERENCE_ROWS nvfp4-B32-M9: CPU reference and model on "
+                        f"{len(checked)} of 9 rows (a deterministic subset)")
+        for line in lines
+    )
+    for r in results:  # the model check measures on the same rows it models
+        assert chk.error_in_band(
+            r["model_check"]["measured_rel_l2"], r["model_check"]["model_rel_l2"]
+        )
+    assert "measured_vmhwm_gib" in nvfp4["host_mem_est"]
+
+
+# ------------------------------------ the 5- and 64-row controls did not move
+GOLDEN = Path(__file__).parent / "data" / "kernel_check_017cbeb88_golden.json"
+NEW_KEYS = {"ref_rows", "host_mem_est"}
+
+
+def _same(path, got, want):
+    if isinstance(want, dict):
+        assert isinstance(got, dict), path
+        assert set(got) - NEW_KEYS == set(want), (path, set(got) ^ set(want))
+        for key, value in want.items():
+            _same(f"{path}.{key}", got[key], value)
+    elif isinstance(want, list):
+        assert isinstance(got, list) and len(got) == len(want), path
+        for i, (g, w) in enumerate(zip(got, want, strict=True)):
+            _same(f"{path}[{i}]", g, w)
+    elif isinstance(want, float):
+        assert got == pytest.approx(want, rel=1e-6, abs=1e-12) or (
+            want != want and got != got
+        ), (path, got, want)
+    else:
+        assert got == want, (path, got, want)
+
+
+def _run_against_golden(chk, monkeypatch, rows):
+    _fa_patch()
+    monkeypatch.setattr(chk, "WORKER_DEVICE", "cpu")
+    golden = json.loads(GOLDEN.read_text())
+    args = Namespace(
+        seed=0,
+        context=100,
+        k_scale=chk.DEFAULT_K_SCALE,
+        v_scale=chk.DEFAULT_V_SCALE,
+        no_timing=True,
+        rounds=1,
+        iters=1,
+        warmup=0,
+        arms=["gather", "fused"],
+    )
+    cases = chk.plan_cases([32], 32, [rows])
+    with torch.inference_mode():
+        results, _ = chk.run_all(
+            cases, _geometry(chk, topk=16), chk.load_kernels(), args, lambda m: None
+        )
+    want = [r for r in golden["results"] if r["rows"] == rows]
+    assert [r["case"] for r in results] == [r["case"] for r in want]
+    _same("results", results, want)
+    verdict = chk.compute_verdict(results)
+    for key in ("STORE_MATCHES_REFERENCE", "GATHER_MATCHES_REFERENCE", "ZERO_FILL_OK"):
+        assert verdict[key] == golden["verdict"][key] == "YES"
+    assert verdict["FUSED_MATCHES_GATHER"] == golden["verdict"]["FUSED_MATCHES_GATHER"]
+
+
+@pytest.mark.skipif(not INTERPRETER, reason="needs TRITON_INTERPRET=1")
+def test_the_5_row_controls_equal_those_of_commit_017cbeb88(chk, monkeypatch):
+    """Store, gather, zero-fill, decode path, the mutated-cache controls, the tie
+    control, the quantization error and the model check of an M = 5 case: the numbers
+    the kernel check printed before the reference was chunked (golden captured with
+    the script of that commit)."""
+    _run_against_golden(chk, monkeypatch, 5)
+
+
+@pytest.mark.skipif(
+    not INTERPRETER or os.environ.get("KERNEL_CHECK_GOLDEN_M64") != "1",
+    reason="~3 min in the interpreter: set TRITON_INTERPRET=1 KERNEL_CHECK_GOLDEN_M64=1",
+)
+def test_the_64_row_controls_equal_those_of_commit_017cbeb88(chk, monkeypatch):
+    _run_against_golden(chk, monkeypatch, 64)

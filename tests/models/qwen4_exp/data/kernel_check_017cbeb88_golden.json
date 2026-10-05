@@ -1,0 +1,430 @@
+{
+ "captured_at": "017cbeb88 (the kernel check before the chunked reference)",
+ "how": "TRITON_INTERPRET=1 CUDA_VISIBLE_DEVICES= PYTHONPATH=<worktree> python run_all(plan_cases([32], 32, [5, 64]), Geometry(head_dim=256,q_heads=6,kv_heads=1,topk=16), Namespace(seed=0, context=100, no_timing=True, arms=['gather','fused'])), WORKER_DEVICE=cpu",
+ "results": [
+  {
+   "case": "nvfp4-B32-M5",
+   "controls": {
+    "nibble_order_swapped": {
+     "decode": {
+      "max_abs": 29.15234375,
+      "mean_abs": 2.363330269426418,
+      "reference_norm": 190.38186070960452,
+      "rel_l2": 1.7476975120911158
+     },
+     "gather": {
+      "different": 19180
+     },
+     "store": {
+      "data": {
+       "bytes": 81920,
+       "different": 46578,
+       "first_index": [
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "scale": {
+       "bytes": 10240,
+       "different": 0,
+       "first_index": null
+      }
+     }
+    },
+    "scale_placement_wrong": {
+     "decode": {
+      "max_abs": 20.609375,
+      "mean_abs": 1.4395727482779572,
+      "reference_norm": 190.38186070960452,
+      "rel_l2": 1.13695031605943
+     },
+     "gather": {
+      "different": 17087
+     },
+     "store": {
+      "data": {
+       "bytes": 81920,
+       "different": 0,
+       "first_index": null
+      },
+      "scale": {
+       "bytes": 10240,
+       "different": 5796,
+       "first_index": [
+        0,
+        0,
+        0,
+        1
+       ]
+      }
+     }
+    }
+   },
+   "decode_path": {
+    "max_abs": 0.0,
+    "mean_abs": 0.0,
+    "reference_norm": 190.38186070960452,
+    "rel_l2": 0.0
+   },
+   "decode_quality": {
+    "max_abs": 4.15625,
+    "mean_abs": 0.1602977421833202,
+    "reference_norm": 196.664727406753,
+    "rel_l2": 0.11501507165632345
+   },
+   "fused": {
+    "controls": {
+     "nibble_order_swapped": {
+      "decode": {
+       "max_abs": 29.15234375,
+       "mean_abs": 2.3633303965829935,
+       "reference_norm": 190.38186070960452,
+       "rel_l2": 1.7476975567971358
+      }
+     },
+     "scale_placement_wrong": {
+      "decode": {
+       "max_abs": 20.609375,
+       "mean_abs": 1.4395735112174104,
+       "reference_norm": 190.38186070960452,
+       "rel_l2": 1.1369512836105646
+      }
+     }
+    },
+    "quality": {
+     "max_abs": 4.15625,
+     "mean_abs": 0.1602977459086105,
+     "reference_norm": 196.664727406753,
+     "rel_l2": 0.11501507277402162
+    },
+    "vs_gather": {
+     "max_abs": 3.0517578125e-05,
+     "mean_abs": 4.221995671590169e-09,
+     "reference_norm": 195.40096975866544,
+     "rel_l2": 1.564839965394722e-07
+    },
+    "vs_gather_illegal": {
+     "max_abs": 0.0009765625,
+     "mean_abs": 4.927317301432292e-07,
+     "reference_norm": 190.38186070960452,
+     "rel_l2": 9.357811463083621e-06
+    },
+    "zero_fill_ok": true
+   },
+   "gather": {
+    "different": 0,
+    "elements": 40960,
+    "max_abs": 0.0
+   },
+   "kind": "nvfp4",
+   "model_check": {
+    "measured_rel_l2": 0.11501507165632345,
+    "model_rel_l2": 0.11500754588275082
+   },
+   "rows": 5,
+   "store": {
+    "data": {
+     "bytes": 81920,
+     "different": 0,
+     "first_index": null
+    },
+    "scale": {
+     "bytes": 10240,
+     "different": 0,
+     "first_index": null
+    }
+   },
+   "tie_control": {
+    "correct": {
+     "data": {
+      "bytes": 8192,
+      "different": 0,
+      "first_index": null
+     },
+     "scale": {
+      "bytes": 1024,
+      "different": 0,
+      "first_index": null
+     }
+    },
+    "e2m1_mutant": {
+     "data": {
+      "bytes": 8192,
+      "different": 4096,
+      "first_index": [
+       0,
+       0,
+       0,
+       0
+      ]
+     },
+     "scale": {
+      "bytes": 1024,
+      "different": 0,
+      "first_index": null
+     }
+    },
+    "e4m3_mutant": {
+     "data": {
+      "bytes": 8192,
+      "different": 2144,
+      "first_index": [
+       0,
+       0,
+       0,
+       9
+      ]
+     },
+     "scale": {
+      "bytes": 1024,
+      "different": 512,
+      "first_index": [
+       0,
+       0,
+       0,
+       1
+      ]
+     }
+    }
+   },
+   "zero_fill": {
+    "ok": true
+   }
+  },
+  {
+   "case": "nvfp4-B32-M64",
+   "controls": {
+    "nibble_order_swapped": {
+     "decode": {
+      "max_abs": 29.15234375,
+      "mean_abs": 1.9992370300290834,
+      "reference_norm": 648.2488529026775,
+      "rel_l2": 1.516813522482495
+     },
+     "gather": {
+      "different": 320460
+     },
+     "store": {
+      "data": {
+       "bytes": 81920,
+       "different": 46578,
+       "first_index": [
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "scale": {
+       "bytes": 10240,
+       "different": 0,
+       "first_index": null
+      }
+     }
+    },
+    "scale_placement_wrong": {
+     "decode": {
+      "max_abs": 34.115234375,
+      "mean_abs": 1.6903255252333718,
+      "reference_norm": 648.2488529026775,
+      "rel_l2": 1.3816671487997474
+     },
+     "gather": {
+      "different": 285620
+     },
+     "store": {
+      "data": {
+       "bytes": 81920,
+       "different": 0,
+       "first_index": null
+      },
+      "scale": {
+       "bytes": 10240,
+       "different": 5796,
+       "first_index": [
+        0,
+        0,
+        0,
+        1
+       ]
+      }
+     }
+    }
+   },
+   "decode_path": {
+    "max_abs": 0.0,
+    "mean_abs": 0.0,
+    "reference_norm": 648.2488529026775,
+    "rel_l2": 0.0
+   },
+   "decode_quality": {
+    "max_abs": 7.50390625,
+    "mean_abs": 0.19236436428703504,
+    "reference_norm": 708.942296300051,
+    "rel_l2": 0.15034701587925592
+   },
+   "fused": {
+    "controls": {
+     "nibble_order_swapped": {
+      "decode": {
+       "max_abs": 29.15234375,
+       "mean_abs": 1.999237029388799,
+       "reference_norm": 648.2488529026775,
+       "rel_l2": 1.5168135215895202
+      }
+     },
+     "scale_placement_wrong": {
+      "decode": {
+       "max_abs": 34.115234375,
+       "mean_abs": 1.690325545602415,
+       "reference_norm": 648.2488529026775,
+       "rel_l2": 1.3816674531547701
+      }
+     }
+    },
+    "quality": {
+     "max_abs": 7.50390625,
+     "mean_abs": 0.19236434087967305,
+     "reference_norm": 708.942296300051,
+     "rel_l2": 0.15034698819826556
+    },
+    "vs_gather": {
+     "max_abs": 0.001953125,
+     "mean_abs": 1.0604283791811515e-07,
+     "reference_norm": 710.4918609303459,
+     "rel_l2": 4.951517998215952e-06
+    },
+    "vs_gather_illegal": {
+     "max_abs": 0.0009765625,
+     "mean_abs": 6.51925802230835e-08,
+     "reference_norm": 648.2488529026775,
+     "rel_l2": 3.3480946013023937e-06
+    },
+    "zero_fill_ok": true
+   },
+   "gather": {
+    "different": 0,
+    "elements": 524288,
+    "max_abs": 0.0
+   },
+   "kind": "nvfp4",
+   "model_check": {
+    "measured_rel_l2": 0.15034701587925592,
+    "model_rel_l2": 0.15034903381029766
+   },
+   "rows": 64,
+   "store": {
+    "data": {
+     "bytes": 81920,
+     "different": 0,
+     "first_index": null
+    },
+    "scale": {
+     "bytes": 10240,
+     "different": 0,
+     "first_index": null
+    }
+   },
+   "tie_control": {
+    "correct": {
+     "data": {
+      "bytes": 8192,
+      "different": 0,
+      "first_index": null
+     },
+     "scale": {
+      "bytes": 1024,
+      "different": 0,
+      "first_index": null
+     }
+    },
+    "e2m1_mutant": {
+     "data": {
+      "bytes": 8192,
+      "different": 4096,
+      "first_index": [
+       0,
+       0,
+       0,
+       0
+      ]
+     },
+     "scale": {
+      "bytes": 1024,
+      "different": 0,
+      "first_index": null
+     }
+    },
+    "e4m3_mutant": {
+     "data": {
+      "bytes": 8192,
+      "different": 2144,
+      "first_index": [
+       0,
+       0,
+       0,
+       9
+      ]
+     },
+     "scale": {
+      "bytes": 1024,
+      "different": 512,
+      "first_index": [
+       0,
+       0,
+       0,
+       1
+      ]
+     }
+    }
+   },
+   "zero_fill": {
+    "ok": true
+   }
+  },
+  {
+   "case": "e4m3-B32-M5",
+   "decode_quality": {
+    "max_abs": 0.8046875,
+    "mean_abs": 0.047189887465598684,
+    "reference_norm": 196.664727406753,
+    "rel_l2": 0.03731927161125649
+   },
+   "kind": "e4m3",
+   "model_check": {
+    "measured_rel_l2": 0.03731927161125649,
+    "model_rel_l2": 0.03730716271061204
+   },
+   "rows": 5
+  },
+  {
+   "case": "e4m3-B32-M64",
+   "decode_quality": {
+    "max_abs": 2.31640625,
+    "mean_abs": 0.05432013095863416,
+    "reference_norm": 708.942296300051,
+    "rel_l2": 0.04702126413273973
+   },
+   "kind": "e4m3",
+   "model_check": {
+    "measured_rel_l2": 0.04702126413273973,
+    "model_rel_l2": 0.04702580009381148
+   },
+   "rows": 64
+  }
+ ],
+ "verdict": {
+  "DECODE_PATH_IDENTICAL": "YES",
+  "FUSED_MATCHES_GATHER": "YES",
+  "GATHER_MATCHES_REFERENCE": "YES",
+  "NVFP4_VS_E4M3_REL_L2": {
+   "M=5": 3.081921663809532,
+   "M=64": 3.1974260720603014
+  },
+  "STORE_MATCHES_REFERENCE": "YES",
+  "ZERO_FILL_OK": "YES",
+  "errors": {}
+ }
+}

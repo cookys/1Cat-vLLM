@@ -84,6 +84,25 @@ values at TP4 are head 256, 6 query heads, 1 KV head, top-k 2051. Block sizes ar
 the ones the allocator derives (``docs/design/c4140_qsa_nvfp4_kv.md``): 2784 and
 2864 for NVFP4 without and with MTP4, 1616 for E4M3 with MTP4 (the control).
 
+Host memory and reference rows. The GPU arms (store, gather, zero-fill, decode, fused,
+scratch route, every timing) always run on every row of the batch. The CPU side does
+not scale that way: the reference gather costs ~19 KiB of host RAM per row (an int64
+index and an FP32 lookup per nibble, ~18.6 bytes per output element), so a whole-batch
+reference at 5568 rows needed ~51 GiB (W1b of 2026-10-05, OOM-killed in a 48G fence),
+and the CPU attention model costs ~70 ms per row (~7 min per case at 5568 rows).
+``--ref-rows`` (default 256) bounds both: up to that many rows every row is checked
+(the 5- and 64-row runs are unchanged, bit for bit); above it a deterministic subset is
+(rows 0, 1, the last two, evenly spaced between) and the comparison reads those rows of
+the GPU's full-batch output, ``--ref-chunk`` (64) rows at a time. ``ZERO_FILL_OK`` still
+looks at every row. The verdict says how many rows the reference saw
+(``REFERENCE_ROWS <case>: ... on <k> of <M> rows``), and every case's JSON entry carries
+``ref_rows``. Before each case the run prints ``HOST_MEM_EST: rows=<M> est_peak_GB=<x>``
+(this process's RSS plus a per-tensor model, ``host_mem_model``, validated against
+measured peak RSS), records it in the JSON (``host_mem_est``, plus the measured
+``VmHWM`` after the case) and skips the case with ``SKIPPED`` (a ``CASE_SKIPPED`` verdict
+line, ``SELF_CHECK: FAIL``) instead of dying if the estimate exceeds ``--max-host-gb``
+(24).
+
 Route knobs. Every arm names its own route, so the run pins
 ``VLLM_SM70_QSA_NVFP4_FUSED_READER=0``, ``VLLM_SM70_QSA_NVFP4_PREFILL_SCRATCH=0`` and
 ``VLLM_SM70_QSA_NVFP4_PREFILL_MIN_ROWS=64`` for its whole duration (the fused arm passes
@@ -205,6 +224,20 @@ ARMS = ("gather", "fused", "prefill_scratch")
 PREFILL_ROUTE_MIN_ROWS = 64
 # The gather route (31 rows per launch group) is compared on this many rows only.
 PREFILL_VS_GATHER_ROWS = 64
+# Host memory. The GPU arms always run at the full row count; what is bounded is the
+# CPU side. The float64/FP16 CPU reference (``gather_dequant_nvfp4_kv``) costs about
+# 18.6 bytes per output element of host RAM (an int64 index and a float32 grid
+# lookup per nibble), i.e. ~19 KiB per row at topk 2051 x head_dim 256 for the K side
+# alone: M = 5568 rows needed ~54 GiB (W1b of 2026-10-05, OOM-killed in a 48G fence).
+# So the CPU references and the CPU attention model run on ``--ref-rows`` rows of the
+# batch (all of them when the batch is that small), ``REF_CHUNK_ROWS`` rows at a time.
+DEFAULT_REF_ROWS = 256
+REF_CHUNK_ROWS = 64
+DEFAULT_MAX_HOST_GB = 24.0
+GIB = float(1 << 30)
+# Bytes of the CPU reference gather per output element ``E = rows * topk * heads * d``,
+# per ``nvfp4_kv.gather_dequant_nvfp4_kv`` (see ``ref_gather_peak_bytes``).
+REF_GATHER_BYTES_PER_ELEMENT = 18.5625
 RESULT_KEYS = ("store", "gather", "zero_fill", "decode_path", "decode_quality")
 # The measured attention error must lie within this factor of the CPU model's.
 BAND_LOW, BAND_HIGH = 0.7, 1.4
@@ -481,20 +514,35 @@ def build_selection(
         if rows >= 3:
             token_to_req[rows - 1] = -1
             empty.append(rows - 1)
-    illegal = torch.zeros((rows, topk), dtype=torch.bool)
-    for row in range(rows):
-        request = int(token_to_req[row])
-        for col in range(topk):
-            token = int(indices[row, col])
-            bad = request < 0 or request >= layout.requests or token < 0
-            if not bad:
-                page = token // layout.block_size
-                bad = page >= layout.pages
-                if not bad:
-                    block = int(table[request, page])
-                    bad = block < 0 or block >= layout.num_blocks
-            illegal[row, col] = bad
+    illegal = expected_illegal(layout, table, token_to_req, indices)
     return Selection(indices, table, token_to_req, illegal, tuple(empty))
+
+
+def expected_illegal(
+    layout: Layout,
+    table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    indices: torch.Tensor,
+) -> torch.Tensor:
+    """bool ``[rows, topk]``: the entries the kernel must treat as illegal.
+
+    The rule by its definition, written out independently of ``nvfp4_entry_validity``:
+    the request is out of range, or the token is negative, or its logical page is past
+    the block table, or the mapped physical block is out of ``[0, num_blocks)``. It
+    runs on whole tensors (the per-entry Python loop it replaces cost ~22 us per entry,
+    i.e. four minutes for one 5568 x 2051 selection); the tests keep the loop as the
+    oracle.
+    """
+    request = token_to_req.long()[:, None]
+    token = indices.long()
+    bad = (request < 0) | (request >= layout.requests) | (token < 0)
+    page = token.div(layout.block_size, rounding_mode="floor")
+    bad |= page >= layout.pages
+    block = table.long()[
+        request.clamp(0, layout.requests - 1), page.clamp(0, layout.pages - 1)
+    ]
+    bad |= (block < 0) | (block >= layout.num_blocks)
+    return bad
 
 
 @dataclass(frozen=True)
@@ -543,6 +591,135 @@ def build_prefill_selection(
         positions,
         torch.tensor([seq_len], dtype=torch.int32),
     )
+
+
+# ------------------------------------------------------------- reference rows
+
+
+def reference_rows(rows: int, limit: int) -> list[int]:
+    """Which rows of a batch get the CPU reference: all of them up to ``limit``.
+
+    Above ``limit`` (``limit <= 0`` means no limit) a deterministic subset of at most
+    ``limit`` rows: the rows the selection builder treats specially (0 and 1 carry the
+    illegal injections of both requests, ``rows - 2`` and ``rows - 1`` are the last
+    row of each request, the very last being the empty one) and evenly spaced rows
+    over the whole batch, so a kernel that fails only in the far rows (an offset
+    that overflows 32 bits at 5568 x 2051 x 256 elements) is still seen. At most
+    ``max(limit, 4)`` rows.
+    """
+    if limit <= 0 or rows <= limit:
+        return list(range(rows))
+    special = sorted({r for r in (0, 1, rows - 2, rows - 1) if 0 <= r < rows})
+    spaced = max(1, limit - len(special))
+    even = {(i * (rows - 1)) // max(1, spaced - 1) for i in range(spaced)}
+    return sorted(set(special) | even)
+
+
+def ref_gather_peak_bytes(entries: int, heads: int, head_dim: int) -> int:
+    """Peak host bytes of one ``gather_dequant_nvfp4_kv`` over ``entries`` top-k entries.
+
+    ``E = entries * heads * head_dim`` output elements. The reference decodes K, then V
+    (``dequantize_kv_nvfp4``), and its second pass runs with the first side's FP16
+    output (``2E``) and the loop variable that still holds the first side's
+    dequantized tensor (``2E``) alive. In ``e2m1_decode`` the biggest live set is the
+    nibble codes (``E``), the int64 table index (``8E``) and the FP32 lookup (``4E``)
+    = 13E, and then the nibble codes, the lookup, its negation, a mask and the
+    ``where`` result = 14E; the packed bytes (``E/2``) and scale bytes (``E/16``)
+    stay. Total ``4E + 14E + E/2 + E/16 = 18.5625E``, plus the int64 index tensors of
+    the validity rule (about 48 bytes per entry).
+    """
+    elements = entries * heads * head_dim
+    return round(REF_GATHER_BYTES_PER_ELEMENT * elements + 48 * entries)
+
+
+def host_mem_model(
+    kind: str,
+    rows: int,
+    geometry: Geometry,
+    block_size: int,
+    context: int,
+    *,
+    ref_rows: int = DEFAULT_REF_ROWS,
+    ref_chunk: int = REF_CHUNK_ROWS,
+    prefill: bool = False,
+) -> dict[str, int]:
+    """Per-term host-RAM model of one case, bytes; ``peak`` is the case's peak.
+
+    ``N = rows * topk`` selected entries, ``E = N * heads * head_dim`` elements.
+    Retained for the whole case: the clean and dirty selections (int32 indices plus a
+    bool mask, ``5N`` each), the prefill selection (int32, ``4N``, with the
+    ``prefill_scratch`` arm) and the random K/V (FP16). On top of that the largest of
+    the case's phases:
+
+    * the reference gather: the reference K and V of the checked rows, kept in FP16
+      (``4 * E_s``, ``E_s`` the elements of the ``S`` checked rows), written chunk by
+      chunk, plus one chunk of ``ref_chunk`` rows through ``ref_gather_peak_bytes``;
+    * the comparison: all of the reference plus one chunk's device output copied to the
+      host (FP16 ``2 E_c``) and its FP32 operands and difference (``3 * 4 E_c``);
+    * the whole-cache dequantization of the model check (FP32), and the CPU attention
+      model over the checked rows (one row at a time, ~25 MB).
+
+    The device tensors (the Triton gather's ``[rows, topk, heads, d]`` K and V, ~5.9 GiB
+    each at 5568 rows) live on the GPU and are not host RAM.
+    """
+    g = geometry
+    n = rows * g.topk
+    layout = plan_layout(block_size, rows, g.topk, context)
+    tokens = layout.requests * layout.tokens_per_request
+    sampled = len(reference_rows(rows, ref_rows))
+    chunk = max(1, min(ref_chunk, sampled))
+    per_entry = g.kv_heads * g.head_dim
+    selections = (5 + 5 + (4 if prefill else 0)) * n
+    kv_inputs = 2 * 2 * tokens * per_entry
+    cache_elements = layout.num_blocks * layout.block_size * per_entry
+    cache_phase = round(REF_GATHER_BYTES_PER_ELEMENT * cache_elements) + (
+        2 * 4 * tokens * per_entry
+    )
+    # One row at a time: K/V gathered to FP32 and repeated per query head (~25 MB).
+    attention_model = 64 << 20
+    parts = {
+        "selections": selections,
+        "kv_inputs": kv_inputs,
+        # ``expected_illegal`` keeps five int64 tensors of the batch's shape alive.
+        "build_phase": 40 * n,
+    }
+    if kind == "nvfp4":
+        chunk_entries = chunk * g.topk
+        parts["ref_cache"] = 4 * sampled * g.topk * per_entry
+        parts["ref_chunk_phase"] = ref_gather_peak_bytes(
+            chunk_entries, g.kv_heads, g.head_dim
+        )
+        parts["compare_phase"] = (2 + 3 * 4) * chunk_entries * per_entry
+        parts["model_check_phase"] = cache_phase + attention_model
+        # The reference arrays are filled chunk by chunk, so the last chunk's gather
+        # meets the earlier chunks' output only; the comparison meets all of it.
+        written = 4 * (sampled - chunk) * g.topk * per_entry
+        parts["reference_phase"] = max(
+            written + parts["ref_chunk_phase"],
+            parts["ref_cache"] + parts["compare_phase"],
+        )
+        phase = max(
+            parts["reference_phase"],
+            parts["model_check_phase"],
+            parts["build_phase"],
+        )
+    else:
+        parts["model_check_phase"] = 4 * 4 * tokens * per_entry + attention_model
+        phase = max(parts["model_check_phase"], parts["build_phase"])
+    parts["peak"] = selections + kv_inputs + phase
+    return parts
+
+
+def process_rss_bytes(field: str = "VmRSS") -> int:
+    """This process's ``VmRSS`` / ``VmHWM`` in bytes (0 where /proc is unavailable)."""
+    try:
+        with open("/proc/self/status", encoding="ascii") as status:
+            for line in status:
+                if line.startswith(field + ":"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError):
+        pass
+    return 0
 
 
 # ------------------------------------------------------------------ statistics
@@ -765,23 +942,27 @@ def model_attention(
     values: torch.Tensor,
     selection: Selection,
     tokens_per_request: int,
+    rows: Sequence[int] | None = None,
 ) -> torch.Tensor:
     """FP32 attention, one row at a time, over each row's selected tokens.
 
     ``keys`` and ``values`` are ``[requests * tokens_per_request, heads, d]``, request
     major, the order ``slot_mapping`` stores them in. Illegal entries are not modelled
-    (use the clean selection).
+    (use the clean selection). ``rows`` limits the model to those rows (the result is
+    ``[len(rows), q_heads, d]`` in that order); the default is every row. The model costs
+    ~70 ms per row on the CPU, so a 5568-row batch must not run it whole.
     """
-    rows, q_heads, head_dim = q.shape
+    _, q_heads, head_dim = q.shape
+    chosen = range(q.shape[0]) if rows is None else list(rows)
     group = q_heads // keys.shape[1]
-    out = torch.zeros(q.shape, dtype=torch.float32)
-    for row in range(rows):
+    out = torch.zeros((len(chosen), q_heads, head_dim), dtype=torch.float32)
+    for position, row in enumerate(chosen):
         request = int(selection.token_to_req[row])
         index = selection.indices[row].long() + request * tokens_per_request
         k = keys[index].float().repeat_interleave(group, dim=1)
         v = values[index].float().repeat_interleave(group, dim=1)
         scores = torch.einsum("hd,khd->hk", q[row].float(), k) * head_dim**-0.5
-        out[row] = torch.einsum("hk,khd->hd", torch.softmax(scores, dim=-1), v)
+        out[position] = torch.einsum("hk,khd->hd", torch.softmax(scores, dim=-1), v)
     return out
 
 
@@ -871,6 +1052,12 @@ def compute_verdict(results: Sequence[dict[str, Any]]) -> dict[str, Any]:
         else:
             verdict["SCRATCH_ROUTE_WITHIN_TOLERANCE"] = "YES" if routed else "UNKNOWN"
     verdict["errors"] = {r["case"]: r["error"] for r in results if r.get("error")}
+    verdict["skipped"] = {r["case"]: r["skipped"] for r in results if r.get("skipped")}
+    verdict["REFERENCE_ROWS"] = {
+        r["case"]: f"{r['ref_rows']['checked']}/{r['ref_rows']['total']}"
+        for r in results
+        if r.get("ref_rows") and not r.get("skipped")
+    }
     ratios: dict[str, float] = {}
     for rows in sorted({r["rows"] for r in results}):
         fp4 = [
@@ -1024,6 +1211,15 @@ def format_verdict(
         lines.append(f"NVFP4_VS_E4M3_REL_L2 {group}: {ratio:.2f}")
     for case, error in verdict["errors"].items():
         lines.append(f"CASE_ERROR {case}: {error}")
+    for case, reason in verdict["skipped"].items():
+        lines.append(f"CASE_SKIPPED {case}: {reason}")
+    for case, coverage in verdict["REFERENCE_ROWS"].items():
+        checked, total = coverage.split("/")
+        lines.append(
+            f"REFERENCE_ROWS {case}: CPU reference and model on {checked} of {total} "
+            f"rows ({'every row' if checked == total else 'a deterministic subset'});"
+            " kernels, zero-fill and timings on every row"
+        )
     return lines
 
 
@@ -1215,6 +1411,11 @@ def compute_self_check(
     reasons += [f"{n} {v}" for n, v in negative.items() if v != "FLAGGED"]
     reasons += [f"stage {n} {v}" for n, v in stages.items() if v != "RAN"]
     reasons += [f"{r['case']} raised" for r in results if r.get("error")]
+    reasons += [
+        f"{r['case']} skipped by the host-memory guard"
+        for r in results
+        if r.get("skipped")
+    ]
     return {
         "positive": positive,
         "negative": negative,
@@ -1324,10 +1525,15 @@ class CaseRun:
         v_scale: float,
         fused: bool = False,
         prefill_scratch: bool = False,
+        ref_rows: int = DEFAULT_REF_ROWS,
+        ref_chunk: int = REF_CHUNK_ROWS,
     ) -> None:
         self.case, self.geometry, self.k = case, geometry, kernels
         self.fused = fused
         self.prefill_scratch = prefill_scratch
+        # The rows the CPU references and the CPU model run on (see DEFAULT_REF_ROWS).
+        self.checked = reference_rows(case.rows, ref_rows)
+        self.ref_chunk = max(1, ref_chunk)
         self.seed, self.k_scale, self.v_scale = seed, k_scale, v_scale
         self.device = torch.device(WORKER_DEVICE)
         self.layout = plan_layout(case.block_size, case.rows, geometry.topk, context)
@@ -1438,6 +1644,9 @@ class CaseRun:
         cache = self._dev(reference)  # the reference bytes: gather and decode are
         # tested on them, so a store mismatch cannot hide behind a later one.
         sel = self.dirty
+        # The kernel runs on every row; the CPU reference only on ``self.checked``
+        # rows, a chunk at a time (a whole-batch reference needs ~19 KiB of host RAM
+        # per row), and the comparison reads those rows of the kernel's output.
         keys, values = nvt.gather_dequant_nvfp4_kv_triton(
             cache,
             self._dev(sel.table),
@@ -1446,25 +1655,10 @@ class CaseRun:
             k_scale=ks,
             v_scale=vs,
         )
-        ref_keys, ref_values = nv.gather_dequant_nvfp4_kv(
-            reference, sel.table, sel.token_to_req, sel.indices, k_scale=ks, v_scale=vs
-        )
-        keys, values = keys.cpu(), values.cpu()
-        different = int((keys != ref_keys).sum() + (values != ref_values).sum())
-        elements = keys.numel() + values.numel()
-        max_abs = float(
-            max(
-                (keys.float() - ref_keys.float()).abs().max(),
-                (values.float() - ref_values.float()).abs().max(),
-            )
-        )
-        result["gather"] = {
-            "different": different,
-            "elements": elements,
-            "max_abs": max_abs,
-        }
-        illegal = sel.illegal[..., None, None].expand_as(keys)
-        zeros_ok = bool((keys[illegal] == 0).all() and (values[illegal] == 0).all())
+        ref_keys, ref_values = self._ref_gather(nv, reference, sel)
+        result["gather"] = self._gather_diff(keys, values, ref_keys, ref_values)
+        zeros_ok = self._zero_fill_ok(keys, values, sel.illegal)
+        del keys, values
 
         # Path identity: a cache stored at unit layer scales, decoded at unit scales,
         # against the FP16 kernel on the dequantized values of that same cache.
@@ -1512,11 +1706,11 @@ class CaseRun:
                 v_scale=vs,
             )
             gather_cmp = {
-                "different": int(
-                    (m_keys.cpu() != ref_keys).sum()
-                    + (m_values.cpu() != ref_values).sum()
-                )
+                "different": self._gather_diff(m_keys, m_values, ref_keys, ref_values)[
+                    "different"
+                ]
             }
+            del m_keys, m_values
             m_unit = self._dev(mutate_cache(unit, mutation, nv.nvfp4_kv_split_views))
             m_out = self._attention(
                 sel,
@@ -1530,6 +1724,7 @@ class CaseRun:
                 "decode": error_stats(m_out, fp16_out),
             }
         result["controls"] = controls
+        del ref_keys, ref_values
         result["tie_control"] = self._tie_control(nv, nvt)
 
         # Quantization error at the realistic scales against the unquantized K/V.
@@ -1553,9 +1748,7 @@ class CaseRun:
         v_model = nv.dequantize_kv_nvfp4(
             v_data, v_scales, layer_scale=vs, out_dtype=torch.float32
         ).reshape(-1, heads, head_dim)[self.slots]
-        result["model_check"] = self._model_check(
-            k_model, v_model, result["decode_quality"]["rel_l2"]
-        )
+        result["model_check"] = self._model_check(k_model, v_model, quantized, baseline)
         if self.fused:
             result["fused"] = self._run_fused(
                 nv,
@@ -1857,18 +2050,97 @@ class CaseRun:
         v_model = v_model.to(torch.float8_e4m3fn).float() * vs
         return {
             "decode_quality": quality,
-            "model_check": self._model_check(k_model, v_model, quality["rel_l2"]),
+            "model_check": self._model_check(k_model, v_model, e4m3, baseline),
         }
 
-    def _model_check(self, k_model, v_model, measured: float) -> dict[str, float]:
-        """The CPU model's relative L2 for these dequantized K/V, and the measured."""
+    def _model_check(
+        self,
+        k_model: torch.Tensor,
+        v_model: torch.Tensor,
+        measured_out: torch.Tensor,
+        baseline_out: torch.Tensor,
+    ) -> dict[str, float]:
+        """The CPU model's relative L2 for these dequantized K/V, and the measured.
+
+        Both are taken over the same rows (``self.checked``; every row of a batch up
+        to ``--ref-rows``, where this equals ``decode_quality``'s relative L2).
+        """
         tpr = self.layout.tokens_per_request
-        reference = model_attention(self.q, self.key, self.value, self.clean, tpr)
-        quantized = model_attention(self.q, k_model, v_model, self.clean, tpr)
+        every = len(self.checked) == self.case.rows
+        rows = None if every else self.checked
+        reference = model_attention(
+            self.q, self.key, self.value, self.clean, tpr, rows
+        )
+        quantized = model_attention(self.q, k_model, v_model, self.clean, tpr, rows)
+        if every:
+            measured = error_stats(measured_out, baseline_out)["rel_l2"]
+        else:
+            measured = error_stats(measured_out[rows], baseline_out[rows])["rel_l2"]
         return {
             "model_rel_l2": error_stats(quantized, reference)["rel_l2"],
             "measured_rel_l2": measured,
         }
+
+    # -- the CPU reference of the gather, a chunk of rows at a time ----------
+    def _ref_gather(self, nv, reference: torch.Tensor, sel: Selection):
+        """The reference gather's FP16 K and V ``[len(checked), topk, heads, d]``."""
+        g = self.geometry
+        rows = self.checked
+        shape = (len(rows), g.topk, g.kv_heads, g.head_dim)
+        keys = torch.empty(shape, dtype=torch.float16)
+        values = torch.empty(shape, dtype=torch.float16)
+        for lo in range(0, len(rows), self.ref_chunk):
+            part = torch.tensor(rows[lo : lo + self.ref_chunk])
+            k, v = nv.gather_dequant_nvfp4_kv(
+                reference,
+                sel.table,
+                sel.token_to_req[part],
+                sel.indices[part],
+                k_scale=self.k_scale,
+                v_scale=self.v_scale,
+            )
+            keys[lo : lo + len(part)] = k
+            values[lo : lo + len(part)] = v
+            del k, v
+        return keys, values
+
+    def _gather_diff(
+        self,
+        got_k: torch.Tensor,
+        got_v: torch.Tensor,
+        ref_k: torch.Tensor,
+        ref_v: torch.Tensor,
+    ) -> dict[str, Any]:
+        """Elements that differ, elements compared and max |diff| of a device gather
+        output (all rows) against the reference of ``self.checked`` rows."""
+        different = elements = 0
+        max_abs = 0.0
+        rows = self.checked
+        for lo in range(0, len(rows), self.ref_chunk):
+            part = torch.tensor(rows[lo : lo + self.ref_chunk], device=got_k.device)
+            for got, ref in ((got_k, ref_k), (got_v, ref_v)):
+                chunk = got.index_select(0, part).cpu()
+                want = ref[lo : lo + len(part)]
+                different += int((chunk != want).sum())
+                elements += chunk.numel()
+                largest = float((chunk.float() - want.float()).abs().max())
+                if math.isnan(largest):
+                    max_abs = largest
+                elif not math.isnan(max_abs) and largest > max_abs:
+                    max_abs = largest
+                del chunk
+        return {"different": different, "elements": elements, "max_abs": max_abs}
+
+    def _zero_fill_ok(
+        self, got_k: torch.Tensor, got_v: torch.Tensor, illegal: torch.Tensor
+    ) -> bool:
+        """Is every illegal entry of the kernel's output exactly zero (all rows)?"""
+        ok = True
+        for lo in range(0, got_k.shape[0], self.ref_chunk):
+            legal = ~self._dev(illegal[lo : lo + self.ref_chunk])[..., None, None]
+            for got in (got_k, got_v):
+                ok &= bool((got[lo : lo + self.ref_chunk].masked_fill(legal, 0) == 0).all())
+        return ok
 
     def _tie_control(self, nv, nvt) -> dict[str, Any]:
         """The store on engineered ties against the reference and two tie mutants."""
@@ -2118,12 +2390,50 @@ def _run_all_pinned(
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     results: list[dict[str, Any]] = []
     runs: dict[str, CaseRun] = {}
+    ref_rows = getattr(args, "ref_rows", DEFAULT_REF_ROWS)
+    ref_chunk = getattr(args, "ref_chunk", REF_CHUNK_ROWS)
+    max_host_gb = getattr(args, "max_host_gb", DEFAULT_MAX_HOST_GB)
+    prefill_arm = "prefill_scratch" in getattr(args, "arms", ("gather",))
     for case in cases:
         entry: dict[str, Any] = {
             "case": case.label,
             "kind": case.kind,
             "rows": case.rows,
         }
+        checked = len(reference_rows(case.rows, ref_rows))
+        entry["ref_rows"] = {"checked": checked, "total": case.rows}
+        model = host_mem_model(
+            case.kind,
+            case.rows,
+            geometry,
+            case.block_size,
+            args.context,
+            ref_rows=ref_rows,
+            ref_chunk=ref_chunk,
+            prefill=prefill_arm,
+        )
+        resident = process_rss_bytes()
+        estimate = resident + model["peak"]
+        entry["host_mem_est"] = {
+            "rows": case.rows,
+            "est_peak_gib": round(estimate / GIB, 3),
+            "process_rss_gib": round(resident / GIB, 3),
+            "model_gib": {k: round(v / GIB, 4) for k, v in model.items()},
+            "max_host_gb": max_host_gb,
+        }
+        log(
+            f"HOST_MEM_EST: rows={case.rows} est_peak_GB={estimate / GIB:.2f} "
+            f"case={case.label} limit_GB={max_host_gb:g} (process {resident / GIB:.2f}"
+            f" + case {model['peak'] / GIB:.2f}) reference_rows={checked}/{case.rows}"
+        )
+        if max_host_gb > 0 and estimate > max_host_gb * GIB:
+            entry["skipped"] = (
+                f"estimated host peak {estimate / GIB:.1f} GB exceeds --max-host-gb "
+                f"{max_host_gb:g}; lower --ref-rows or raise the limit"
+            )
+            log(f"SKIPPED {case.label}: {entry['skipped']}")
+            results.append(entry)
+            continue
         try:
             run = CaseRun(
                 case,
@@ -2134,10 +2444,15 @@ def _run_all_pinned(
                 k_scale=args.k_scale,
                 v_scale=args.v_scale,
                 fused="fused" in getattr(args, "arms", ("gather",)),
-                prefill_scratch="prefill_scratch" in getattr(args, "arms", ("gather",)),
+                prefill_scratch=prefill_arm,
+                ref_rows=ref_rows,
+                ref_chunk=ref_chunk,
             )
             entry.update(run.run_nvfp4() if case.kind == "nvfp4" else run.run_e4m3())
             runs[case.label] = run
+            entry["host_mem_est"]["measured_vmhwm_gib"] = round(
+                process_rss_bytes("VmHWM") / GIB, 3
+            )
             log(f"verified {case.label}")
         except Exception as exc:  # noqa: BLE001 - reported, the other cases still run
             entry["error"] = f"{type(exc).__name__}: {exc}"
@@ -2191,6 +2506,28 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "prefill-sized --rows); `--arms gather` is the run without the fused reader",
     )
     parser.add_argument("--rows", type=int, nargs="+", default=list(DEFAULT_ROWS))
+    parser.add_argument(
+        "--ref-rows",
+        type=int,
+        default=DEFAULT_REF_ROWS,
+        help="rows per case that get the CPU reference and the CPU attention model "
+        "(all rows of a batch this small; a deterministic subset of this many rows "
+        "otherwise, 0 = every row). The kernels, the zero-fill check and the timings "
+        "always run on every row. The reference costs ~19 KiB of host RAM per row",
+    )
+    parser.add_argument(
+        "--ref-chunk",
+        type=int,
+        default=REF_CHUNK_ROWS,
+        help="rows per step of the CPU reference (host RAM is linear in this)",
+    )
+    parser.add_argument(
+        "--max-host-gb",
+        type=float,
+        default=DEFAULT_MAX_HOST_GB,
+        help="skip (SKIPPED line, not a crash) a case whose estimated host peak, "
+        "this process's RSS plus the case's model, exceeds this many GiB; 0 = no limit",
+    )
     parser.add_argument("--context", type=int, default=8192, help="tokens per request")
     parser.add_argument("--k-scale", type=float, default=DEFAULT_K_SCALE)
     parser.add_argument("--v-scale", type=float, default=DEFAULT_V_SCALE)
@@ -2207,6 +2544,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--iters and --rounds must be positive, --warmup non-negative")
     if args.context <= 0 or args.k_scale <= 0 or args.v_scale <= 0:
         parser.error("--context and the layer scales must be positive")
+    if args.ref_rows < 0 or args.ref_chunk <= 0 or args.max_host_gb < 0:
+        parser.error(
+            "--ref-rows and --max-host-gb must not be negative, --ref-chunk positive"
+        )
     return args
 
 
