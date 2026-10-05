@@ -371,6 +371,49 @@ def _use_grouped_mtp5(layer, x: torch.Tensor, topk_ids: torch.Tensor) -> bool:
     )
 
 
+# The NoPlan W13 kernel keeps route slots in two 32-lane ballot words.
+_GROUPED_NOPLAN_MAX_ROUTES: Final = 64
+
+
+def _select_grouped_w13_op(x: torch.Tensor, topk_ids: torch.Tensor, split: int):
+    """The W13 op of the grouped decode branch: NoPlan only where admitted."""
+    if _use_grouped_noplan(x, topk_ids, split):
+        return sm70_ops.nvfp4_grouped_w13_noplan_sm70_out
+    return sm70_ops.nvfp4_grouped_w13_sm70_out
+
+
+def _use_grouped_noplan(
+    x: torch.Tensor, topk_ids: torch.Tensor, split: int = 4
+) -> bool:
+    """Q2.16 option C: W13 derives the expert grouping, no plan_kernel launch.
+
+    Only reached from the grouped decode branch. Anything the NoPlan kernel
+    does not cover (builds without the op, more than 64 routes, M != 5,
+    split != 4) keeps the planned path, with a one-time warning when the knob
+    is on.
+    """
+    if not envs.VLLM_SM70_MOE_QPN_NO_PLAN:
+        return False
+    if (
+        x.shape[0] != 5
+        or split != 4
+        or topk_ids.numel() > _GROUPED_NOPLAN_MAX_ROUTES
+    ):
+        logger.warning_once(
+            "VLLM_SM70_MOE_QPN_NO_PLAN=1 only covers the M=5, split4 grouped "
+            "expert path (<=%d routes); other shapes keep plan_kernel.",
+            _GROUPED_NOPLAN_MAX_ROUTES,
+        )
+        return False
+    if not sm70_ops.has_nvfp4_grouped_noplan_dispatch():
+        logger.warning_once(
+            "VLLM_SM70_MOE_QPN_NO_PLAN=1 but this build has no "
+            "nvfp4_grouped_w13_noplan_sm70_out; keeping plan_kernel."
+        )
+        return False
+    return True
+
+
 @triton.jit
 def _prepare_single_token_slots_kernel(
     input_ptr,
@@ -1531,7 +1574,8 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         slots = num_tokens * top_k
         grouped_mtp5 = _use_grouped_mtp5(layer, x, topk_ids)
         if grouped_mtp5 or _use_grouped_decode(layer, x, topk_ids):
-            sm70_ops.nvfp4_grouped_w13_sm70_out(
+            grouped_split = 4 if grouped_mtp5 or num_tokens == 8 else 8
+            _select_grouped_w13_op(x, topk_ids, grouped_split)(
                 buffers["intermediate"],
                 x,
                 layer.w13_tm_weight,
@@ -1541,7 +1585,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 layer._nvfp4_grouped_experts,
                 layer._nvfp4_grouped_sizes,
                 layer._nvfp4_grouped_total,
-                4 if grouped_mtp5 or num_tokens == 8 else 8,
+                grouped_split,
                 interleaved_w13,
             )
             w2_op = (

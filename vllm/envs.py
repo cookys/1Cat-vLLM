@@ -355,6 +355,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE: bool = False
     VLLM_SM70_NVFP4_MOE_GROUPED_DECODE: bool = False
     VLLM_SM70_NVFP4_MOE_GROUPED_MTP5: bool = False
+    VLLM_SM70_MOE_QPN_NO_PLAN: bool = False
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W13: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W2: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE: bool = False
@@ -4553,6 +4554,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "weighted reduction."
         ),
         category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
+    ),
+    # Q2.16 option C: no plan_kernel launch on the grouped M=5 expert path.
+    "VLLM_SM70_MOE_QPN_NO_PLAN": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MOE_QPN_NO_PLAN", "0"))),
+        description=(
+            "Grouped native-NVFP4 M=5 decode: let the W13 CTAs derive the "
+            "expert grouping from the route ids instead of launching "
+            "plan_kernel first. Arithmetic, split association and FP16 "
+            "materialization points are unchanged (bitwise-equal outputs); "
+            "other shapes and builds without the op fall back to the planned "
+            "path. Default off pending GPU parity and ABBA."
+        ),
+        category="experimental",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),

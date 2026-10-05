@@ -215,6 +215,10 @@ def has_nvfp4_grouped_batch_reduce_dispatch() -> bool:
     return hasattr(torch.ops._C, "nvfp4_grouped_w2_batch_reduce_sm70_out")
 
 
+def has_nvfp4_grouped_noplan_dispatch() -> bool:
+    return hasattr(torch.ops._C, "nvfp4_grouped_w13_noplan_sm70_out")
+
+
 def nvfp4_grouped_w13_sm70_out(
     out: torch.Tensor,
     x: torch.Tensor,
@@ -229,6 +233,28 @@ def nvfp4_grouped_w13_sm70_out(
     interleaved: bool,
 ) -> None:
     torch.ops._C.nvfp4_grouped_w13_sm70_out(
+        out, x, w, s, ids, rows, experts, sizes, total, split, interleaved
+    )
+
+
+def nvfp4_grouped_w13_noplan_sm70_out(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    s: torch.Tensor,
+    ids: torch.Tensor,
+    rows: torch.Tensor,
+    experts: torch.Tensor,
+    sizes: torch.Tensor,
+    total: torch.Tensor,
+    split: int,
+    interleaved: bool,
+) -> None:
+    """Same contract as ``nvfp4_grouped_w13_sm70_out`` without plan_kernel.
+
+    rows/experts/sizes/total are still produced (by the W13 CTAs) for W2.
+    """
+    torch.ops._C.nvfp4_grouped_w13_noplan_sm70_out(
         out, x, w, s, ids, rows, experts, sizes, total, split, interleaved
     )
 
@@ -277,6 +303,15 @@ if has_nvfp4_grouped_decode_dispatch():
 
     @register_fake("_C::nvfp4_grouped_w2_sm70_out")
     def _grouped_w2_fake(out, routed, x, w, s, topk, rows, experts, sizes, total):
+        return None
+
+
+if has_nvfp4_grouped_noplan_dispatch():
+
+    @register_fake("_C::nvfp4_grouped_w13_noplan_sm70_out")
+    def _grouped_w13_noplan_fake(
+        out, x, w, s, ids, rows, experts, sizes, total, split, interleaved
+    ):
         return None
 
 
