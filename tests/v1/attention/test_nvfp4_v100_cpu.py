@@ -462,6 +462,50 @@ def test_p3_workspace_decodes_256_and_reuses_profiled_buffer():
         f._fp8_prefill_bridge_workspaces.clear()
 
 
+def test_nvfp4_bridge_workspace_single_entry_no_regrow():
+    f._fp8_prefill_bridge_workspaces.clear()
+    try:
+        shape_only = torch.empty(0, 16, 2, 144, dtype=torch.uint8)
+        prof = f._get_fp8_prefill_bridge_workspace(
+            shape_only, 40, head_dim=256, nvfp4=True, phase="profile"
+        )
+        real = torch.empty(3, 4096, 2, 144, dtype=torch.uint8)
+        ptrs = []
+        for blocks in (3, 10, 40):
+            ws = f._get_fp8_prefill_bridge_workspace(
+                real, blocks, head_dim=256, nvfp4=True
+            )
+            assert ws[0].shape[0] == blocks
+            ptrs.append(ws[0].data_ptr())
+        assert ptrs == [prof[0].data_ptr()] * 3
+        assert len(f._fp8_prefill_bridge_workspaces) == 1
+        (key,) = f._fp8_prefill_bridge_workspaces
+        assert key[-1] == "nvfp4" and key[1:3] == (2, 256)
+    finally:
+        f._fp8_prefill_bridge_workspaces.clear()
+
+
+def test_nvfp4_bridge_key_ignores_stream(monkeypatch):
+    f._fp8_prefill_bridge_workspaces.clear()
+    try:
+        cache = torch.empty(1, 16, 2, 144, dtype=torch.uint8)
+        monkeypatch.setattr(cache.__class__, "is_cuda", property(lambda s: False))
+        keys = []
+        for sid in (7, 9):
+            monkeypatch.setattr(
+                f.torch.cuda,
+                "current_stream",
+                lambda dev, sid=sid: Mock(cuda_stream=sid),
+            )
+            f._get_fp8_prefill_bridge_workspace(
+                cache, 2, head_dim=256, nvfp4=True
+            )
+            keys.append(tuple(f._fp8_prefill_bridge_workspaces))
+        assert keys[0] == keys[1] and len(keys[1]) == 1
+    finally:
+        f._fp8_prefill_bridge_workspaces.clear()
+
+
 @pytest.mark.parametrize("destination", [False, True])
 def test_p3_mixed_prefill_uses_actual_lengths_and_ignores_padding(destination):
     obj = impl()
