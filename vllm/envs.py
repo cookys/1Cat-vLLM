@@ -489,6 +489,8 @@ if TYPE_CHECKING:
 
     VLLM_FLASH_V100_E4M3_GROUPED_FP32: bool = True
     VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN: int = 32768
+    VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_EXTRA_PAGES: str = ""
+    VLLM_FLASH_V100_GROUPED_VERIFY_MTP: bool = False
     VLLM_FLASH_V100_DFLASH2_FIXED_INTERLEAVED: bool = True
     VLLM_FLASH_V100_DFLASH2_STAGE_PAGE_IDS: bool = True
     VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN: int = 32768
@@ -3232,6 +3234,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN": lambda: int(
         os.getenv("VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN", "32768")
+    ),
+    # Opt-in (plan 072 A2): comma-separated extra attention page sizes admitted
+    # by the exact grouped verifier on top of the built-in 1648/1728/3296/3456.
+    # Extra pages run the native runtime-stride path. Parsed lazily by the
+    # attention backend; blanks are ignored.
+    "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_EXTRA_PAGES": lambda: os.getenv(
+        "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_EXTRA_PAGES", ""
+    ),
+    # Opt-in (plan 072 A2): admit the exact grouped verifier for single-request
+    # native-MTP verification (2 <= q <= 16). Batched MTP stays rejected.
+    "VLLM_FLASH_V100_GROUPED_VERIFY_MTP": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_GROUPED_VERIFY_MTP", "0"))
     ),
     "VLLM_FLASH_V100_DFLASH2_FIXED_INTERLEAVED": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_DFLASH2_FIXED_INTERLEAVED", "1"))
