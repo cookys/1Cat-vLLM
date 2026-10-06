@@ -111,6 +111,97 @@ __device__ __forceinline__ uint4 nvfp4_data4_to_half8(const uint32_t data,
   return make_uint4(out[0], out[1], out[2], out[3]);
 }
 
+// ---------------------------------------------------------------------------
+// 32-dim NVFP4 loader unit (Q1.23 P1.1).
+//
+// Half-precision bit patterns of the 16 e2m1 codes (sign = bit 3). This table
+// is the single source of truth: the 8 magnitudes all have a zero low byte, so
+// the device lookup below packs their high bytes into two 32-bit words and
+// resolves four nibbles per PRMT instead of indexing a constant-memory table
+// (constant-cache reads with a divergent per-thread index would serialize).
+// tests/kernels/attention/test_sm70_flash_v100_nvfp4_e2m1_table.py parses this
+// table and checks it against nvfp4_kv.E2M1_GRID.
+constexpr uint16_t kNvfp4E2m1HalfBits[16] = {
+    0x0000, 0x3800, 0x3c00, 0x3e00, 0x4000, 0x4200, 0x4400, 0x4600,
+    0x8000, 0xb800, 0xbc00, 0xbe00, 0xc000, 0xc200, 0xc400, 0xc600};
+
+constexpr uint32_t nvfp4_mag_hi_bytes(const int first) {
+  return static_cast<uint32_t>(kNvfp4E2m1HalfBits[first] >> 8) |
+         (static_cast<uint32_t>(kNvfp4E2m1HalfBits[first + 1] >> 8) << 8) |
+         (static_cast<uint32_t>(kNvfp4E2m1HalfBits[first + 2] >> 8) << 16) |
+         (static_cast<uint32_t>(kNvfp4E2m1HalfBits[first + 3] >> 8) << 24);
+}
+constexpr uint32_t kNvfp4MagHiBytesLo = nvfp4_mag_hi_bytes(0);  // mags 0..3
+constexpr uint32_t kNvfp4MagHiBytesHi = nvfp4_mag_hi_bytes(4);  // mags 4..7
+constexpr bool nvfp4_table_prmt_compatible() {
+  for (int m = 0; m < 8; ++m) {
+    // magnitudes: zero low byte, sign clear; negatives: same | 0x8000.
+    if ((kNvfp4E2m1HalfBits[m] & 0x80ffu) != 0u ||
+        kNvfp4E2m1HalfBits[m + 8] != (kNvfp4E2m1HalfBits[m] | 0x8000u)) {
+      return false;
+    }
+  }
+  return true;
+}
+static_assert(nvfp4_table_prmt_compatible(),
+              "e2m1 table must have zero-low-byte magnitudes and mirrored "
+              "negatives for the PRMT lookup");
+
+// Four consecutive e2m1 codes (low 16 bits of `w16`, code i in nibble i) ->
+// two half2 (dims 0,1 and 2,3), unscaled. One PRMT resolves the four magnitude
+// high bytes; the sign nibble bits are moved to the fp16 sign positions.
+__device__ __forceinline__ void nvfp4_data2_to_half2x2(const uint32_t w16,
+                                                       uint32_t& h01,
+                                                       uint32_t& h23) {
+  const uint32_t hi = __byte_perm(kNvfp4MagHiBytesLo, kNvfp4MagHiBytesHi,
+                                  w16 & 0x7777u);
+  const uint32_t s = w16 & 0x8888u;
+  h01 = __byte_perm(hi, 0u, 0x1404u) | ((s << 12) & 0x00008000u) |
+        ((s << 24) & 0x80000000u);
+  h23 = __byte_perm(hi, 0u, 0x3424u) | ((s << 4) & 0x00008000u) |
+        ((s << 16) & 0x80000000u);
+}
+
+__device__ __forceinline__ uint32_t nvfp4_half2_scale(const uint32_t h2,
+                                                      const __half2 scale2) {
+  union {
+    uint32_t u;
+    __half2 h;
+  } v;
+  v.u = h2;
+  v.h = __hmul2(v.h, scale2);
+  return v.u;
+}
+
+// Decode 8 consecutive e2m1 codes (one 32-bit data word) with one fp16 block
+// scale into 8 fp16 values. The e2m1 magnitude (<= 2 significant bits) times an
+// E4M3FN scale (<= 4 significant bits) fits in 6 significant bits within the
+// normal fp16 range [2^-10, 2688], so __hmul2 is exact (equal to the float
+// path of nvfp4_data4_to_half8). A NaN scale byte propagates (0 * NaN = NaN).
+__device__ __forceinline__ uint4 nvfp4_word_to_half8(const uint32_t word,
+                                                     const __half2 scale2) {
+  uint32_t a, b, c, d;
+  nvfp4_data2_to_half2x2(word & 0xffffu, a, b);
+  nvfp4_data2_to_half2x2(word >> 16, c, d);
+  return make_uint4(nvfp4_half2_scale(a, scale2), nvfp4_half2_scale(b, scale2),
+                    nvfp4_half2_scale(c, scale2), nvfp4_half2_scale(d, scale2));
+}
+
+// Decode 32 consecutive dims: 16 data bytes + two scale bytes (low byte covers
+// dims 0..15, high byte dims 16..31) -> 4 uint4 of fp16 (dims 8i..8i+7).
+__device__ __forceinline__ void nvfp4_data16_to_half32(const uint4 data,
+                                                       const uint32_t scales2,
+                                                       uint4 (&out)[4]) {
+  const __half2 s0 = __half2half2(
+      __float2half_rn(fp8_e4m3fn_to_float(static_cast<uint8_t>(scales2))));
+  const __half2 s1 = __half2half2(__float2half_rn(
+      fp8_e4m3fn_to_float(static_cast<uint8_t>(scales2 >> 8))));
+  out[0] = nvfp4_word_to_half8(data.x, s0);
+  out[1] = nvfp4_word_to_half8(data.y, s0);
+  out[2] = nvfp4_word_to_half8(data.z, s1);
+  out[3] = nvfp4_word_to_half8(data.w, s1);
+}
+
 template <int KV_DTYPE, bool E4M3_BITS = false>
 __device__ __forceinline__ float load_kv_cache_float_unscaled(
     const void* __restrict__ cache, const int64_t index) {

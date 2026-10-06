@@ -933,6 +933,46 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel(
               ? fp8_e4m3fn_vector_to_half8_fast(raw_hi)
               : fp8_e5m2_vector_to_half8(raw_hi);
     }
+  } else if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_NVFP4) {
+    // 32-dim unit: one 16-byte LDG of e2m1 data (32 codes) + one 2-byte LDG of
+    // the two E4M3FN scale bytes, expanded to 4 uint4 (32 halves) in smem.
+    // Needs 16-byte aligned data rows (checked on the host: page stride and
+    // base pointer % 16 == 0; a row is 128 bytes and dims % 32 == 0).
+    static_assert(!CONTIGUOUS_HKV1_LAYOUT && !E4M3_SHARED_LUT &&
+                      BLOCK_SIZE == 0,
+                  "NVFP4 KV uses the runtime-page-size plain layout");
+    constexpr int kUnitUint4 = 4;  // 32 dims = 4 x (8 halves)
+    const int units_per_row = panel_d_stride_uint4 / kUnitUint4;
+    const int unit_count = valid_kv_tile_rows * units_per_row;
+    const int64_t num_kv_heads = token_stride / 144;
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(kv_cache);
+    const int64_t scale_region =
+        static_cast<int64_t>(block_size) * num_kv_heads * 128;
+    for (int unit_idx = copy_thread_idx; unit_idx < unit_count;
+         unit_idx += NUM_THREADS) {
+      const int row = unit_idx / units_per_row;
+      const int unit = unit_idx - row * units_per_row;
+      const int token_offset = tile_page_offset + kv_tile_start + row;
+      const int logical_block = token_offset / block_size;
+      const int block_offset = token_offset - logical_block * block_size;
+      const int physical_block = page_ids[logical_block];
+      const int64_t page_base =
+          static_cast<int64_t>(physical_block) * block_stride;
+      const int64_t row_index =
+          static_cast<int64_t>(block_offset) * num_kv_heads + kv_head_idx;
+      const int64_t dims = static_cast<int64_t>(panel_offset) + unit * 32;
+      const uint4 data = __ldg(reinterpret_cast<const uint4*>(
+          bytes + page_base + row_index * 128 + (dims >> 1)));
+      const uint32_t scales2 = __ldg(reinterpret_cast<const uint16_t*>(
+          bytes + page_base + scale_region + row_index * 16 + (dims >> 4)));
+      uint4 half32[kUnitUint4];
+      flash_v100::nvfp4_data16_to_half32(data, scales2, half32);
+#pragma unroll
+      for (int i = 0; i < kUnitUint4; ++i) {
+        shared_vec[row * kv_smem_stride_uint4 + unit * kUnitUint4 + i] =
+            half32[i];
+      }
+    }
   } else {
     const int copy_count = valid_kv_tile_rows * panel_d_stride_uint4;
     for (int copy_idx = copy_thread_idx; copy_idx < copy_count;
@@ -1341,8 +1381,9 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
       "The shared conversion LUT is only valid for E4M3 KV");
   static_assert(KV_DTYPE != flash_v100::KV_CACHE_DTYPE_NVFP4 ||
                     (!CONTIGUOUS_HKV1_LAYOUT && !FP8_PAIR_LOAD &&
-                     !E4M3_SHARED_LUT && std::is_same_v<PARTIAL_T, float>),
-                "NVFP4 KV uses the plain loader and fp32 partial outputs");
+                     !E4M3_SHARED_LUT && !QK_SW_PIPELINE && BLOCK_SIZE == 0),
+                "NVFP4 KV uses the 32-dim plain loader (no pair load, LUT, "
+                "fixed-stride layout, or QK software pipeline)");
   const int batch_idx = blockIdx.x;
   const int kv_head_idx = blockIdx.y;
   const int partition_idx = blockIdx.z;
@@ -3729,9 +3770,8 @@ template <int PARTITION_SIZE, int GROUP_SIZE, bool PADDED_SMEM,
           bool PARTITION_PAGE_IDS = false, bool FP8_PAIR_LOAD = false,
           int KV_DTYPE_OVERRIDE = -1, bool E4M3_SHARED_LUT = false,
           typename PARTIAL_T = std::conditional_t<
-              KV_DTYPE_OVERRIDE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 ||
-                  KV_DTYPE_OVERRIDE == flash_v100::KV_CACHE_DTYPE_NVFP4,
-              float, __half>>
+              KV_DTYPE_OVERRIDE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3, float,
+              __half>>
 void launch_flash_attention_decode_paged_xqa_tc_256_wide(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
     at::Tensor& out, const at::Tensor& block_table, const at::Tensor& seq_lens,
@@ -5274,10 +5314,11 @@ at::Tensor flash_attention_decode_paged_xqa(
                     v_cache.stride(1) == v_cache.size(2) * 144,
                 "NVFP4 KV view must be [blocks, block_size, H, 144] with "
                 "token stride H*144 and head stride 144");
-    TORCH_CHECK(k_cache.stride(0) % 4 == 0 && v_cache.stride(0) % 4 == 0 &&
-                    reinterpret_cast<uintptr_t>(k_cache.data_ptr()) % 4 == 0 &&
-                    reinterpret_cast<uintptr_t>(v_cache.data_ptr()) % 4 == 0,
-                "NVFP4 KV pages and base pointers must be 4-byte aligned");
+    TORCH_CHECK(k_cache.stride(0) % 16 == 0 && v_cache.stride(0) % 16 == 0 &&
+                    reinterpret_cast<uintptr_t>(k_cache.data_ptr()) % 16 == 0 &&
+                    reinterpret_cast<uintptr_t>(v_cache.data_ptr()) % 16 == 0,
+                "NVFP4 KV pages and base pointers must be 16-byte aligned "
+                "(32-dim loader unit uses 16-byte data loads)");
     TORCH_CHECK(partition_size == 256 || partition_size == 512 ||
                     partition_size == 1024,
                 "NVFP4 XQA supports partition_size 256, 512, or 1024");
@@ -5298,12 +5339,11 @@ at::Tensor flash_attention_decode_paged_xqa(
   TORCH_CHECK(launch_num_partitions > 0,
               "launch_num_partitions must be positive");
   const auto expected_partial_dtype =
-      (kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 || is_nvfp4_kv)
-          ? torch::kFloat32
-          : torch::kFloat16;
-  TORCH_CHECK(
-      tmp_out.dtype() == expected_partial_dtype,
-      "XQA decode tmp_out must be fp32 for E4M3/NVFP4 KV and fp16 otherwise");
+      kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 ? torch::kFloat32
+                                                           : torch::kFloat16;
+  TORCH_CHECK(tmp_out.dtype() == expected_partial_dtype,
+              "XQA decode tmp_out must be fp32 for E4M3 KV and fp16 otherwise "
+              "(NVFP4 follows E5M2: fp16 partials)");
   TORCH_CHECK(tmp_out.size(0) >= q.size(0) && tmp_out.size(1) >= q.size(1) &&
                   tmp_out.size(2) >= launch_num_partitions &&
                   tmp_out.size(3) == q.size(2),
@@ -5324,9 +5364,63 @@ at::Tensor flash_attention_decode_paged_xqa(
   TORCH_CHECK(out.stride(-1) == 1, "out last dim must be contiguous");
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   if (is_nvfp4_kv) {
-    // First version: the plain 256-wide route only (no dual-CTA, wave
-    // reducer, aligned-page LUT, or fp8 pair-load routes; those are
-    // E4M3/E5M2-only and never reached from here).
+    // Q1.23 P1.1: the B=1 G6 decode route is the E5M2 one (same predicate, env
+    // switches, thresholds and kernels: p256 [0, p1024_begin), p1024 one-CTA up
+    // to the dual-CTA threshold, p1024 192-thread two-CTA beyond it, half
+    // partials, device-side split reduce). Only E5M2-specific parts are left
+    // out: the scalar short-sequence kernel (the p256 XQA kernel covers
+    // [0, p1024_begin) instead) and the FP8 pair load (replaced by the 32-dim
+    // NVFP4 loader unit). Relay 8 measured the plain route at 2.0x E5M2 here.
+    const bool use_nvfp4_g6_dual_cta =
+        q.size(0) == 1 && q_per_kv == 6 && partition_size == 256 &&
+        k_cache.size(1) >= 256 && k_cache.size(1) % 16 == 0 &&
+        k_cache.size(2) == 1 && !decode_partition_size_overridden() &&
+        xqa_e5m2_g6_dual_cta_enabled() && xqa_e5m2_g6_split_reduce_enabled() &&
+        xqa_e5m2_partition_page_ids_enabled();
+    if (use_nvfp4_g6_dual_cta) {
+      const int sm_count =
+          at::cuda::getDeviceProperties(q.get_device())->multiProcessorCount;
+      const int dual_cta_seq_len = sm_count * 1024 + 1;
+      const int p1024_begin = xqa_e5m2_p1024_begin();
+      TORCH_CHECK(p1024_begin < dual_cta_seq_len,
+                  "Invalid NVFP4 G6 partition thresholds: ", p1024_begin, ", ",
+                  dual_cta_seq_len);
+      const int p1024_launch_num_partitions = (launch_num_partitions + 3) / 4;
+      const int p1024_one_cta_launch_num_partitions =
+          std::min(p1024_launch_num_partitions, sm_count);
+      const int split_reduce_dim_tile = xqa_split_reduce_dim_tile();
+      constexpr int kNvfp4 = flash_v100::KV_CACHE_DTYPE_NVFP4;
+      launch_flash_attention_decode_paged_xqa_tc_256_wide<
+          256, 6, true, kXQATC256WideThreads, 1, 0, false, false,
+          kXQARouteP1024SawtoothMid, false, true, false, kNvfp4>(
+          q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,
+          exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,
+          launch_num_partitions, false, split_reduce_dim_tile, stream, 0,
+          p1024_begin, 0, false);
+      launch_flash_attention_decode_paged_xqa_tc_256_wide<
+          1024, 6, false, kXQATC256WideThreads, 1, 0, false, false,
+          kXQARouteP1024SawtoothMid, false, true, false, kNvfp4>(
+          q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,
+          exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,
+          p1024_one_cta_launch_num_partitions, false, split_reduce_dim_tile,
+          stream, p1024_begin, dual_cta_seq_len, 0, false);
+      launch_flash_attention_decode_paged_xqa_tc_256_wide<
+          1024, 6, false, kXQATCG6DualCtaThreads, 2, 0, false, false,
+          kXQARouteLongSeqLens, false, true, false, kNvfp4>(
+          q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,
+          exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,
+          p1024_launch_num_partitions, false, split_reduce_dim_tile, stream,
+          dual_cta_seq_len, 0, 0, false);
+      launch_flash_attention_decode_xqa_split_reduce<0>(
+          out, seq_lens, tmp_out, max_logits, exp_sums, launch_num_partitions,
+          split_reduce_dim_tile, stream, p1024_begin, dual_cta_seq_len,
+          dual_cta_seq_len);
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+      return out;
+    }
+    // Fallback (B>1, other group sizes, small pages, route switches off): the
+    // plain 256-wide route with half partials and the generic reduce, as the
+    // E5M2 fallback does.
 #define LAUNCH_NVFP4_XQA(GROUP_SIZE, PARTITION)                                \
   launch_flash_attention_decode_paged_xqa_tc_256_wide<                         \
       PARTITION, GROUP_SIZE, false, kXQATC256WideThreads, 1, 0, false, false,  \
