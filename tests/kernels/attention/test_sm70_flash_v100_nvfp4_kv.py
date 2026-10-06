@@ -152,3 +152,55 @@ def test_nvfp4_xqa_matches_fp16_dequant_and_float32_reference(ctx_len, rows):
     )
     rel_l2 = (out_nvfp4.float() - reference).norm() / reference.norm()
     assert rel_l2.item() <= 1e-3, f"rel-L2 vs float32 reference: {rel_l2.item():.3e}"
+
+
+def _decode_nvfp4(flash_attn_v100, cache, block_table, seq_lens, q, ctx_len):
+    return flash_attn_v100.flash_attn_decode_paged_xqa(
+        q,
+        cache[:, 0],
+        cache[:, 1],
+        block_table,
+        seq_lens,
+        softmax_scale=HEAD_DIM**-0.5,
+        kv_cache_dtype="nvfp4",
+        k_scale=1.0,
+        v_scale=1.0,
+        max_seq_len_hint=ctx_len,
+    )
+
+
+@pytest.mark.parametrize("ctx_len", [4096, 70000])
+@pytest.mark.parametrize("rows", [5, 8])
+def test_nvfp4_smallq_192_variant_and_half_p_knobs(ctx_len, rows, monkeypatch):
+    """Q1.23 P1.2: the 192-thread 2-blocks/SM smallq variant (default ON) and
+    the half-P contrast build (default OFF), both read via getenv at dispatch.
+
+    192 ON vs OFF runs the same math in a different block shape, so only the
+    cross-partition merge order may differ (expected: bit-identical or within
+    fp16 output rounding). HALF_P rounds P to half before PV (E5M2 contract),
+    so it is allowed a looser bound against the fp32-P result.
+    """
+    flash_attn_v100 = _require_nvfp4_xqa()
+    cache, _, _, block_table, seq_lens, q, k_deq, v_deq = _build_case(
+        ctx_len, rows, seed=4321 + rows
+    )
+    reference = _torch_reference(q, k_deq, v_deq, seq_lens, HEAD_DIM**-0.5)
+
+    def run(smallq_192: str, half_p: str):
+        monkeypatch.setenv("VLLM_FLASH_V100_NVFP4_SMALLQ_192", smallq_192)
+        monkeypatch.setenv("VLLM_FLASH_V100_NVFP4_HALF_P", half_p)
+        return _decode_nvfp4(
+            flash_attn_v100, cache, block_table, seq_lens, q, ctx_len
+        ).float()
+
+    on = run("1", "0")
+    off = run("0", "0")
+    half_p_on = run("1", "1")
+    half_p_off_route0 = run("0", "1")
+
+    torch.testing.assert_close(on, off, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(half_p_on, on, atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(half_p_off_route0, off, atol=5e-3, rtol=5e-3)
+    for name, out in (("192-on", on), ("192-off", off), ("half-p", half_p_on)):
+        rel_l2 = (out - reference).norm() / reference.norm()
+        assert rel_l2.item() <= 1e-3, f"{name} rel-L2 vs fp32 ref {rel_l2.item():.3e}"
