@@ -2248,6 +2248,8 @@ def _get_fp8_prefill_bridge_workspace(
     required_blocks: int,
     *,
     head_dim: int | None = None,
+    nvfp4: bool = False,
+    phase: str = "runtime",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
     # NVFP4's last dimension is 144 packed bytes; its decoded head is 256.
     head_dim = int(key_cache.shape[3]) if head_dim is None else head_dim
@@ -2261,13 +2263,30 @@ def _get_fp8_prefill_bridge_workspace(
         if key_cache.is_cuda
         else 0
     )
-    cache_key = (
-        device_index,
-        stream_id,
-        int(key_cache.shape[2]),
-        head_dim,
-    )
+    if nvfp4:
+        # Stream-independent: the profile-time reservation and the runtime
+        # prefill must share one entry even if they run on different streams.
+        # shape[2] is num_kv_heads for the [blocks, page, heads, 144] view.
+        cache_key = (device_index, int(key_cache.shape[2]), head_dim, "nvfp4")
+    else:
+        cache_key = (
+            device_index,
+            stream_id,
+            int(key_cache.shape[2]),
+            head_dim,
+        )
     workspace = _fp8_prefill_bridge_workspaces.get(cache_key)
+    if nvfp4:
+        logger.info_once(
+            "NVFP4 bridge workspace %s: key=%s entries=%d required_blocks=%d "
+            "cached_blocks=%s data_ptr=%s",
+            phase,
+            cache_key,
+            len(_fp8_prefill_bridge_workspaces),
+            required_blocks,
+            workspace[0].shape[0] if workspace is not None else None,
+            workspace[0].data_ptr() if workspace is not None else None,
+        )
     if workspace is not None and workspace[0].shape[0] >= required_blocks:
         return (
             workspace[0][:required_blocks],
@@ -2279,6 +2298,15 @@ def _get_fp8_prefill_bridge_workspace(
         return None
 
     previous_capacity = workspace[0].shape[0] if workspace is not None else 0
+    if workspace is not None:
+        logger.warning(
+            "Bridge workspace %s regrowing: key=%s old_capacity=%d "
+            "required_blocks=%d (old buffers popped, may fragment)",
+            phase,
+            cache_key,
+            previous_capacity,
+            required_blocks,
+        )
     capacity = max(required_blocks, previous_capacity * 2)
     shape = (
         capacity,
@@ -5798,7 +5826,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 (0, 16, self.num_kv_heads, 144), dtype=torch.uint8
             )
             workspace = _get_fp8_prefill_bridge_workspace(
-                shape_only, self._nvfp4_bridge_profile_blocks, head_dim=256
+                shape_only,
+                self._nvfp4_bridge_profile_blocks,
+                head_dim=256,
+                nvfp4=True,
+                phase="profile",
             )
             if workspace is None:
                 raise RuntimeError("Cannot reserve NVFP4 prefill bridge workspace")
@@ -8338,7 +8370,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     "reprofile the final block-size/max-model-len configuration"
                 )
             workspace = _get_fp8_prefill_bridge_workspace(
-                key_cache, required_blocks, head_dim=256
+                key_cache, required_blocks, head_dim=256, nvfp4=True
             )
         else:
             workspace = _get_fp8_prefill_bridge_workspace(key_cache, required_blocks)
