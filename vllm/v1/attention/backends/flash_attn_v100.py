@@ -2140,6 +2140,70 @@ def _try_sm70_fa2_d256_prefill(
     return None
 
 
+def _require_nvfp4_xqa_reader() -> None:
+    """A dtype string or new Python wrapper cannot qualify an old native .so."""
+    try:
+        from flash_attn_v100 import (
+            flash_attn_decode_paged_xqa,
+            flash_attn_nvfp4_kv_available,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "FLASH_ATTN_V100 NVFP4 needs the XQA reader and capability probe; "
+            "rebuild the extension and its Python package"
+        ) from exc
+    if not callable(flash_attn_decode_paged_xqa) or not flash_attn_nvfp4_kv_available(
+        min_version=1
+    ):
+        raise RuntimeError(
+            "FLASH_ATTN_V100 NVFP4 capability probe rejected this extension; "
+            "packed NVFP4 cannot fall back to an FP8 reader"
+        )
+
+
+def _get_nvfp4_prefill_bridge_op():
+    """Version 1 can decode; only version >=2 may unpack a prefill prefix."""
+    from flash_attn_v100 import flash_attn_nvfp4_kv_available
+
+    if not flash_attn_nvfp4_kv_available(min_version=2):
+        return None
+    try:
+        from flash_attn_v100 import nvfp4_paged_kv_to_fp16
+    except ImportError as exc:
+        raise RuntimeError(
+            "NVFP4 probe reports version >=2 but Python lacks the prefill "
+            "bridge; install matching native and Python packages"
+        ) from exc
+    if not callable(nvfp4_paged_kv_to_fp16):
+        raise RuntimeError("NVFP4 version >=2 requires a callable prefill bridge")
+    return nvfp4_paged_kv_to_fp16
+
+
+def _validate_nvfp4_xqa_cache(kv_cache: torch.Tensor, num_kv_heads: int) -> None:
+    """P1 native contract: interleaved K/V pages, NHD views, aligned uint32 loads.
+
+    Inspect only tensor metadata; no device reads, allocation or host sync.
+    The 144 dimension describes bytes, not interleaved per-token data/scales.
+    """
+    if (
+        kv_cache.dtype != torch.uint8
+        or kv_cache.ndim != 5
+        or kv_cache.shape[1] != 2
+        or kv_cache.shape[-1] != 144
+        or kv_cache.shape[3] != num_kv_heads
+        or kv_cache.shape[2] <= 0
+        or kv_cache.shape[2] % 16
+    ):
+        raise ValueError("NVFP4 requires [blocks,2,page,heads,144] uint8 cache")
+    side_bytes = kv_cache.shape[2] * num_kv_heads * 144
+    expected_stride = (2 * side_bytes, side_bytes, num_kv_heads * 144, 144, 1)
+    if kv_cache.stride() != expected_stride or kv_cache.data_ptr() % 4:
+        raise ValueError(
+            "NVFP4 XQA P1 requires NHD cache[:,0]/cache[:,1] views with "
+            "un-padded interleaved pages and 4-byte aligned base pointers"
+        )
+
+
 def _get_fp8_e5m2_paged_kv_bridge_op():
     global _fp8_e5m2_paged_kv_to_fp16
     global _fp8_e5m2_paged_kv_to_fp16_checked
@@ -2182,7 +2246,11 @@ def _allocate_growing_workspace(
 def _get_fp8_prefill_bridge_workspace(
     key_cache: torch.Tensor,
     required_blocks: int,
+    *,
+    head_dim: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    # NVFP4's last dimension is 144 packed bytes; its decoded head is 256.
+    head_dim = int(key_cache.shape[3]) if head_dim is None else head_dim
     device_index = (
         key_cache.device.index
         if key_cache.device.index is not None
@@ -2197,7 +2265,7 @@ def _get_fp8_prefill_bridge_workspace(
         device_index,
         stream_id,
         int(key_cache.shape[2]),
-        int(key_cache.shape[3]),
+        head_dim,
     )
     workspace = _fp8_prefill_bridge_workspaces.get(cache_key)
     if workspace is not None and workspace[0].shape[0] >= required_blocks:
@@ -2216,7 +2284,7 @@ def _get_fp8_prefill_bridge_workspace(
         capacity,
         _FP8_PREFILL_BRIDGE_PAGE_SIZE,
         key_cache.shape[2],
-        key_cache.shape[3],
+        head_dim,
     )
 
     def _allocate() -> tuple[torch.Tensor, ...]:
@@ -4846,6 +4914,30 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         super().__init__(*args, **kwargs)
         self.kv_cache_dtype = _normalize_flash_v100_kv_cache_dtype(self.kv_cache_dtype)
         _log_kv_dtype_contract(self.kv_cache_dtype)
+        self.nvfp4_kv_available = False
+        self.nvfp4_paged_kv_to_fp16 = None
+        if self.kv_cache_dtype == "nvfp4":
+            _require_nvfp4_xqa_reader()
+            self.nvfp4_kv_available = True
+            self.nvfp4_paged_kv_to_fp16 = _get_nvfp4_prefill_bridge_op()
+            if self.nvfp4_paged_kv_to_fp16 is not None:
+                from vllm.config import get_current_vllm_config
+
+                config = get_current_vllm_config()
+                page = config.cache_config.block_size
+                self._nvfp4_bridge_profile_blocks = _cdiv_int(
+                    _cdiv_int(config.model_config.max_model_len, page) * page,
+                    _FP8_PREFILL_BRIDGE_PAGE_SIZE,
+                )
+                logger.info_once(
+                    "FLASH_ATTN_V100 NVFP4 capability >=2: XQA decode/per-row "
+                    "verify plus FP16 prefill bridge; scalar/grouped disabled."
+                )
+            else:
+                logger.info_once(
+                    "FLASH_ATTN_V100 NVFP4 capability 1: XQA decode/per-row "
+                    "verify only; prefill/profile require native version >=2."
+                )
         (
             self.flash_attn_func,
             self.flash_attn_bhmd_func,
@@ -5635,6 +5727,154 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             extra,
         )
 
+    def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
+        if self.kv_cache_dtype != "nvfp4":
+            return super().do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)
+        if not self.nvfp4_kv_available:
+            raise RuntimeError("NVFP4 cache writer requires a capable reader")
+        if self.attn_type != AttentionType.DECODER:
+            raise NotImplementedError("NVFP4 KV supports decoder attention only")
+        from vllm.models.qwen4_exp.nvidia.ops.nvfp4_kv_triton import (
+            store_nvfp4_kv_triton,
+        )
+
+        # These are dequantization multipliers, NOT their reciprocals. The
+        # writer takes the reciprocal internally. Uncalibrated 27B uses 1.0.
+        # Persistent device scalars avoid allocation / H2D inside graphs.
+        store_nvfp4_kv_triton(
+            key,
+            value,
+            kv_cache,
+            slot_mapping,
+            k_scale=layer._k_scale,
+            v_scale=layer._v_scale,
+        )
+
+    def _forward_nvfp4(
+        self,
+        layer,
+        query,
+        key,
+        value,
+        kv_cache,
+        attn_metadata,
+        output,
+        output_scale,
+        output_block_scale,
+    ):
+        """Packed-cache route; no FP8/Triton/grouped fallback is permitted.
+
+        Small causal query spans reuse graph-stable per-row metadata.
+        Version >=2 enables an eager FP16 prefix bridge. Its bounded workspace
+        is reserved during profile_run, before the remaining KV pool is sized.
+        Version 1 continues to reject prefill/profile without blocking XQA.
+        """
+        if not self.nvfp4_kv_available:
+            raise RuntimeError("FLASH_ATTN_V100 NVFP4 capability missing")
+        if (
+            query.dtype != torch.float16
+            or query.shape[-1] != 256
+            or self.attn_type != AttentionType.DECODER
+            or self.alibi_slopes is not None
+            or self.logits_soft_cap
+            or self.sinks is not None
+            or self._flash_v100_has_sliding_window()
+            or self.prefix_anchored_decode_window is not None
+            or output_scale is not None
+            or output_block_scale is not None
+        ):
+            raise NotImplementedError(
+                "NVFP4 V100 v1 requires causal full decoder attention, "
+                "FP16 Q/head256, no ALiBi/sinks/softcap/quantized output"
+            )
+        if output is None:
+            raise ValueError("NVFP4 V100 requires an output buffer")
+        if attn_metadata is None:
+            if self.nvfp4_paged_kv_to_fp16 is None:
+                raise NotImplementedError(
+                    "NVFP4 prefill/profile requires native bridge version >=2"
+                )
+            shape_only = query.new_empty(
+                (0, 16, self.num_kv_heads, 144), dtype=torch.uint8
+            )
+            workspace = _get_fp8_prefill_bridge_workspace(
+                shape_only, self._nvfp4_bridge_profile_blocks, head_dim=256
+            )
+            if workspace is None:
+                raise RuntimeError("Cannot reserve NVFP4 prefill bridge workspace")
+            _profile_sm70_prefill_workspace(query, self.num_kv_heads)
+            _record_route("nvfp4_profile_bridge")
+            return output.fill_(0)
+        if not getattr(attn_metadata, "causal", True):
+            raise NotImplementedError("NVFP4 V100 v1 does not support noncausal KV")
+        _validate_nvfp4_xqa_cache(kv_cache, self.num_kv_heads)
+        if getattr(attn_metadata, "ddtree_parent_ids", None) is not None:
+            raise NotImplementedError("NVFP4 V100 v1 does not support tree masks")
+        if attn_metadata.num_actual_tokens == 0:
+            return output
+        if attn_metadata.max_query_len == 1:
+            _record_route("nvfp4_decode")
+            return self._flash_v100_decode(
+                layer, query, key, value, kv_cache, attn_metadata, output
+            )
+        key_cache, value_cache = _split_paged_kv_cache(kv_cache)
+        qsl = getattr(attn_metadata, "query_start_loc_cpu", None)
+        if qsl is None:
+            qsl = attn_metadata.query_start_loc
+        # Async CPU shadows may be upper bounds, not actual sequence lengths.
+        # The persistent smallq path already consumes the GPU metadata; the
+        # eager fallback must use it as well when constructing per-row lengths.
+        seq_lens = attn_metadata.seq_lens
+        if attn_metadata.max_query_len <= 8:
+            _record_route("nvfp4_verify_per_row")
+            return self._flash_v100_small_query_prefill_as_decode(
+                layer,
+                query,
+                key_cache,
+                value_cache,
+                attn_metadata,
+                output,
+                qsl,
+                seq_lens,
+            )
+        if self.nvfp4_paged_kv_to_fp16 is None:
+            raise NotImplementedError(
+                "NVFP4 prefill requires native bridge version >=2"
+            )
+        if _is_cuda_graph_capturing(query):
+            raise RuntimeError("NVFP4 prefill bridge requires eager execution")
+        # Dense cu_seqlens/slices need exact lengths, not scheduler upper bounds.
+        # One eager transfer per layer also covers mixed decode/prefill batches.
+        seq_lens_cpu = seq_lens.to(device="cpu")
+        _record_route("nvfp4_prefill_bridge")
+        for request in range(len(qsl) - 1):
+            start, end = int(qsl[request]), int(qsl[request + 1])
+            end = min(end, int(attn_metadata.num_actual_tokens))
+            if start >= end:
+                continue
+            seq_len = int(seq_lens_cpu[request])
+            if seq_len < end - start:
+                raise ValueError("NVFP4 prefill sequence is shorter than its query")
+            result = self._run_fp8_prefill_bridge(
+                query=query[start:end].unsqueeze(0),
+                key_cache=key_cache,
+                value_cache=value_cache,
+                block_table=attn_metadata.block_table[request : request + 1],
+                seq_lens=seq_lens[request : request + 1],
+                seq_len=seq_len,
+                k_scale=float(layer._k_scale_float),
+                v_scale=float(layer._v_scale_float),
+                causal=True,
+                window_size=(-1, -1),
+                out=output[start:end].unsqueeze(0),
+            )
+            if result is None:
+                raise RuntimeError("NVFP4 prefill bridge unavailable; no FP8 fallback")
+            value_out, is_destination = result
+            if not is_destination:
+                output[start:end].copy_(value_out.squeeze(0))
+        return output
+
     def _supports_flash_v100_path(self) -> bool:
         """Check whether current layer/config can run Flash V100 safely."""
         supported_kv_dtype = not _uses_fp8_kv_cache(
@@ -5647,6 +5887,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and self.logits_soft_cap == 0
             and self.sinks is None
             and supported_kv_dtype
+            and (self.kv_cache_dtype != "nvfp4" or self.nvfp4_kv_available)
         )
 
     def _flash_v100_has_sliding_window(self) -> bool:
@@ -5741,6 +5982,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         anchor_lens: torch.Tensor | None = None,
         anchored_window: int = 0,
     ) -> None:
+        if kv_cache_dtype == "nvfp4":
+            raise NotImplementedError(
+                "NVFP4 P1 requires an admitted XQA route; scalar fallback "
+                "is not implemented (check XQA flags, shape and partition hints)"
+            )
         scalar_tail = getattr(self, "_sm70_scalar_tail_attention", None)
         if scalar_tail is not None and scalar_tail(
             query,
@@ -5813,6 +6059,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
     ) -> bool:
         """Gate the verifier on its hardware and tensor-layout contract."""
         global _logged_prefill_smallq_grouped_verify_gate
+        if self.kv_cache_dtype == "nvfp4":
+            return False
         block_table = getattr(attn_metadata, "block_table", None)
         seq_lens = getattr(attn_metadata, "seq_lens", None)
         num_reqs = int(
@@ -5984,7 +6232,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             return False
 
         q_per_kv = query.shape[1] // key_cache.shape[2]
-        if q_per_kv not in (6, 8):
+        if q_per_kv not in ((4, 6, 8) if self.kv_cache_dtype == "nvfp4" else (6, 8)):
             return False
 
         fp16_kv = (
@@ -6003,6 +6251,16 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and value_cache.dtype == torch.uint8
             and not getattr(attn_metadata, "is_dflash_selector_target", False)
         )
+        nvfp4_kv = (
+            self.kv_cache_dtype == "nvfp4"
+            and self.nvfp4_kv_available
+            and key_cache.dtype == value_cache.dtype == torch.uint8
+            and key_cache.shape[-1] == value_cache.shape[-1] == 144
+        )
+        if nvfp4_kv:
+            # No scalar NVFP4 reader exists in P1. The native XQA contract
+            # supports short contexts too; the old crossover is a speed policy.
+            return True
         if not (fp16_kv or fp8_e4m3_kv or fp8_e5m2_kv):
             return False
         if fp8_e4m3_kv and (
@@ -6040,7 +6298,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         partition_size_hint: int | None,
     ) -> None:
         global _logged_prefill_smallq_decode_xqa
-        grouped_op = getattr(self, "flash_attn_grouped_e4m3_fp32_paged", None)
+        grouped_op = (
+            None
+            if self.kv_cache_dtype == "nvfp4"
+            else getattr(self, "flash_attn_grouped_e4m3_fp32_paged", None)
+        )
         if grouped_op is not None and grouped_e4m3_fp32_allowed(
             self,
             query,
@@ -6239,6 +6501,19 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         global _logged_prefill_triton_safe
         global _warned_decode_fallback
         global _warned_decode_strict_fallback, _warned_feature_fallback
+
+        if self.kv_cache_dtype == "nvfp4":
+            return self._forward_nvfp4(
+                layer,
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                output,
+                output_scale,
+                output_block_scale,
+            )
 
         if attn_metadata is None:
             assert output is not None
@@ -7274,6 +7549,12 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         )
         xqa_kv_supported = (
             (
+                self.kv_cache_dtype == "nvfp4"
+                and self.nvfp4_kv_available
+                and key_cache.dtype == value_cache.dtype == torch.uint8
+                and key_cache.shape[-1] == value_cache.shape[-1] == 144
+            )
+            or (
                 self.kv_cache_dtype in ("auto", "float16", "bfloat16")
                 and key_cache.dtype == torch.float16
                 and value_cache.dtype == torch.float16
@@ -7303,7 +7584,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and query.shape[2] == 256
             and key_cache.shape[2] > 0
             and query.shape[1] % key_cache.shape[2] == 0
-            and _decode_xqa_allowed_for_q_per_kv(q_per_kv, attn_metadata)
+            and (
+                q_per_kv in (4, 6, 8)
+                if self.kv_cache_dtype == "nvfp4"
+                else _decode_xqa_allowed_for_q_per_kv(q_per_kv, attn_metadata)
+            )
             and (
                 self.kv_cache_dtype not in ("fp8", "fp8_e4m3")
                 or (
@@ -8024,6 +8309,10 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         window_size: tuple[int, int],
         out: torch.Tensor,
     ) -> tuple[torch.Tensor, bool] | None:
+        if self.kv_cache_dtype == "nvfp4" and self.nvfp4_paged_kv_to_fp16 is None:
+            raise NotImplementedError(
+                "NVFP4 prefill bridge requires native version >=2"
+            )
         if block_table.shape[0] != 1:
             return None
         input_block_size = int(key_cache.shape[1])
@@ -8039,17 +8328,31 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             input_capacity,
             _FP8_PREFILL_BRIDGE_PAGE_SIZE,
         )
-        workspace = _get_fp8_prefill_bridge_workspace(
-            key_cache,
-            required_blocks,
-        )
+        if self.kv_cache_dtype == "nvfp4":
+            if seq_len > input_capacity:
+                raise ValueError("NVFP4 sequence exceeds its block table capacity")
+            profiled = getattr(self, "_nvfp4_bridge_profile_blocks", None)
+            if profiled is not None and required_blocks > profiled:
+                raise RuntimeError(
+                    "NVFP4 bridge exceeds its profiled workspace; "
+                    "reprofile the final block-size/max-model-len configuration"
+                )
+            workspace = _get_fp8_prefill_bridge_workspace(
+                key_cache, required_blocks, head_dim=256
+            )
+        else:
+            workspace = _get_fp8_prefill_bridge_workspace(key_cache, required_blocks)
         if workspace is None:
             return None
         key_out, value_out, output_block_table = workspace
         bridge = (
-            self.fp8_e4m3_paged_kv_to_fp16
-            if self.kv_cache_dtype == "fp8_e4m3"
-            else self.fp8_e5m2_paged_kv_to_fp16
+            self.nvfp4_paged_kv_to_fp16
+            if self.kv_cache_dtype == "nvfp4"
+            else (
+                self.fp8_e4m3_paged_kv_to_fp16
+                if self.kv_cache_dtype == "fp8_e4m3"
+                else self.fp8_e5m2_paged_kv_to_fp16
+            )
         )
         if bridge is None:
             return None
@@ -9482,6 +9785,30 @@ class FlashAttnV100Backend(TritonAttentionBackend):
 
     # Keep vLLM unified KV cache update path.
     forward_includes_kv_cache_update: bool = False
+
+    supported_kv_cache_dtypes = [
+        *TritonAttentionBackend.supported_kv_cache_dtypes,
+        "nvfp4",
+    ]
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        if cache_dtype_str == "nvfp4":
+            if head_size != 256 or block_size % 16:
+                raise ValueError(
+                    "FLASH_ATTN_V100 NVFP4 requires head_size=256 "
+                    "and block_size divisible by 16"
+                )
+            return (num_blocks, 2, block_size, num_kv_heads, 144)
+        return TritonAttentionBackend.get_kv_cache_shape(
+            num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str
+        )
 
     @staticmethod
     def get_impl_cls():

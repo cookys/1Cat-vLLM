@@ -73,7 +73,10 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     draft_cache_dtype = speculative_config.kv_cache_dtype
     if (
         draft_cache_dtype is None
-        and str(vllm_config.cache_config.cache_dtype).startswith("fp8")
+        and (
+            str(vllm_config.cache_config.cache_dtype).startswith("fp8")
+            or vllm_config.cache_config.cache_dtype == "nvfp4"
+        )
         and current_platform.is_cuda()
         and current_platform.is_device_capability(70)
     ):

@@ -220,7 +220,12 @@ def _reshape_kv_cache(
                     kernel_block_size,
                     kv_cache_spec.num_kv_heads,
                     kv_cache_spec.head_size,
-                    cache_dtype_str=cache_dtype,
+                    cache_dtype_str=(
+                        "auto"
+                        if cache_dtype == "nvfp4"
+                        and kv_cache_spec.dtype == torch.float16
+                        else cache_dtype
+                    ),
                 )
 
                 # FIXME(woosuk): Add kv_cache_stride_order to all attention backends.
@@ -322,7 +327,11 @@ def _update_hybrid_attention_layout(
             kernel_block_sizes[group.kv_cache_group_id],
             kv_cache_spec.num_kv_heads,
             kv_cache_spec.head_size,
-            cache_dtype_str=cache_dtype,
+            cache_dtype_str=(
+                "auto"
+                if cache_dtype == "nvfp4" and kv_cache_spec.dtype == torch.float16
+                else cache_dtype
+            ),
         )
         # if the first dim of the kvcache's layout is already num_blocks, continue
         if block_dim == 0:

@@ -12592,7 +12592,12 @@ class GPUModelRunner(
                         shape_block_size,
                         kv_cache_spec.num_kv_heads,
                         kv_cache_spec.head_size,
-                        cache_dtype_str=self.cache_config.cache_dtype,
+                        cache_dtype_str=(
+                            "auto"
+                            if self.cache_config.cache_dtype == "nvfp4"
+                            and kv_cache_spec.dtype == torch.float16
+                            else self.cache_config.cache_dtype
+                        ),
                     )
                     dtype = kv_cache_spec.dtype
                     try:
@@ -12616,6 +12621,11 @@ class GPUModelRunner(
 
                     raw_tensor = kv_cache_raw_tensors[layer_name].view(dtype)
                     if kv_cache_spec.page_size_padded is not None:
+                        if kernel_num_blocks != num_blocks:
+                            raise ValueError(
+                                "Padded physical KV pages cannot use virtual "
+                                "kernel block splitting"
+                            )
                         # Use strided view to handle page_size_bytes that
                         # include padding. This follows
                         # the same pattern as MambaSpec handling below.
@@ -12690,7 +12700,12 @@ class GPUModelRunner(
                 kernel_block_sizes[group.kv_cache_group_id],
                 kv_cache_spec.num_kv_heads,
                 kv_cache_spec.head_size,
-                cache_dtype_str=self.cache_config.cache_dtype,
+                cache_dtype_str=(
+                    "auto"
+                    if self.cache_config.cache_dtype == "nvfp4"
+                    and kv_cache_spec.dtype == torch.float16
+                    else self.cache_config.cache_dtype
+                ),
             )
             # block_dim: 0 means (num_blocks, 2, ...); 1 means (2, num_blocks, ...).
             if block_dim == 0:

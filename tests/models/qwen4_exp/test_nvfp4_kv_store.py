@@ -281,11 +281,13 @@ def _packed_member_views(monkeypatch):
 
 @pytest.mark.skipif(
     "packed_members"
-    not in __import__("inspect").signature(
+    not in __import__("inspect")
+    .signature(
         __import__(
             "vllm.v1.worker.gpu.attn_utils", fromlist=["_reshape_kv_cache"]
         )._reshape_kv_cache
-    ).parameters,
+    )
+    .parameters,
     reason="runner packed_members (p070 packs) is not on the d30469863 base; "
     "covered on p071-fable-prefill-bprime",
 )
@@ -315,11 +317,13 @@ def _impl(dtype):
 
 @pytest.mark.skipif(
     "packed_members"
-    not in __import__("inspect").signature(
+    not in __import__("inspect")
+    .signature(
         __import__(
             "vllm.v1.worker.gpu.attn_utils", fromlist=["_reshape_kv_cache"]
         )._reshape_kv_cache
-    ).parameters,
+    )
+    .parameters,
     reason="runner packed_members (p070 packs) is not on the d30469863 base; "
     "covered on p071-fable-prefill-bprime",
 )
@@ -347,8 +351,13 @@ def test_other_cache_dtypes_still_use_reshape_and_cache_flash(
     from vllm.v1.attention.backends import flash_attn
 
     calls = []
+    # The optional FlashAttention import is absent with CUDA hidden. This
+    # delegation test supplies its own callback and never invokes a GPU op.
     monkeypatch.setattr(
-        flash_attn, "reshape_and_cache_flash", lambda *args: calls.append(args)
+        flash_attn,
+        "reshape_and_cache_flash",
+        lambda *args: calls.append(args),
+        raising=False,
     )
     layer = SimpleNamespace(_k_scale="k", _v_scale="v")
     cache = torch.zeros(2, 2, BLOCK, 1, 256, dtype=torch.uint8)

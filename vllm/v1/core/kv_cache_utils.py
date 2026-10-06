@@ -12,6 +12,8 @@ from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any, NamedTuple, NewType, TypeAlias, cast, overload
 
+import torch
+
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -29,6 +31,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheTensor,
+    KVQuantMode,
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
@@ -1040,6 +1043,75 @@ def is_kv_cache_page_size_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool
     return len(page_sizes) == 1
 
 
+def _pad_nvfp4_hybrid_draft_pages(
+    specs: dict[str, KVCacheSpec],
+) -> dict[str, KVCacheSpec]:
+    """Keep the NVFP4 target page when an FP16 SW drafter needs larger pages.
+
+    Use an aligned *divisor* of the target token block for the SW group and
+    pad its physical page. A merely byte-efficient choice (e.g. 816 versus
+    a target block of 2912) makes prefix-hit alignment lcm=148512 tokens.
+    Divisors preserve the target checkpoint grid. No dtype/window/state
+    contents change, and non-NVFP4 layouts retain the legacy unifier.
+    """
+    targets = [s for s in specs.values() if type(s) is FullAttentionSpec]
+    states = [s for s in specs.values() if isinstance(s, MambaSpec)]
+    drafts = [s for s in specs.values() if type(s) is SlidingWindowSpec]
+    if not targets or not states or not drafts:
+        return specs
+    if len(targets) + len(states) + len(drafts) != len(specs):
+        return specs
+    if not all(s.kv_quant_mode.is_nvfp4 and s.dtype == torch.uint8 for s in targets):
+        return specs
+    target = targets[0]
+    page, block = target.page_size_bytes, target.block_size
+    if any(s.page_size_bytes != page or s.block_size != block for s in targets):
+        return specs
+    if any(
+        s.block_size != block
+        or s.page_size_bytes > page
+        or s.mamba_cache_mode != "align"
+        for s in states
+    ):
+        return specs
+    if any(
+        s.dtype != torch.float16 or s.kv_quant_mode != KVQuantMode.NONE for s in drafts
+    ):
+        return specs
+    replacements = {}
+    for name, spec in specs.items():
+        if type(spec) is SlidingWindowSpec:
+            per_token = replace(
+                spec, block_size=1, page_size_padded=None
+            ).page_size_bytes
+            limit = min(block, spec.block_size, page // per_token)
+            choices = [n for n in range(16, limit + 1, 16) if block % n == 0]
+            if not choices:
+                raise ValueError(
+                    "NVFP4 hybrid draft needs a 16-token-aligned divisor of "
+                    f"target block {block} fitting page {page} bytes"
+                )
+            draft_block = max(choices)
+            replacements[name] = replace(
+                spec, block_size=draft_block, page_size_padded=page
+            )
+            logger.info(
+                "NVFP4 hybrid draft page: layer=%s block=%d->%d "
+                "logical_bytes=%d physical_bytes=%d target_block=%d",
+                name,
+                spec.block_size,
+                draft_block,
+                draft_block * per_token,
+                page,
+                block,
+            )
+        elif isinstance(spec, MambaSpec):
+            replacements[name] = replace(spec, page_size_padded=page)
+        else:
+            replacements[name] = spec
+    return replacements
+
+
 def unify_kv_cache_spec_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
     vllm_config: VllmConfig | None = None,
@@ -1056,6 +1128,7 @@ def unify_kv_cache_spec_page_size(
     Returns:
         The updated KVCacheSpec with the same page_size_bytes.
     """
+    kv_cache_spec = _pad_nvfp4_hybrid_draft_pages(kv_cache_spec)
     page_sizes = {layer.page_size_bytes for layer in kv_cache_spec.values()}
     if len(page_sizes) <= 1:
         # All layers have the same page size, no need to unify.
