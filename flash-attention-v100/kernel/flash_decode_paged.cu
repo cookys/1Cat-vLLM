@@ -2152,6 +2152,17 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
                         KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 &&
                         std::is_same_v<PARTIAL_T, float>),
       "probability compensation is isolated to E4M3 FP32 groups");
+  // NVFP4 reads through the 32-dim unit branch of load_xqa_tc_kv_panel: runtime
+  // page size, plain layout, half partials, and none of the E4M3-only or
+  // sparse-page features. D=256 gives 8 units per row (32 uint4), which fits the
+  // 264-half (33 uint4) shared row stride unchanged.
+  static_assert(
+      KV_DTYPE != flash_v100::KV_CACHE_DTYPE_NVFP4 ||
+          (PAGE_BLOCK_SIZE == 0 && !CONTIGUOUS_HKV1_LAYOUT &&
+           !STAGE_PARTITION_PAGE_IDS && !SPARSE_PAGE4 && !COMPENSATE_P &&
+           !ROW_SEQLENS && std::is_same_v<PARTIAL_T, __half> &&
+           kGroupedVerifyHeadDim % 32 == 0),
+      "NVFP4 grouped verify: runtime page, plain layout, half partials only");
   using Traits = GroupedVerifyTraits<MAX_QUERY_TOKENS>;
   const int head_group = blockIdx.x;
   const int split_id = blockIdx.y;
@@ -4669,8 +4680,9 @@ at::Tensor flash_attention_grouped_e4m3_fp32_paged(
   return out;
 }
 
-// 1 = XQA decode read path, 2 = + paged NVFP4 -> FP16 bridge (Q1.23 P3).
-int64_t flash_attention_nvfp4_kv_version() { return 2; }
+// 1 = XQA decode read path, 2 = + paged NVFP4 -> FP16 bridge (Q1.23 P3),
+// 3 = + exact grouped DFlash2/MTP4 verifier reads NVFP4 (Q1.23 P4).
+int64_t flash_attention_nvfp4_kv_version() { return 3; }
 
 int64_t flash_attention_grouped_e4m3_fp32_precision_version() {
   // Revision 3 retains unnormalized FP32 numerators and separate max/sum.
@@ -4715,8 +4727,10 @@ at::Tensor flash_attention_grouped_verify_paged(
   TORCH_CHECK(partial_out.is_cuda() && partial_lse.is_cuda(),
               "grouped verify workspaces must be CUDA tensors");
   TORCH_CHECK(q.dtype() == torch::kFloat16, "grouped verify q must be fp16");
-  TORCH_CHECK(kv_cache_dtype == "fp8_e5m2" || kv_cache_dtype == "fp8_e4m3",
-              "grouped verify requires E5M2 or E4M3 KV");
+  TORCH_CHECK(kv_cache_dtype == "fp8_e5m2" || kv_cache_dtype == "fp8_e4m3" ||
+                  kv_cache_dtype == "nvfp4",
+              "grouped verify requires E5M2, E4M3, or NVFP4 KV");
+  const bool is_nvfp4_kv = kv_cache_dtype == "nvfp4";
   TORCH_CHECK(kv_cache_dtype != "fp8_e4m3" || (q.size(0) == 8 && one_pass),
               "E4M3 grouped verify requires q=8 and one_pass=true");
   TORCH_CHECK(kv_cache_dtype != "fp8_e4m3" ||
@@ -4753,8 +4767,23 @@ at::Tensor flash_attention_grouped_verify_paged(
   TORCH_CHECK(k_cache.dim() == 4 && v_cache.dim() == 4 &&
                   k_cache.sizes() == v_cache.sizes() && k_cache.size(1) > 0 &&
                   k_cache.size(2) == 1 &&
-                  k_cache.size(3) == kGroupedVerifyHeadDim,
-              "grouped verify KV must have shape [blocks, page, 1, 256]");
+                  k_cache.size(3) == (is_nvfp4_kv ? 144 : kGroupedVerifyHeadDim),
+              "grouped verify KV must have shape [blocks, page, 1, 256] "
+              "(NVFP4: [blocks, page, 1, 144])");
+  if (is_nvfp4_kv) {
+    // Page side = block_size*H 128-byte e2m1 rows then block_size*H 16-byte
+    // E4M3 scale rows; the 32-dim loader unit issues 16-byte data loads.
+    TORCH_CHECK(k_cache.stride(2) == 144 &&
+                    k_cache.stride(1) == k_cache.size(2) * 144 &&
+                    v_cache.stride(2) == 144 &&
+                    v_cache.stride(1) == v_cache.size(2) * 144,
+                "NVFP4 KV view must be [blocks, block_size, H, 144] with "
+                "token stride H*144 and head stride 144");
+    TORCH_CHECK(k_cache.stride(0) % 16 == 0 && v_cache.stride(0) % 16 == 0 &&
+                    reinterpret_cast<uintptr_t>(k_cache.data_ptr()) % 16 == 0 &&
+                    reinterpret_cast<uintptr_t>(v_cache.data_ptr()) % 16 == 0,
+                "NVFP4 KV pages and base pointers must be 16-byte aligned");
+  }
   TORCH_CHECK(seq_lens.dim() == 1 && seq_lens.size(0) == batch_size,
               "grouped verify seq_lens must cover every request");
   TORCH_CHECK(q.is_contiguous(),
@@ -4897,8 +4926,30 @@ at::Tensor flash_attention_grouped_verify_paged(
     }                                                                         \
   } while (0)
 
+#define DISPATCH_GROUPED_VERIFY_PARTIAL_NVFP4(MAX_QUERY_TOKENS, TWO_PASS,     \
+                                              SINGLE_QUERY)                   \
+  LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 0, SINGLE_QUERY,  \
+                                false, false,                                 \
+                                flash_v100::KV_CACHE_DTYPE_NVFP4)
+
   const bool single_query = query_len == 1;
-  if (kv_cache_dtype == "fp8_e4m3") {
+  if (is_nvfp4_kv) {
+    // Runtime page size only (the pinned 1648/3296 specialisations and the
+    // fixed interleaved layouts are E5M2 hybrid-cache shapes).
+    if (wide_query && one_pass) {
+      DISPATCH_GROUPED_VERIFY_PARTIAL_NVFP4(kGroupedVerifyQ16MaxQ, false, false);
+    } else if (wide_query) {
+      DISPATCH_GROUPED_VERIFY_PARTIAL_NVFP4(kGroupedVerifyQ16MaxQ, true, false);
+    } else if (one_pass && single_query) {
+      DISPATCH_GROUPED_VERIFY_PARTIAL_NVFP4(kGroupedVerifyQ8MaxQ, false, true);
+    } else if (one_pass) {
+      DISPATCH_GROUPED_VERIFY_PARTIAL_NVFP4(kGroupedVerifyQ8MaxQ, false, false);
+    } else if (single_query) {
+      DISPATCH_GROUPED_VERIFY_PARTIAL_NVFP4(kGroupedVerifyQ8MaxQ, true, true);
+    } else {
+      DISPATCH_GROUPED_VERIFY_PARTIAL_NVFP4(kGroupedVerifyQ8MaxQ, true, false);
+    }
+  } else if (kv_cache_dtype == "fp8_e4m3") {
     // Reuse the grouped q8 schedule and existing E4M3 vector conversion.
     // Runtime strides cover both separate and interleaved hybrid KV pages.
     LAUNCH_GROUPED_VERIFY_PARTIAL(kGroupedVerifyQ8MaxQ, false, 0, false, false,
@@ -4916,6 +4967,7 @@ at::Tensor flash_attention_grouped_verify_paged(
   } else {
     DISPATCH_GROUPED_VERIFY_PARTIAL(kGroupedVerifyQ8MaxQ, true, false);
   }
+#undef DISPATCH_GROUPED_VERIFY_PARTIAL_NVFP4
 #undef DISPATCH_GROUPED_VERIFY_PARTIAL
 #undef LAUNCH_GROUPED_VERIFY_PARTIAL
   const dim3 combine_grid(static_cast<unsigned>(query_len), kGroupedVerifyHeads,

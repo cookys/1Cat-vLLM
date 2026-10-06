@@ -3744,3 +3744,165 @@ def test_e4m3_xqa_policy_accepts_multiple_kv_heads(kv_heads, batch):
     assert mod._e4m3_batch_xqa_allowed(q)
     k = torch.empty((1, 800, kv_heads, 256), dtype=torch.uint8)
     assert mod._g6_aligned_page_partition_size_hint(q[:1], k, k, "fp8_e4m3") == 64
+
+
+def _grouped_verify_gate_case(
+    *,
+    page_size: int,
+    query_len: int,
+    num_reqs: int = 1,
+    dflash_marker: bool = True,
+    mtp_marker: bool = False,
+    kv_dtype: str = "fp8_e5m2",
+):
+    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
+
+    impl = FlashAttnV100Impl(
+        num_heads=6,
+        head_size=256,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype=kv_dtype,
+    )
+    impl.use_dflash2_grouped_verify = True
+    impl.use_dflash2_batched_grouped_verify = True
+    impl.dflash2_grouped_verify_request_major_abi_version = 1
+    impl.dflash2_grouped_verify_max_query_tokens = 16
+    impl.flash_attn_grouped_verify_paged = lambda *a, **k: None
+    total_q = query_len * num_reqs
+    attn_metadata = SimpleNamespace(
+        num_reqs=num_reqs,
+        max_query_len=query_len,
+        causal=True,
+        is_dflash_selector_target=dflash_marker,
+        is_mtp_verify_target=mtp_marker,
+        max_model_len=32768,
+        seq_lens=torch.full((num_reqs,), 2056, dtype=torch.int32),
+        block_table=torch.zeros((num_reqs, 2), dtype=torch.int32),
+    )
+    query = torch.zeros((total_q, 6, 256), dtype=torch.float16)
+    tail = 144 if kv_dtype == "nvfp4" else 256
+    key_cache = torch.zeros((2, page_size, 1, tail), dtype=torch.uint8)
+    value_cache = torch.zeros_like(key_cache)
+    return impl._dflash2_grouped_verify_allowed(
+        query, key_cache, value_cache, attn_metadata, num_query_tokens=total_q
+    )
+
+
+def test_grouped_verify_default_pages_unchanged():
+    assert _grouped_verify_gate_case(page_size=3296, query_len=8)
+    assert not _grouped_verify_gate_case(page_size=4096, query_len=8)
+    assert not _grouped_verify_gate_case(page_size=2048, query_len=8)
+
+
+def test_grouped_verify_extra_pages_env(monkeypatch):
+    monkeypatch.setenv(
+        "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_EXTRA_PAGES", "2048,4096"
+    )
+    assert _grouped_verify_gate_case(page_size=4096, query_len=8)
+    assert _grouped_verify_gate_case(page_size=2048, query_len=8)
+    assert _grouped_verify_gate_case(page_size=3296, query_len=8)
+    assert not _grouped_verify_gate_case(page_size=8192, query_len=8)
+    # q5 without the MTP marker stays rejected even for an admitted page.
+    assert not _grouped_verify_gate_case(
+        page_size=2048, query_len=5, dflash_marker=False
+    )
+    assert not _grouped_verify_gate_case(page_size=2048, query_len=5)
+
+
+def test_grouped_verify_mtp_marker(monkeypatch):
+    monkeypatch.setenv("VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_EXTRA_PAGES", "2048")
+    assert _grouped_verify_gate_case(
+        page_size=2048, query_len=5, dflash_marker=False, mtp_marker=True
+    )
+    # Batched MTP stays rejected (native batched path needs q == 8 + dflash).
+    assert not _grouped_verify_gate_case(
+        page_size=2048, query_len=5, num_reqs=4, dflash_marker=False, mtp_marker=True
+    )
+    # q == 1 is not a verify shape.
+    assert not _grouped_verify_gate_case(
+        page_size=2048, query_len=1, dflash_marker=False, mtp_marker=True
+    )
+    # Page whitelist still applies.
+    assert not _grouped_verify_gate_case(
+        page_size=4096, query_len=5, dflash_marker=False, mtp_marker=True
+    )
+
+
+def test_grouped_verify_nvfp4_gate(monkeypatch):
+    from vllm.v1.attention.backends import flash_attn_v100 as mod
+
+    monkeypatch.setenv("VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_EXTRA_PAGES", "4096")
+    monkeypatch.setattr(mod, "_grouped_verify_nvfp4_available", lambda: True)
+    # nvfp4 + probe v3 + extra page + MTP marker -> allowed (q5, single request).
+    assert _grouped_verify_gate_case(
+        page_size=4096, query_len=5, dflash_marker=False, mtp_marker=True,
+        kv_dtype="nvfp4",
+    )
+    assert _grouped_verify_gate_case(page_size=4096, query_len=8, kv_dtype="nvfp4")
+    # Page whitelist still applies.
+    assert not _grouped_verify_gate_case(page_size=2048, query_len=8, kv_dtype="nvfp4")
+    # An E5M2-shaped (256-wide) tail never passes for nvfp4 and vice versa.
+    monkeypatch.setattr(mod, "_grouped_verify_nvfp4_available", lambda: False)
+    assert not _grouped_verify_gate_case(page_size=4096, query_len=8, kv_dtype="nvfp4")
+    # E5M2 is unaffected by the nvfp4 probe.
+    assert _grouped_verify_gate_case(page_size=4096, query_len=8)
+
+
+@pytest.mark.parametrize("version, expected", [(1, False), (2, False), (3, True)])
+def test_grouped_verify_nvfp4_probe_version(monkeypatch, version, expected):
+    import sys
+    import types
+
+    from vllm.v1.attention.backends import flash_attn_v100 as mod
+
+    fake = types.ModuleType("flash_attn_v100")
+    fake.flash_attn_nvfp4_kv_available = lambda min_version=1: version >= min_version
+    monkeypatch.setitem(sys.modules, "flash_attn_v100", fake)
+    assert mod._grouped_verify_nvfp4_available() is expected
+    monkeypatch.setitem(sys.modules, "flash_attn_v100", None)  # ImportError
+    assert mod._grouped_verify_nvfp4_available() is False
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("", ()),
+        ("   ", ()),
+        (" 2048 , 4096", (2048, 4096)),
+        ("2048,,4096,", (2048, 4096)),
+    ],
+)
+def test_grouped_verify_extra_pages_parsing(monkeypatch, raw, expected):
+    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
+
+    monkeypatch.setenv("VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_EXTRA_PAGES", raw)
+    impl = FlashAttnV100Impl(
+        num_heads=6,
+        head_size=256,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="fp8_e5m2",
+    )
+    assert impl.dflash2_grouped_verify_extra_pages == expected
+
+
+@pytest.mark.parametrize("raw", ["abc", "2048,x", "0", "-4096", "20.5"])
+def test_grouped_verify_extra_pages_garbage_raises(monkeypatch, raw):
+    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
+
+    monkeypatch.setenv("VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_EXTRA_PAGES", raw)
+    with pytest.raises(ValueError, match="EXTRA_PAGES"):
+        FlashAttnV100Impl(
+            num_heads=6,
+            head_size=256,
+            scale=1.0,
+            num_kv_heads=1,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype="fp8_e5m2",
+        )

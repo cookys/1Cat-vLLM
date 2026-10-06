@@ -458,6 +458,7 @@ class FlashAttnV100Metadata(TritonAttentionMetadata):
     smallq_decode_workspace_seq_capacity_hint: int | None
     smallq_decode_partition_size_hint: int | None
     is_dflash_selector_target: bool
+    is_mtp_verify_target: bool
 
 
 def _as_flash_v100_metadata(
@@ -1322,6 +1323,16 @@ def _get_flash_grouped_verify_op():
     except ImportError:
         _flash_attn_grouped_verify_paged = None
     return _flash_attn_grouped_verify_paged
+
+
+def _grouped_verify_nvfp4_available() -> bool:
+    """True when the extension's grouped verifier reads NVFP4 KV (probe v3)."""
+    try:
+        from flash_attn_v100 import flash_attn_nvfp4_kv_available
+
+        return bool(flash_attn_nvfp4_kv_available(min_version=3))
+    except (ImportError, RuntimeError, TypeError, ValueError):
+        return False
 
 
 def _get_sm70_splitd_d256_ops():
@@ -3671,6 +3682,14 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
             and get_dflash_model_draft_tokens(spec_config) == 7
             and selector_engine
         )
+        # Opt-in (plan 072 A2): native-MTP target verification may use the
+        # exact grouped verifier for a single request.
+        self._is_mtp_verify_target = bool(
+            spec_config is not None
+            and getattr(spec_config, "method", None) == "mtp"
+            and not self._is_speculative_draft_model
+            and envs.VLLM_FLASH_V100_GROUPED_VERIFY_MTP
+        )
         self._use_sm70_dflash2_fused_smallq_metadata = bool(
             envs.VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA
             and self.device.type == "cuda"
@@ -3768,6 +3787,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         )
         flash_metadata.causal = common_attn_metadata.causal
         flash_metadata.is_dflash_selector_target = self._is_dflash_selector_target
+        flash_metadata.is_mtp_verify_target = self._is_mtp_verify_target
         flash_metadata.max_model_len = self.vllm_config.model_config.max_model_len
         flash_metadata.flash_v100_cudagraph_capture = False
         flash_metadata.flash_v100_batch_context_routing = (
@@ -4904,6 +4924,32 @@ def prepare_dflash2_smallq_group_metadata(
     return prepared, descriptor
 
 
+def _parse_grouped_verify_extra_pages(raw: str) -> tuple[int, ...]:
+    """Parse VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_EXTRA_PAGES.
+
+    Comma-separated positive integers; blank entries are ignored.
+    """
+    pages: list[int] = []
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            value = int(part)
+        except ValueError:
+            raise ValueError(
+                "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_EXTRA_PAGES must be "
+                f"comma-separated positive integers, got {raw!r}"
+            ) from None
+        if value < 1:
+            raise ValueError(
+                "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_EXTRA_PAGES must be "
+                f"comma-separated positive integers, got {raw!r}"
+            )
+        pages.append(value)
+    return tuple(pages)
+
+
 class FlashAttnV100Impl(TritonAttentionImpl):
     """Flash Attention V100 implementation with explicit fallback policy."""
 
@@ -5132,6 +5178,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             raise ValueError(
                 "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN must be positive"
             )
+        self.dflash2_grouped_verify_extra_pages = (
+            _parse_grouped_verify_extra_pages(
+                envs.VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_EXTRA_PAGES
+            )
+        )
         decode_scalar_paged_env = os.getenv("VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED")
         self.use_decode_scalar_paged = decode_scalar_paged_env != "0"
         self.compare_bhmd_out_dir = os.getenv("VLLM_FLASH_V100_COMPARE_BHMD_OUT_DIR")
@@ -6077,9 +6128,17 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 num_query_tokens if num_reqs == 1 else 0,
             )
         )
+        is_nvfp4_kv = self.kv_cache_dtype == "nvfp4"
+        # Opt-in marker (plan 072 A2) set by the metadata builder.
+        is_mtp_verify_target = bool(
+            getattr(attn_metadata, "is_mtp_verify_target", False)
+        )
         single_request_shape = bool(
             num_reqs == 1
-            and num_query_tokens in (8, 16)
+            and (
+                num_query_tokens in (8, 16)
+                or (is_mtp_verify_target and 2 <= num_query_tokens <= 16)
+            )
             and num_query_tokens <= self.dflash2_grouped_verify_max_query_tokens
         )
         batched_request_shape = bool(
@@ -6093,7 +6152,10 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             self.use_dflash2_grouped_verify
             and (single_request_shape or batched_request_shape)
             and self.flash_attn_grouped_verify_paged is not None
-            and getattr(attn_metadata, "is_dflash_selector_target", False)
+            and (
+                getattr(attn_metadata, "is_dflash_selector_target", False)
+                or (is_mtp_verify_target and num_reqs == 1)
+            )
             and getattr(attn_metadata, "max_model_len", 0)
             >= self.dflash2_grouped_verify_min_model_len
             and getattr(attn_metadata, "causal", True)
@@ -6108,8 +6170,12 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             # q15 LABD increases the aligned hybrid-cache page from the
             # block-8 service's 1648/3296 layout to 1728/3456. The grouped
             # operator's runtime-stride implementation is exact for both.
-            and key_cache.shape[1] in (1648, 1728, 3296, 3456)
-            and tuple(key_cache.shape[2:]) == (1, 256)
+            # Extra pages from VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_EXTRA_PAGES
+            # run the same native runtime-stride path as 1728/3456
+            # (plan 072 A2, 2026-10-06).
+            and key_cache.shape[1]
+            in (1648, 1728, 3296, 3456, *self.dflash2_grouped_verify_extra_pages)
+            and tuple(key_cache.shape[2:]) == (1, 144 if is_nvfp4_kv else 256)
             and tuple(value_cache.shape) == tuple(key_cache.shape)
             and key_cache.dtype == torch.uint8
             and value_cache.dtype == torch.uint8
@@ -6118,7 +6184,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             # This legacy verifier stores normalized partials in FP16.
             # E4M3 must reach the repaired FP32 path below, including when
             # the old native entry advertises E4M3 byte-format support.
-            and self.kv_cache_dtype == "fp8_e5m2"
+            # NVFP4 (Q1.23 P4) also reads fp16 partials and needs probe v3.
+            and (
+                self.kv_cache_dtype == "fp8_e5m2"
+                or (is_nvfp4_kv and _grouped_verify_nvfp4_available())
+            )
             and block_table is not None
             and block_table.ndim == 2
             and block_table.shape[0] == num_reqs
@@ -6143,7 +6213,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 "causal=%s window=%s reqs=%d max_q=%d actual=%d "
                 "native_max_q=%d q=%s/%s "
                 "k=%s/%s v=%s/%s kv_dtype=%s block_table=%s/%s "
-                "seq_lens=%s/%s.",
+                "seq_lens=%s/%s extra_pages=%s mtp_verify=%s.",
                 self.flash_attn_grouped_verify_paged is not None,
                 getattr(attn_metadata, "is_dflash_selector_target", False),
                 getattr(attn_metadata, "max_model_len", None),
@@ -6165,6 +6235,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 None if block_table is None else block_table.dtype,
                 None if seq_lens is None else tuple(seq_lens.shape),
                 None if seq_lens is None else seq_lens.dtype,
+                self.dflash2_grouped_verify_extra_pages,
+                is_mtp_verify_target,
             )
             _logged_prefill_smallq_grouped_verify_gate = True
         return allowed
