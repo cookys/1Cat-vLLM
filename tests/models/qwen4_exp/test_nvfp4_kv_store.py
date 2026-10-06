@@ -462,3 +462,17 @@ def test_the_in_kernel_e2m1_encoder_matches_torch_on_every_tie_and_a_dense_sweep
     x = torch.cat([probes, -probes])
     got = nvt._probe_encoder(x.to(DEVICE), "e2m1").cpu()
     assert torch.equal(got, nv.e2m1_encode(x).to(torch.int32))
+
+
+@pytest.mark.parametrize("k_scale", [0.02, 0.5, 1.0, 7.0, 64.0])
+@pytest.mark.parametrize("v_scale", [0.5, 7.0])
+def test_a_layer_scale_sweep_matches_the_reference_bytes(k_scale, v_scale) -> None:
+    # Regression for the GPU-only mismatch at (7.0, 0.5): the kernel must use
+    # IEEE reciprocals (tl.math.div_rn), not div.full.f32, to match the
+    # torch reference. On the interpreter this pins the sweep; on a GPU it
+    # also exercises the lowering.
+    key, value = _rows((48, 2, 256), 11, 4.0), _rows((48, 2, 256), 12, 4.0)
+    reference, actual = _store_both(
+        key, value, _slots(48), k_scale=_scalar(k_scale), v_scale=_scalar(v_scale)
+    )
+    assert torch.equal(reference, actual)

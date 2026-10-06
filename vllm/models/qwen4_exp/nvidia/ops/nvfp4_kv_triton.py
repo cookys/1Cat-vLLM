@@ -768,12 +768,16 @@ def _store_nvfp4_kernel(
     # The SM100 store's order: SFScaleVal = 1 / k_scale;
     # SFValue = SFScaleVal * (vecMax * (1 / 6)); outputScale = 1 / (SFValue_q * k).
     layer_scale = tl.load(layer_scale_ptr)
-    scale_inverse = 1.0 / layer_scale
+    # tl.math.div_rn is IEEE round-to-nearest division. A plain ``/`` lowers to
+    # div.full.f32 on CUDA (up to 2 ulp), which flips boundary bytes.
+    scale_inverse = tl.math.div_rn(1.0, layer_scale)
     amax = tl.max(tl.maximum(tl.abs(even), tl.abs(odd)), axis=1)
     block_code = _e4m3_encode_nonneg(scale_inverse * (amax * 0.16666667163372040))
     block_value = fp8_e4m3fn_bits_to_fp32(block_code)
     out_scale = tl.where(
-        block_value > 0.0, 1.0 / (block_value * (1.0 / scale_inverse)), 0.0
+        block_value > 0.0,
+        tl.math.div_rn(1.0, block_value * tl.math.div_rn(1.0, scale_inverse)),
+        0.0,
     )[:, None]
     low = _e2m1_code(even * out_scale)  # the even element is the low nibble
     high = _e2m1_code(odd * out_scale)
