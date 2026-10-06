@@ -43,6 +43,14 @@ def impl():
     obj.sinks = None
     obj.sliding_window = (-1, -1)
     obj.prefix_anchored_decode_window = None
+    # Real __init__ always sets these; default = grouped verifier disabled.
+    obj.use_dflash2_grouped_verify = False
+    obj.use_dflash2_batched_grouped_verify = False
+    obj.dflash2_grouped_verify_request_major_abi_version = 0
+    obj.dflash2_grouped_verify_max_query_tokens = 16
+    obj.dflash2_grouped_verify_min_model_len = 0
+    obj.dflash2_grouped_verify_extra_pages = ()
+    obj.flash_attn_grouped_verify_paged = None
     return obj
 
 
@@ -102,12 +110,85 @@ def test_capability_probe_not_just_dtype_or_python_symbol(monkeypatch, available
             f._require_nvfp4_xqa_reader()
 
 
-def test_legacy_grouped_never_sees_nvfp4():
+def _grouped_impl(extra_pages=(4096,)):
     obj = impl()
-    assert (
-        obj._dflash2_grouped_verify_allowed(None, None, None, None, num_query_tokens=8)
-        is False
+    obj.scale = 0.0625
+    obj.use_dflash2_grouped_verify = True
+    obj.use_dflash2_batched_grouped_verify = False
+    obj.dflash2_grouped_verify_request_major_abi_version = 0
+    obj.dflash2_grouped_verify_max_query_tokens = 16
+    obj.dflash2_grouped_verify_min_model_len = 0
+    obj.dflash2_grouped_verify_extra_pages = tuple(extra_pages)
+    obj.flash_attn_grouped_verify_paged = Mock()
+    obj._call_dflash2_grouped_verify = Mock()
+    obj._flash_v100_small_query_prefill_as_decode = Mock()
+    return obj
+
+
+def _grouped_case(obj, page=4096, q_len=5, mtp=True):
+    q = torch.zeros(q_len, 6, 256, dtype=torch.float16)
+    out = torch.empty_like(q)
+    cache = torch.empty(2, 2, page, 1, 144, dtype=torch.uint8)
+    meta = metadata([q_len])
+    meta.num_reqs = 1
+    meta.max_model_len = 32768
+    meta.is_mtp_verify_target = mtp
+    obj._call_dflash2_grouped_verify.return_value = out
+    obj._flash_v100_small_query_prefill_as_decode.return_value = out
+    layer = NS(_k_scale_float=0.5, _v_scale_float=2.0)
+    assert obj.forward(layer, q, q, q, cache, meta, out) is out
+
+
+def _fake_probe(monkeypatch, version):
+    package = NS(
+        flash_attn_nvfp4_kv_available=lambda min_version=1: version >= min_version
     )
+    monkeypatch.setitem(sys.modules, "flash_attn_v100", package)
+
+
+def test_grouped_gate_rejects_nvfp4_without_probe_v3(monkeypatch):
+    _fake_probe(monkeypatch, 2)
+    obj = _grouped_impl()
+    q = torch.zeros(5, 6, 256, dtype=torch.float16)
+    cache = torch.empty(2, 2, 4096, 1, 144, dtype=torch.uint8)
+    meta = metadata([5])
+    meta.num_reqs = 1
+    meta.max_model_len = 32768
+    meta.is_mtp_verify_target = True
+    assert not obj._dflash2_grouped_verify_allowed(
+        q, cache[:, 0], cache[:, 1], meta, num_query_tokens=5
+    )
+
+
+def test_nvfp4_verify_takes_grouped_when_gate_admits(monkeypatch):
+    _fake_probe(monkeypatch, 3)
+    obj = _grouped_impl()
+    _grouped_case(obj)
+    obj._call_dflash2_grouped_verify.assert_called_once()
+    obj._flash_v100_small_query_prefill_as_decode.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "version,page,mtp",
+    [(2, 4096, True), (3, 2048, True), (3, 4096, False)],
+)
+def test_nvfp4_verify_falls_back_to_per_row_when_gate_rejects(
+    monkeypatch, version, page, mtp
+):
+    _fake_probe(monkeypatch, version)
+    obj = _grouped_impl()
+    _grouped_case(obj, page=page, mtp=mtp)
+    obj._call_dflash2_grouped_verify.assert_not_called()
+    obj._flash_v100_small_query_prefill_as_decode.assert_called_once()
+
+
+def test_nvfp4_verify_grouped_disabled_uses_per_row(monkeypatch):
+    _fake_probe(monkeypatch, 3)
+    obj = _grouped_impl()
+    obj.use_dflash2_grouped_verify = False
+    _grouped_case(obj)
+    obj._call_dflash2_grouped_verify.assert_not_called()
+    obj._flash_v100_small_query_prefill_as_decode.assert_called_once()
 
 
 @pytest.mark.parametrize("q_per_kv", [4, 6, 8])

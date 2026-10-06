@@ -5813,8 +5813,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         output_scale,
         output_block_scale,
     ):
-        """Packed-cache route; no FP8/Triton/grouped fallback is permitted.
+        """Packed-cache route; no FP8/Triton fallback is permitted.
 
+        The DFlash2/MTP grouped verifier (native probe version >=3) is taken
+        only when ``_dflash2_grouped_verify_allowed`` admits the shape; any
+        rejection falls back to the per-row XQA path (Q1.23 integration).
         Small causal query spans reuse graph-stable per-row metadata.
         Version >=2 enables an eager FP16 prefix bridge. Its bounded workspace
         is reserved during profile_run, before the remaining KV pool is sized.
@@ -5876,6 +5879,29 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         # The persistent smallq path already consumes the GPU metadata; the
         # eager fallback must use it as well when constructing per-row lengths.
         seq_lens = attn_metadata.seq_lens
+        if attn_metadata.max_query_len <= 16 and self.use_dflash2_grouped_verify:
+            num_query_tokens = min(
+                int(attn_metadata.num_actual_tokens),
+                int(query.shape[0]),
+                int(output.shape[0]),
+            )
+            if self._dflash2_grouped_verify_allowed(
+                query,
+                key_cache,
+                value_cache,
+                attn_metadata,
+                num_query_tokens=num_query_tokens,
+            ):
+                _record_route("nvfp4_verify_grouped")
+                self._call_dflash2_grouped_verify(
+                    layer,
+                    query[:num_query_tokens],
+                    key_cache,
+                    value_cache,
+                    attn_metadata,
+                    out=output[:num_query_tokens],
+                )
+                return output
         if attn_metadata.max_query_len <= 8:
             _record_route("nvfp4_verify_per_row")
             return self._flash_v100_small_query_prefill_as_decode(
@@ -6110,8 +6136,6 @@ class FlashAttnV100Impl(TritonAttentionImpl):
     ) -> bool:
         """Gate the verifier on its hardware and tensor-layout contract."""
         global _logged_prefill_smallq_grouped_verify_gate
-        if self.kv_cache_dtype == "nvfp4":
-            return False
         block_table = getattr(attn_metadata, "block_table", None)
         seq_lens = getattr(attn_metadata, "seq_lens", None)
         num_reqs = int(
