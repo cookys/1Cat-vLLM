@@ -3755,17 +3755,26 @@ def _grouped_verify_gate_case(
     mtp_marker: bool = False,
     kv_dtype: str = "fp8_e5m2",
 ):
+    from unittest import mock
+
     from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
 
-    impl = FlashAttnV100Impl(
-        num_heads=6,
-        head_size=256,
-        scale=1.0,
-        num_kv_heads=1,
-        alibi_slopes=None,
-        sliding_window=None,
-        kv_cache_dtype=kv_dtype,
+    # The nvfp4 constructor sizes its prefill-bridge workspace from the current
+    # vLLM config (Astra's Python side); give it a minimal stand-in.
+    fake_config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=16),
+        model_config=SimpleNamespace(max_model_len=32768),
     )
+    with mock.patch("vllm.config.get_current_vllm_config", lambda: fake_config):
+        impl = FlashAttnV100Impl(
+            num_heads=6,
+            head_size=256,
+            scale=1.0,
+            num_kv_heads=1,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype=kv_dtype,
+        )
     impl.use_dflash2_grouped_verify = True
     impl.use_dflash2_batched_grouped_verify = True
     impl.dflash2_grouped_verify_request_major_abi_version = 1
