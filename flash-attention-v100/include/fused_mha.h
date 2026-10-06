@@ -68,6 +68,7 @@ at::Tensor flash_attention_grouped_e4m3_fp32_paged(
     float scale, float k_scale, float v_scale);
 
 int64_t flash_attention_grouped_e4m3_fp32_precision_version();
+int64_t flash_attention_nvfp4_kv_version();
 
 int64_t flash_attention_tp2_e4m3_scalar_fast_version();
 int64_t flash_attention_tp2_e4m3_scalar_fast_launch_count();

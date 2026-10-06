@@ -1135,6 +1135,17 @@ def flash_attn_grouped_verify_request_major_abi_version() -> int:
     return 0 if get_abi_version is None else int(get_abi_version())
 
 
+def flash_attn_nvfp4_kv_available(min_version: int = 1) -> bool:
+    """True when the extension has the NVFP4 (e2m1 + E4M3 block scale) KV read
+    path in the XQA 256-wide decode kernel."""
+    version = getattr(flash_attn_v100_cuda, "nvfp4_kv_version", None)
+    return (
+        hasattr(flash_attn_v100_cuda, "decode_paged_xqa_fwd")
+        and callable(version)
+        and int(version()) >= min_version
+    )
+
+
 def flash_attn_grouped_e4m3_fp32_available(min_version: int = 4) -> bool:
     version = getattr(flash_attn_v100_cuda, "grouped_e4m3_fp32_precision_version", None)
     return (
@@ -1338,7 +1349,7 @@ def flash_attn_decode_paged_xqa(
             active_num_partitions=active_num_partitions,
             partial_dtype=(
                 torch.float32
-                if kv_cache_dtype in ("fp8", "fp8_e4m3")
+                if kv_cache_dtype in ("fp8", "fp8_e4m3", "nvfp4")
                 else torch.float16
             ),
         )
@@ -1897,6 +1908,7 @@ __all__ = [
     "flash_attn_grouped_verify_paged",
     "flash_attn_grouped_e4m3_fp32_paged",
     "flash_attn_grouped_e4m3_fp32_available",
+    "flash_attn_nvfp4_kv_available",
     "flash_attn_decode_paged_wmma",
     "flash_attn_decode_qk_scores",
     "flash_attn_turboquant_decode_paged",

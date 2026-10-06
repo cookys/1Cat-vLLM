@@ -9,6 +9,7 @@ namespace flash_v100 {
 constexpr int KV_CACHE_DTYPE_FP16 = 0;
 constexpr int KV_CACHE_DTYPE_FP8_E4M3 = 1;
 constexpr int KV_CACHE_DTYPE_FP8_E5M2 = 2;
+constexpr int KV_CACHE_DTYPE_NVFP4 = 3;
 
 __device__ __forceinline__ float quiet_nan_f() {
   return __int_as_float(0x7fffffff);

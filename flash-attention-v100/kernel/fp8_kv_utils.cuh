@@ -9,6 +9,9 @@ namespace flash_v100 {
 constexpr int KV_CACHE_DTYPE_FP16 = 0;
 constexpr int KV_CACHE_DTYPE_FP8_E4M3 = 1;
 constexpr int KV_CACHE_DTYPE_FP8_E5M2 = 2;
+// NVFP4 KV: e2m1 data (2 values per byte, low nibble = even element) with one
+// E4M3FN scale byte per 16 values; page layout [data | scales] per side.
+constexpr int KV_CACHE_DTYPE_NVFP4 = 3;
 
 __device__ __forceinline__ float quiet_nan_f() {
   return __int_as_float(0x7fffffff);
@@ -76,6 +79,36 @@ __device__ __forceinline__ __half2 load_fp8_e5m2_half2_unscaled(
 
 __device__ __forceinline__ float fp8_e5m2_to_float(uint8_t raw) {
   return __half2float(fp8_e5m2_to_half(raw));
+}
+
+// e2m1 code: sign = bit 3, exp = bits 2..1, mant = bit 0.
+// value = exp == 0 ? mant * 0.5 : (1 + mant * 0.5) * 2^(exp - 1)
+// i.e. the grid {0, .5, 1, 1.5, 2, 3, 4, 6}. Built as exact fp16 bits.
+__device__ __forceinline__ float nvfp4_e2m1_to_float(const uint32_t nib) {
+  const uint32_t mag = nib & 7u;
+  const uint32_t bits =
+      mag < 2u ? (mag ? 0x3800u : 0u)
+               : ((((mag >> 1) + 14u) << 10) | ((mag & 1u) << 9));
+  const float value = __half2float(__ushort_as_half(static_cast<unsigned short>(bits)));
+  return (nib & 8u) ? -value : value;
+}
+
+// Decode 8 consecutive e2m1 values (4 data bytes, element 2j in the low nibble
+// of byte j) that share one E4M3FN block scale into 8 fp16 values. Each product
+// (<= 2 mantissa bits x <= 4 mantissa bits, magnitude in [2^-10, 2688]) is
+// exactly representable in fp16, so __float2half_rn is lossless.
+__device__ __forceinline__ uint4 nvfp4_data4_to_half8(const uint32_t data,
+                                                      const float scale) {
+  uint32_t out[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const uint32_t byte = (data >> (8 * j)) & 0xffu;
+    const __half lo = __float2half_rn(nvfp4_e2m1_to_float(byte & 0xfu) * scale);
+    const __half hi = __float2half_rn(nvfp4_e2m1_to_float(byte >> 4) * scale);
+    out[j] = static_cast<uint32_t>(__half_as_ushort(lo)) |
+             (static_cast<uint32_t>(__half_as_ushort(hi)) << 16);
+  }
+  return make_uint4(out[0], out[1], out[2], out[3]);
 }
 
 template <int KV_DTYPE, bool E4M3_BITS = false>

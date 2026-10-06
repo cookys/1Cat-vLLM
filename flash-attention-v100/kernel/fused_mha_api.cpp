@@ -30,6 +30,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("grouped_e4m3_fp32_precision_version",
         &flash_attention_grouped_e4m3_fp32_precision_version,
         "E4M3 grouped FP32 numerical implementation revision");
+  m.def("nvfp4_kv_version", &flash_attention_nvfp4_kv_version,
+        "Capability revision of the NVFP4 KV read path in XQA decode");
   m.def("tp2_e4m3_scalar_fast_version",
         &flash_attention_tp2_e4m3_scalar_fast_version,
         "Capability for the opt-in TP2 E4M3 scalar decoder");

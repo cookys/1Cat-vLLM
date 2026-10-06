@@ -34,6 +34,9 @@ int kv_cache_dtype_code_from_string(const std::string& kv_cache_dtype) {
   if (kv_cache_dtype == "fp8_e5m2") {
     return flash_v100::KV_CACHE_DTYPE_FP8_E5M2;
   }
+  if (kv_cache_dtype == "nvfp4") {
+    return flash_v100::KV_CACHE_DTYPE_NVFP4;
+  }
   return -1;
 }
 
@@ -805,6 +808,26 @@ __device__ __forceinline__ uint4 load_xqa_tc_kv_vector(
   if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16) {
     const uint4* cache_vec = reinterpret_cast<const uint4*>(kv_cache);
     return __ldg(&cache_vec[physical_offset / 8 + vec_col]);
+  } else if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_NVFP4) {
+    // Cache view is uint8 [blocks, block_size, H, 144]; physically each page
+    // side holds block_size*H 128-byte e2m1 rows followed by block_size*H
+    // 16-byte E4M3FN scale rows. token_stride = H * 144 gives H.
+    static_assert(!CONTIGUOUS_HKV1_LAYOUT && !E4M3_SHARED_LUT,
+                  "NVFP4 KV does not use the fixed-stride or LUT layouts");
+    const int64_t num_kv_heads = token_stride / 144;
+    const int64_t page_base = static_cast<int64_t>(physical_block) * block_stride;
+    const int64_t row_index =
+        static_cast<int64_t>(block_offset) * num_kv_heads + kv_head_idx;
+    const int64_t dims = static_cast<int64_t>(panel_offset) + vec_col * 8;
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(kv_cache);
+    const uint32_t data = __ldg(reinterpret_cast<const uint32_t*>(
+        bytes + page_base + row_index * 128 + (dims >> 1)));
+    const uint8_t scale_byte = __ldg(
+        bytes + page_base +
+        static_cast<int64_t>(block_size) * num_kv_heads * 128 +
+        row_index * 16 + (dims >> 4));
+    return flash_v100::nvfp4_data4_to_half8(
+        data, flash_v100::fp8_e4m3fn_to_float(scale_byte));
   } else {
     static_assert(KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 ||
                       KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2,
@@ -1316,6 +1339,10 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
   static_assert(
       !E4M3_SHARED_LUT || KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3,
       "The shared conversion LUT is only valid for E4M3 KV");
+  static_assert(KV_DTYPE != flash_v100::KV_CACHE_DTYPE_NVFP4 ||
+                    (!CONTIGUOUS_HKV1_LAYOUT && !FP8_PAIR_LOAD &&
+                     !E4M3_SHARED_LUT && std::is_same_v<PARTIAL_T, float>),
+                "NVFP4 KV uses the plain loader and fp32 partial outputs");
   const int batch_idx = blockIdx.x;
   const int kv_head_idx = blockIdx.y;
   const int partition_idx = blockIdx.z;
@@ -3702,8 +3729,9 @@ template <int PARTITION_SIZE, int GROUP_SIZE, bool PADDED_SMEM,
           bool PARTITION_PAGE_IDS = false, bool FP8_PAIR_LOAD = false,
           int KV_DTYPE_OVERRIDE = -1, bool E4M3_SHARED_LUT = false,
           typename PARTIAL_T = std::conditional_t<
-              KV_DTYPE_OVERRIDE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3, float,
-              __half>>
+              KV_DTYPE_OVERRIDE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 ||
+                  KV_DTYPE_OVERRIDE == flash_v100::KV_CACHE_DTYPE_NVFP4,
+              float, __half>>
 void launch_flash_attention_decode_paged_xqa_tc_256_wide(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
     at::Tensor& out, const at::Tensor& block_table, const at::Tensor& seq_lens,
@@ -3768,7 +3796,12 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
             route_seq_len_end, route_seq_len_final);                           \
   } while (0)
 
-  if constexpr (KV_DTYPE_OVERRIDE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3) {
+  if constexpr (KV_DTYPE_OVERRIDE == flash_v100::KV_CACHE_DTYPE_NVFP4) {
+    TORCH_CHECK(k_cache.scalar_type() == at::kByte,
+                "NVFP4 XQA requires uint8 KV cache");
+    LAUNCH_XQA_PARTITION(flash_v100::KV_CACHE_DTYPE_NVFP4);
+  } else if constexpr (KV_DTYPE_OVERRIDE ==
+                       flash_v100::KV_CACHE_DTYPE_FP8_E4M3) {
     static_assert(!(FP8_PAIR_LOAD && E4M3_SHARED_LUT),
                   "Paired E4M3 conversion and the shared LUT are exclusive");
     TORCH_CHECK(k_cache.scalar_type() == at::kByte,
@@ -4570,6 +4603,8 @@ at::Tensor flash_attention_grouped_e4m3_fp32_paged(
   return out;
 }
 
+int64_t flash_attention_nvfp4_kv_version() { return 1; }
+
 int64_t flash_attention_grouped_e4m3_fp32_precision_version() {
   // Revision 3 retains unnormalized FP32 numerators and separate max/sum.
   // Older normalized-partial/LSE workspaces are not ABI-compatible.
@@ -4970,6 +5005,8 @@ at::Tensor flash_attention_decode_paged(
   const int kv_dtype_code = kv_cache_dtype_code_from_string(kv_cache_dtype);
   TORCH_CHECK(kv_dtype_code >= 0,
               "Unsupported kv_cache_dtype: ", kv_cache_dtype);
+  TORCH_CHECK(kv_dtype_code != flash_v100::KV_CACHE_DTYPE_NVFP4,
+              "nvfp4 KV is only supported by the XQA 256-wide decode entry");
   if (kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16) {
     TORCH_CHECK(k_cache.dtype() == torch::kFloat16, "k_cache must be fp16");
     TORCH_CHECK(v_cache.dtype() == torch::kFloat16, "v_cache must be fp16");
@@ -5183,9 +5220,10 @@ at::Tensor flash_attention_decode_paged_xqa(
   const int kv_dtype_code = kv_cache_dtype_code_from_string(kv_cache_dtype);
   TORCH_CHECK(kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16 ||
                   kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 ||
-                  kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E5M2,
-              "XQA decode supports fp16, fp8_e4m3, and fp8_e5m2 KV cache "
-              "only");
+                  kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E5M2 ||
+                  kv_dtype_code == flash_v100::KV_CACHE_DTYPE_NVFP4,
+              "XQA decode supports fp16, fp8_e4m3, fp8_e5m2, and nvfp4 KV "
+              "cache only");
   if (kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16) {
     TORCH_CHECK(k_cache.dtype() == torch::kFloat16 &&
                     v_cache.dtype() == torch::kFloat16,
@@ -5221,8 +5259,28 @@ at::Tensor flash_attention_decode_paged_xqa(
   TORCH_CHECK(q.size(0) <= seq_lens.size(0),
               "seq_lens batch size must cover q batch size");
   TORCH_CHECK(k_cache.sizes() == v_cache.sizes(), "K/V cache shape mismatch");
-  TORCH_CHECK(k_cache.size(3) == q.size(2), "KV head_dim mismatch");
+  const bool is_nvfp4_kv = kv_dtype_code == flash_v100::KV_CACHE_DTYPE_NVFP4;
+  // NVFP4 views a page side as [block_size, H, 144] bytes: 128 e2m1 data
+  // bytes + 16 E4M3 scale bytes per (token, head), stored as a data region
+  // followed by a scale region (144 is a logical size, not a row stride).
+  TORCH_CHECK(k_cache.size(3) == (is_nvfp4_kv ? 144 : q.size(2)),
+              "KV head_dim mismatch");
   TORCH_CHECK(q.size(2) == 256, "XQA decode supports head_dim=256 only");
+  if (is_nvfp4_kv) {
+    TORCH_CHECK(k_cache.stride(2) == 144 &&
+                    k_cache.stride(1) == k_cache.size(2) * 144 &&
+                    v_cache.stride(2) == 144 &&
+                    v_cache.stride(1) == v_cache.size(2) * 144,
+                "NVFP4 KV view must be [blocks, block_size, H, 144] with "
+                "token stride H*144 and head stride 144");
+    TORCH_CHECK(k_cache.stride(0) % 4 == 0 && v_cache.stride(0) % 4 == 0 &&
+                    reinterpret_cast<uintptr_t>(k_cache.data_ptr()) % 4 == 0 &&
+                    reinterpret_cast<uintptr_t>(v_cache.data_ptr()) % 4 == 0,
+                "NVFP4 KV pages and base pointers must be 4-byte aligned");
+    TORCH_CHECK(partition_size == 256 || partition_size == 512 ||
+                    partition_size == 1024,
+                "NVFP4 XQA supports partition_size 256, 512, or 1024");
+  }
   const int num_heads_q = q.size(1);
   const int num_heads_kv = k_cache.size(2);
   TORCH_CHECK(num_heads_kv > 0 && num_heads_q % num_heads_kv == 0,
@@ -5239,10 +5297,12 @@ at::Tensor flash_attention_decode_paged_xqa(
   TORCH_CHECK(launch_num_partitions > 0,
               "launch_num_partitions must be positive");
   const auto expected_partial_dtype =
-      kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 ? torch::kFloat32
-                                                           : torch::kFloat16;
-  TORCH_CHECK(tmp_out.dtype() == expected_partial_dtype,
-              "XQA decode tmp_out must be fp32 for E4M3 KV and fp16 otherwise");
+      (kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 || is_nvfp4_kv)
+          ? torch::kFloat32
+          : torch::kFloat16;
+  TORCH_CHECK(
+      tmp_out.dtype() == expected_partial_dtype,
+      "XQA decode tmp_out must be fp32 for E4M3/NVFP4 KV and fp16 otherwise");
   TORCH_CHECK(tmp_out.size(0) >= q.size(0) && tmp_out.size(1) >= q.size(1) &&
                   tmp_out.size(2) >= launch_num_partitions &&
                   tmp_out.size(3) == q.size(2),
@@ -5262,6 +5322,40 @@ at::Tensor flash_attention_decode_paged_xqa(
   TORCH_CHECK(out.sizes() == q.sizes(), "out must have same shape as q");
   TORCH_CHECK(out.stride(-1) == 1, "out last dim must be contiguous");
   auto stream = at::cuda::getCurrentCUDAStream().stream();
+  if (is_nvfp4_kv) {
+    // First version: the plain 256-wide route only (no dual-CTA, wave
+    // reducer, aligned-page LUT, or fp8 pair-load routes; those are
+    // E4M3/E5M2-only and never reached from here).
+#define LAUNCH_NVFP4_XQA(GROUP_SIZE, PARTITION)                                \
+  launch_flash_attention_decode_paged_xqa_tc_256_wide<                         \
+      PARTITION, GROUP_SIZE, false, kXQATC256WideThreads, 1, 0, false, false,  \
+      kXQARouteAllSeqLens, false, false, false,                                \
+      flash_v100::KV_CACHE_DTYPE_NVFP4>(                                       \
+      q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,    \
+      exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,        \
+      launch_num_partitions, false, 8, stream)
+#define DISPATCH_NVFP4_PARTITION(GROUP_SIZE)                                   \
+  do {                                                                         \
+    if (partition_size == 256) {                                               \
+      LAUNCH_NVFP4_XQA(GROUP_SIZE, 256);                                       \
+    } else if (partition_size == 512) {                                        \
+      LAUNCH_NVFP4_XQA(GROUP_SIZE, 512);                                       \
+    } else {                                                                   \
+      LAUNCH_NVFP4_XQA(GROUP_SIZE, 1024);                                      \
+    }                                                                          \
+  } while (0)
+    if (q_per_kv == 4) {
+      DISPATCH_NVFP4_PARTITION(4);
+    } else if (q_per_kv == 6) {
+      DISPATCH_NVFP4_PARTITION(6);
+    } else {
+      DISPATCH_NVFP4_PARTITION(8);
+    }
+#undef DISPATCH_NVFP4_PARTITION
+#undef LAUNCH_NVFP4_XQA
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+  }
   if (kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E4M3) {
     const bool e4m3_batch_allowed = q.size(0) > 1 && xqa_e4m3_batch_enabled();
     const bool e4m3_aligned_page =
@@ -6247,6 +6341,8 @@ at::Tensor flash_attention_decode_qk_scores(
   const int kv_dtype_code = kv_cache_dtype_code_from_string(kv_cache_dtype);
   TORCH_CHECK(kv_dtype_code >= 0,
               "Unsupported kv_cache_dtype: ", kv_cache_dtype);
+  TORCH_CHECK(kv_dtype_code != flash_v100::KV_CACHE_DTYPE_NVFP4,
+              "nvfp4 KV is only supported by the XQA 256-wide decode entry");
   if (kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16) {
     TORCH_CHECK(k_cache.dtype() == torch::kFloat16, "k_cache must be fp16");
   } else {
