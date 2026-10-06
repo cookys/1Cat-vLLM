@@ -1775,7 +1775,12 @@ def test_a_batch_over_the_reference_limit_runs_end_to_end_and_says_how_many_rows
     assert len(checked) < 9
     assert nvfp4["gather"]["elements"] == 2 * len(checked) * 16 * 256
     assert nvfp4["gather"]["different"] == 0
-    assert nvfp4["zero_fill"]["ok"]
+    assert nvfp4["zero_fill"] == {
+        "ok": True,
+        "gather_zeros": True,
+        "empty_rows": True,
+        "decode_identical": True,
+    }
     verdict = chk.compute_verdict(results)
     assert verdict["GATHER_MATCHES_REFERENCE"] == "YES"
     assert verdict["ZERO_FILL_OK"] == "YES"
@@ -1795,7 +1800,14 @@ def test_a_batch_over_the_reference_limit_runs_end_to_end_and_says_how_many_rows
 
 # ------------------------------------ the 5- and 64-row controls did not move
 GOLDEN = Path(__file__).parent / "data" / "kernel_check_017cbeb88_golden.json"
-NEW_KEYS = {"ref_rows", "host_mem_est"}
+NEW_KEYS = {
+    "ref_rows",
+    "host_mem_est",
+    # zero_fill gained its three parts next to the existing ``ok`` (plan 071 待修 22)
+    "gather_zeros",
+    "empty_rows",
+    "decode_identical",
+}
 
 
 def _same(path, got, want):
@@ -1990,3 +2002,117 @@ def test_a_clean_run_prints_context_poisoned_no(chk):
 def test_the_continue_flag_is_parsed_and_off_by_default(chk):
     assert chk.parse_args([]).continue_on_cuda_error is False
     assert chk.parse_args(["--continue-on-cuda-error"]).continue_on_cuda_error is True
+
+
+# ------------------- DECODE_PATH_IDENTICAL: the FP16 reference runs per gather group
+def _launch_recorder(monkeypatch, qsa):
+    """Record (kind, rows) of every ``qsa_sparse_paged_attention`` launch.
+
+    The Triton interpreter cannot run the split-K merge kernel (a scalar ``&`` a
+    tensor), so every interpreter case here is single-split and the split order of a
+    real GPU launch is out of reach on the CPU. What the CPU can pin down is the thing
+    that sets the split count: ``_qsa_sparse_launch_profile`` is a function of the rows
+    of a launch, so two launches are comparable only if they have the same rows."""
+    real = qsa.qsa_sparse_paged_attention
+    calls: list[tuple[str, int]] = []
+
+    def fake(q, k_cache, v_cache, *args, **kwargs):
+        dtype = kwargs.get("kv_cache_dtype")
+        if dtype == "nvfp4":  # the production route: run it, it launches per group
+            return real(q, k_cache, v_cache, *args, **kwargs)
+        kind = "gathered" if dtype == qsa.QSA_NVFP4_GATHERED_DTYPE else "fp16"
+        calls.append((kind, int(q.shape[0])))
+        out = kwargs.get("out")
+        if out is None:
+            out = torch.zeros_like(q)
+        out.zero_()
+        return out
+
+    monkeypatch.setattr(qsa, "qsa_sparse_paged_attention", fake)
+    return calls
+
+
+@pytest.mark.skipif(not INTERPRETER, reason="needs TRITON_INTERPRET=1")
+def test_the_fp16_reference_is_launched_per_gather_group_like_the_nvfp4_route(
+    chk, monkeypatch
+):
+    """W1b'' 2026-10-06 (plan 071 待修 22): M=64 and M=5568 failed DECODE_PATH_IDENTICAL
+    by one FP16 ulp while M=5 was bit-identical. The NVFP4 route always launches per
+    gather group; a whole-batch FP16 reference lands in another launch-profile bucket
+    (other split count, other FP32 merge order)."""
+    import importlib
+
+    qsa = importlib.import_module("vllm.models.qwen4_exp.nvidia.ops.qsa")
+    qn = importlib.import_module("vllm.models.qwen4_exp.nvidia.ops.qsa_nvfp4")
+    topk, rows, group = 16, 12, 4
+    monkeypatch.setattr(qn, "NVFP4_GATHER_SCRATCH_BYTES", group * 2 * topk * 256 * 2)
+    assert qn.nvfp4_gather_rows_per_group(topk, 1, 256) == group
+    # The premise: at the production geometry (6 query heads -> block_m 8) 12 rows and
+    # a group of 4 are different profile buckets (32 vs 64 target splits).
+    assert qsa._qsa_sparse_launch_profile(rows, 8, True)[1] == 32
+    assert qsa._qsa_sparse_launch_profile(group, 8, True)[1] == 64
+
+    run, nv, _ = _case_run(chk, monkeypatch, rows, topk=topk)
+    shape = (
+        run.layout.num_blocks,
+        2,
+        run.layout.block_size,
+        1,
+        nv.nvfp4_kv_row_bytes(256),
+    )
+    unit = torch.zeros(shape, dtype=torch.uint8)
+    nv.reshape_and_cache_nvfp4_reference(run.key, run.value, unit, run.slots)
+    calls = _launch_recorder(monkeypatch, qsa)
+    with torch.inference_mode():
+        run._decode_path_outputs(nv, run.dirty, unit, run._dev(unit))
+    gathered = [n for kind, n in calls if kind == "gathered"]
+    reference = [n for kind, n in calls if kind == "fp16"]
+    assert gathered == [4, 4, 4]  # what the production route launches
+    assert reference == gathered, (
+        "the FP16 reference must be launched with the rows of each gather group, "
+        f"got {reference}"
+    )
+
+
+def test_a_failing_zero_fill_names_the_part_that_failed(chk):
+    parts = ("gather_zeros", "empty_rows", "decode_identical")
+    for broken in parts:
+        result = _ok_result("nvfp4-B32-M64", rows=64)
+        result["zero_fill"] = {key: key != broken for key in parts} | {"ok": False}
+        verdict = chk.compute_verdict([result])
+        assert verdict["ZERO_FILL_OK"] == "NO"
+        detail = [
+            line
+            for line in chk.format_verdict(verdict, [result])
+            if line.startswith("ZERO_FILL_DETAIL")
+        ]
+        want = " ".join(
+            f"{key} {'NO' if key == broken else 'YES'}" for key in parts
+        )
+        assert detail == [f"ZERO_FILL_DETAIL nvfp4-B32-M64: {want}"]
+
+
+def test_a_passing_zero_fill_prints_no_detail_line(chk):
+    result = _ok_result()
+    result["zero_fill"] = {
+        "ok": True,
+        "gather_zeros": True,
+        "empty_rows": True,
+        "decode_identical": True,
+    }
+    verdict = chk.compute_verdict([result])
+    assert not any(
+        line.startswith("ZERO_FILL_DETAIL")
+        for line in chk.format_verdict(verdict, [result])
+    )
+
+
+def test_a_zero_fill_without_its_parts_says_unknown_not_a_guess(chk):
+    result = _ok_result()
+    result["zero_fill"] = {"ok": False}  # a result written before the parts existed
+    verdict = chk.compute_verdict([result])
+    lines = chk.format_verdict(verdict, [result])
+    assert (
+        "ZERO_FILL_DETAIL nvfp4-B2784-M1: gather_zeros UNKNOWN empty_rows UNKNOWN "
+        "decode_identical UNKNOWN"
+    ) in lines

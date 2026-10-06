@@ -437,6 +437,12 @@ decode round-trip 裡佔多少；佔比小就不值得做。
 `DECODE_VS_FP16`、`E4M3_CONTROL`、`NVFP4_VS_E4M3_REL_L2`、`TIMING_US`、`DECODE_ROUNDTRIP_US`。`--out` 寫 JSON。
 結束碼：0 是 `SELF_CHECK: PASS`，1 是 `SELF_CHECK: FAIL`，2 是沒有 CUDA、GPU 已被佔用或參數不可用。
 
+`DECODE_PATH_IDENTICAL` 的 FP16 參照是**依 gather 群組**各發射一次，不是整批一次：`_qsa_sparse_launch_profile` 依單次 launch 的列數選
+BLOCK_N 與 split 數，而 NVFP4 路徑永遠按 `nvfp4_gather_rows_per_group`（topk 2051、1 head、256 維是 31 列）分組發射，整批參照的 FP32
+partial 合併順序會不同，M ≥ 32 起差一個 FP16 ulp（W1b″ 2026-10-06，`/data/bench/q15-w1b3-full-20261006-012925`：M=5 位元一致，
+M=64 與 M=5568 的 max|d| 為 0.0078 與 0.0156，`ZERO_FILL_OK` 也因此 NO；plan 071 待修 22）。兩側改用同一組列數後 profile 相同，比對重回逐位元。
+`ZERO_FILL_OK` 由三項合成，失敗時印 `ZERO_FILL_DETAIL <case>: gather_zeros .. empty_rows .. decode_identical ..` 指出是哪一項。
+
 ### 自檢
 
 一行指令就能知道這次跑可不可信，最後一行是 `SELF_CHECK: PASS` 或 `SELF_CHECK: FAIL (<原因>)`：

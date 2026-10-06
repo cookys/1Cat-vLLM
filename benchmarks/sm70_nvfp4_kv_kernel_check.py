@@ -119,6 +119,13 @@ Verdict printed on stdout:
     GATHER_MATCHES_REFERENCE: YES/NO         FP16 outputs equal, every NVFP4 case
     ZERO_FILL_OK: YES/NO                     illegal entries are exact zeros
     DECODE_PATH_IDENTICAL: YES/NO            unit scales: NVFP4 route == FP16 kernel
+                                             (the FP16 reference is launched per gather
+                                             group: the launch profile, and with it
+                                             the split-K merge order, depends on the
+                                             rows of a launch and the NVFP4 route
+                                             always runs per group; W1b'' 2026-10-06,
+                                             /data/bench/q15-w1b3-full-20261006-012925,
+                                             plan 071 待修 22)
     FUSED_MATCHES_GATHER: YES/NO/UNKNOWN     fused reader within tolerance of gather
     DECODE_VS_FP16 <case>: max|d| .. mean|d| .. relL2 ..
     E4M3_CONTROL <case>: max|d| .. mean|d| .. relL2 ..
@@ -127,7 +134,9 @@ Verdict printed on stdout:
     DECODE_ROUNDTRIP_US M=<rows>: nvfp4 .. e4m3 .. ratio ..
 
 ``NO`` lines carry the evidence (the count and first position of differing bytes,
-the largest difference). ``UNKNOWN`` means a case failed before it could say.
+the largest difference). A failing ``ZERO_FILL_OK`` adds a
+``ZERO_FILL_DETAIL <case>`` line naming which of its three parts (gather zeros, empty
+rows, decode identical) failed. ``UNKNOWN`` means a case failed before it could say.
 
 Self-check. One command line is enough to know whether the run can be trusted. Every
 run also validates itself and ends with a verdict:
@@ -1222,6 +1231,18 @@ def format_verdict(
                 f"DECODE_PATH_DIFF {r['case']}: "
                 f"max|d| {r['decode_path']['max_abs']:.3g}"
             )
+        zero = r.get("zero_fill")
+        if zero and not zero.get("ok", True):
+            # ZERO_FILL_OK is three controls in one: say which of them failed.
+            parts = [
+                f"{name} {_yes_no(zero[key]) if key in zero else 'UNKNOWN'}"
+                for name, key in (
+                    ("gather_zeros", "gather_zeros"),
+                    ("empty_rows", "empty_rows"),
+                    ("decode_identical", "decode_identical"),
+                )
+            ]
+            lines.append(f"ZERO_FILL_DETAIL {r['case']}: {' '.join(parts)}")
     for r in results:
         q = r.get("decode_quality")
         if not q:
@@ -1701,23 +1722,17 @@ class CaseRun:
         # against the FP16 kernel on the dequantized values of that same cache.
         unit = torch.zeros(shape, dtype=torch.uint8)
         nv.reshape_and_cache_nvfp4_reference(self.key, self.value, unit, self.slots)
-        (u_k, u_v), (u_ks, u_vs) = nv.nvfp4_kv_split_views(unit)
         unit_cache = self._dev(unit)
-        nvfp4_out = self._attention(
-            sel,
-            k_cache=unit_cache[:, 0],
-            v_cache=unit_cache[:, 1],
-            kv_cache_dtype="nvfp4",
-        )
-        fp16_out = self._attention(
-            sel,
-            k_cache=self._dev(nv.dequantize_kv_nvfp4(u_k, u_ks)),
-            v_cache=self._dev(nv.dequantize_kv_nvfp4(u_v, u_vs)),
-        )
+        nvfp4_out, fp16_out = self._decode_path_outputs(nv, sel, unit, unit_cache)
         nvfp4_out, fp16_out = nvfp4_out.cpu(), fp16_out.cpu()
         decode_ok = bool(torch.equal(nvfp4_out, fp16_out))
         empty_ok = all(not nvfp4_out[row].any() for row in sel.empty_rows)
-        result["zero_fill"] = {"ok": bool(zeros_ok and empty_ok and decode_ok)}
+        result["zero_fill"] = {
+            "ok": bool(zeros_ok and empty_ok and decode_ok),
+            "gather_zeros": bool(zeros_ok),
+            "empty_rows": bool(empty_ok),
+            "decode_identical": decode_ok,
+        }
         result["decode_path"] = error_stats(nvfp4_out, fp16_out)
 
         # Negative controls: the same three comparisons, on mutated caches.
@@ -1812,6 +1827,50 @@ class CaseRun:
             nv.dequantize_kv_nvfp4(v_data, v_scales, layer_scale=vs)
         )
         return result
+
+    def _decode_path_outputs(self, nv, sel: Selection, unit: torch.Tensor, unit_cache):
+        """The NVFP4 route and the FP16 kernel on the same unit-scale cache.
+
+        The FP16 reference is launched per gather group, with the rows of each group
+        of the NVFP4 route (``nvfp4_gather_rows_per_group`` at the case geometry and the
+        default scratch). ``_qsa_sparse_launch_profile`` picks BLOCK_N and the split
+        count from the number of rows of a launch, and the NVFP4 route always launches
+        per group, so a whole-batch reference merges its FP32 partials in another
+        order and differs by an FP16 ulp from M ~ 32 up (W1b'' 2026-10-06,
+        ``/data/bench/q15-w1b3-full-20261006-012925``, plan 071 待修 22). Per group,
+        both sides launch the same profile and the comparison is exact again.
+        """
+        (u_k, u_v), (u_ks, u_vs) = nv.nvfp4_kv_split_views(unit)
+        nvfp4_out = self._attention(
+            sel,
+            k_cache=unit_cache[:, 0],
+            v_cache=unit_cache[:, 1],
+            kv_cache_dtype="nvfp4",
+        )
+        k16 = self._dev(nv.dequantize_kv_nvfp4(u_k, u_ks))
+        v16 = self._dev(nv.dequantize_kv_nvfp4(u_v, u_vs))
+        g = self.geometry
+        group_rows = self.k["qn"].nvfp4_gather_rows_per_group(
+            g.topk, g.kv_heads, g.head_dim, None
+        )
+        q = self._dev(self.q)
+        indices = self._dev(sel.indices)
+        table = self._dev(sel.table)
+        token_to_req = self._dev(sel.token_to_req)
+        fp16_out = torch.empty_like(q)
+        rows = q.shape[0]
+        for start in range(0, rows, group_rows):
+            stop = min(rows, start + group_rows)
+            self.k["qsa"].qsa_sparse_paged_attention(
+                q[start:stop],
+                k16,
+                v16,
+                indices[start:stop],
+                table,
+                token_to_req[start:stop],
+                out=fp16_out[start:stop],
+            )
+        return nvfp4_out, fp16_out
 
     def _run_fused(
         self,
