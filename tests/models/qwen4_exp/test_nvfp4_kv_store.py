@@ -279,6 +279,16 @@ def _packed_member_views(monkeypatch):
     return raw, views["a"], views["b"]
 
 
+@pytest.mark.skipif(
+    "packed_members"
+    not in __import__("inspect").signature(
+        __import__(
+            "vllm.v1.worker.gpu.attn_utils", fromlist=["_reshape_kv_cache"]
+        )._reshape_kv_cache
+    ).parameters,
+    reason="runner packed_members (p070 packs) is not on the d30469863 base; "
+    "covered on p071-fable-prefill-bprime",
+)
 def test_a_packed_member_view_is_written_without_touching_its_neighbour(
     monkeypatch,
 ) -> None:
@@ -303,6 +313,16 @@ def _impl(dtype):
     return impl
 
 
+@pytest.mark.skipif(
+    "packed_members"
+    not in __import__("inspect").signature(
+        __import__(
+            "vllm.v1.worker.gpu.attn_utils", fromlist=["_reshape_kv_cache"]
+        )._reshape_kv_cache
+    ).parameters,
+    reason="runner packed_members (p070 packs) is not on the d30469863 base; "
+    "covered on p071-fable-prefill-bprime",
+)
 def test_the_owner_contract_stores_through_do_kv_cache_update() -> None:
     key, value = _rows((24, 2, 256), 25), _rows((24, 2, 256), 26)
     slots = _slots(24)
