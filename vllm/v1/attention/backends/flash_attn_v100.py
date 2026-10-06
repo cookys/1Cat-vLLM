@@ -1325,6 +1325,16 @@ def _get_flash_grouped_verify_op():
     return _flash_attn_grouped_verify_paged
 
 
+def _grouped_verify_nvfp4_available() -> bool:
+    """True when the extension's grouped verifier reads NVFP4 KV (probe v3)."""
+    try:
+        from flash_attn_v100 import flash_attn_nvfp4_kv_available
+
+        return bool(flash_attn_nvfp4_kv_available(min_version=3))
+    except (ImportError, RuntimeError, TypeError, ValueError):
+        return False
+
+
 def _get_sm70_splitd_d256_ops():
     """Load the exact SM70 Split-D dense and paged prefill operators."""
     global _sm70_splitd_d256_ops
@@ -5870,6 +5880,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 num_query_tokens if num_reqs == 1 else 0,
             )
         )
+        is_nvfp4_kv = self.kv_cache_dtype == "nvfp4"
         # Opt-in marker (plan 072 A2) set by the metadata builder.
         is_mtp_verify_target = bool(
             getattr(attn_metadata, "is_mtp_verify_target", False)
@@ -5916,7 +5927,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             # (plan 072 A2, 2026-10-06).
             and key_cache.shape[1]
             in (1648, 1728, 3296, 3456, *self.dflash2_grouped_verify_extra_pages)
-            and tuple(key_cache.shape[2:]) == (1, 256)
+            and tuple(key_cache.shape[2:]) == (1, 144 if is_nvfp4_kv else 256)
             and tuple(value_cache.shape) == tuple(key_cache.shape)
             and key_cache.dtype == torch.uint8
             and value_cache.dtype == torch.uint8
@@ -5925,7 +5936,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             # This legacy verifier stores normalized partials in FP16.
             # E4M3 must reach the repaired FP32 path below, including when
             # the old native entry advertises E4M3 byte-format support.
-            and self.kv_cache_dtype == "fp8_e5m2"
+            # NVFP4 (Q1.23 P4) also reads fp16 partials and needs probe v3.
+            and (
+                self.kv_cache_dtype == "fp8_e5m2"
+                or (is_nvfp4_kv and _grouped_verify_nvfp4_available())
+            )
             and block_table is not None
             and block_table.ndim == 2
             and block_table.shape[0] == num_reqs

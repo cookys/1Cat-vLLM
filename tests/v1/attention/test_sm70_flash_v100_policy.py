@@ -3753,6 +3753,7 @@ def _grouped_verify_gate_case(
     num_reqs: int = 1,
     dflash_marker: bool = True,
     mtp_marker: bool = False,
+    kv_dtype: str = "fp8_e5m2",
 ):
     from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
 
@@ -3763,7 +3764,7 @@ def _grouped_verify_gate_case(
         num_kv_heads=1,
         alibi_slopes=None,
         sliding_window=None,
-        kv_cache_dtype="fp8_e5m2",
+        kv_cache_dtype=kv_dtype,
     )
     impl.use_dflash2_grouped_verify = True
     impl.use_dflash2_batched_grouped_verify = True
@@ -3782,7 +3783,8 @@ def _grouped_verify_gate_case(
         block_table=torch.zeros((num_reqs, 2), dtype=torch.int32),
     )
     query = torch.zeros((total_q, 6, 256), dtype=torch.float16)
-    key_cache = torch.zeros((2, page_size, 1, 256), dtype=torch.uint8)
+    tail = 144 if kv_dtype == "nvfp4" else 256
+    key_cache = torch.zeros((2, page_size, 1, tail), dtype=torch.uint8)
     value_cache = torch.zeros_like(key_cache)
     return impl._dflash2_grouped_verify_allowed(
         query, key_cache, value_cache, attn_metadata, num_query_tokens=total_q
@@ -3827,6 +3829,41 @@ def test_grouped_verify_mtp_marker(monkeypatch):
     assert not _grouped_verify_gate_case(
         page_size=4096, query_len=5, dflash_marker=False, mtp_marker=True
     )
+
+
+def test_grouped_verify_nvfp4_gate(monkeypatch):
+    from vllm.v1.attention.backends import flash_attn_v100 as mod
+
+    monkeypatch.setenv("VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_EXTRA_PAGES", "4096")
+    monkeypatch.setattr(mod, "_grouped_verify_nvfp4_available", lambda: True)
+    # nvfp4 + probe v3 + extra page + MTP marker -> allowed (q5, single request).
+    assert _grouped_verify_gate_case(
+        page_size=4096, query_len=5, dflash_marker=False, mtp_marker=True,
+        kv_dtype="nvfp4",
+    )
+    assert _grouped_verify_gate_case(page_size=4096, query_len=8, kv_dtype="nvfp4")
+    # Page whitelist still applies.
+    assert not _grouped_verify_gate_case(page_size=2048, query_len=8, kv_dtype="nvfp4")
+    # An E5M2-shaped (256-wide) tail never passes for nvfp4 and vice versa.
+    monkeypatch.setattr(mod, "_grouped_verify_nvfp4_available", lambda: False)
+    assert not _grouped_verify_gate_case(page_size=4096, query_len=8, kv_dtype="nvfp4")
+    # E5M2 is unaffected by the nvfp4 probe.
+    assert _grouped_verify_gate_case(page_size=4096, query_len=8)
+
+
+@pytest.mark.parametrize("version, expected", [(1, False), (2, False), (3, True)])
+def test_grouped_verify_nvfp4_probe_version(monkeypatch, version, expected):
+    import sys
+    import types
+
+    from vllm.v1.attention.backends import flash_attn_v100 as mod
+
+    fake = types.ModuleType("flash_attn_v100")
+    fake.flash_attn_nvfp4_kv_available = lambda min_version=1: version >= min_version
+    monkeypatch.setitem(sys.modules, "flash_attn_v100", fake)
+    assert mod._grouped_verify_nvfp4_available() is expected
+    monkeypatch.setitem(sys.modules, "flash_attn_v100", None)  # ImportError
+    assert mod._grouped_verify_nvfp4_available() is False
 
 
 @pytest.mark.parametrize(

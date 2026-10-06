@@ -1140,7 +1140,8 @@ def flash_attn_nvfp4_kv_available(min_version: int = 1) -> bool:
     path in the XQA 256-wide decode kernel.
 
     Versions: 1 = XQA decode read path; 2 = + paged NVFP4 -> FP16 bridge
-    (``nvfp4_paged_kv_to_fp16``)."""
+    (``nvfp4_paged_kv_to_fp16``); 3 = + exact grouped DFlash2/MTP4 verifier
+    (``flash_attn_grouped_verify_paged(kv_cache_dtype="nvfp4")``)."""
     version = getattr(flash_attn_v100_cuda, "nvfp4_kv_version", None)
     return (
         hasattr(flash_attn_v100_cuda, "decode_paged_xqa_fwd")
@@ -1232,6 +1233,11 @@ def flash_attn_grouped_verify_paged(
     paged-KV scan across a packed GQA group. Single-request q16 uses two
     three-head groups; batched requests use request-major q8 groups. Workspaces
     are stream- and batch-local and CUDA-graph safe.
+
+    ``kv_cache_dtype`` is ``fp8_e5m2`` (default), ``fp8_e4m3`` (q8 only), or
+    ``nvfp4`` (needs ``flash_attn_nvfp4_kv_available(min_version=3)``): the cache
+    is the uint8 view ``[blocks, page, 1, 144]`` and only the runtime-page-size
+    schedule is used. Partials stay fp16 for NVFP4 as for E5M2.
     """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
