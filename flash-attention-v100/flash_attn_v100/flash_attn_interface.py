@@ -1350,9 +1350,10 @@ def flash_attn_decode_paged_xqa(
             head_dim=head_dim,
             plan=plan,
             active_num_partitions=active_num_partitions,
+            # NVFP4 follows E5M2 (fp16 partials); only E4M3 keeps fp32.
             partial_dtype=(
                 torch.float32
-                if kv_cache_dtype in ("fp8", "fp8_e4m3", "nvfp4")
+                if kv_cache_dtype in ("fp8", "fp8_e4m3")
                 else torch.float16
             ),
         )
