@@ -164,6 +164,12 @@ void flash_attention_fp8_e4m3_paged_kv_to_fp16(
     at::Tensor& key_out, at::Tensor& value_out, const float key_scale,
     const float value_scale);
 
+void flash_attention_nvfp4_paged_kv_to_fp16(
+    const at::Tensor& key_cache, const at::Tensor& value_cache,
+    const at::Tensor& block_table, const at::Tensor& seq_lens,
+    at::Tensor& key_out, at::Tensor& value_out, const float key_scale,
+    const float value_scale);
+
 std::vector<at::Tensor> flash_attention_backward(
     const at::Tensor& dout, const at::Tensor& q, const at::Tensor& k,
     const at::Tensor& v, const at::Tensor& out, const at::Tensor& softmax_lse,

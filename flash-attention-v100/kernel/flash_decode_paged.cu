@@ -4603,7 +4603,8 @@ at::Tensor flash_attention_grouped_e4m3_fp32_paged(
   return out;
 }
 
-int64_t flash_attention_nvfp4_kv_version() { return 1; }
+// 1 = XQA decode read path, 2 = + paged NVFP4 -> FP16 bridge (Q1.23 P3).
+int64_t flash_attention_nvfp4_kv_version() { return 2; }
 
 int64_t flash_attention_grouped_e4m3_fp32_precision_version() {
   // Revision 3 retains unnormalized FP32 numerators and separate max/sum.

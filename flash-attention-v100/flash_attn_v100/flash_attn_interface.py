@@ -1137,7 +1137,10 @@ def flash_attn_grouped_verify_request_major_abi_version() -> int:
 
 def flash_attn_nvfp4_kv_available(min_version: int = 1) -> bool:
     """True when the extension has the NVFP4 (e2m1 + E4M3 block scale) KV read
-    path in the XQA 256-wide decode kernel."""
+    path in the XQA 256-wide decode kernel.
+
+    Versions: 1 = XQA decode read path; 2 = + paged NVFP4 -> FP16 bridge
+    (``nvfp4_paged_kv_to_fp16``)."""
     version = getattr(flash_attn_v100_cuda, "nvfp4_kv_version", None)
     return (
         hasattr(flash_attn_v100_cuda, "decode_paged_xqa_fwd")
@@ -1664,6 +1667,40 @@ def fp8_e5m2_paged_kv_to_fp16(
         value_cache,
         maybe_contiguous(block_table),
         maybe_contiguous(seq_lens),
+        key_out,
+        value_out,
+        float(k_scale),
+        float(v_scale),
+    )
+    return key_out, value_out
+
+
+def nvfp4_paged_kv_to_fp16(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    key_out: torch.Tensor,
+    value_out: torch.Tensor,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expand paged NVFP4 K/V into preallocated FP16 paged workspaces.
+
+    Caches are uint8 views ``[blocks, page, H, 144]`` (token stride ``H*144``,
+    head stride 144: a data region then a scale region per page side); the
+    output is fp16 ``[capacity, out_page, H, 256]`` with an identity block
+    table per batch row. The layer scales are folded into the output. Only the
+    live prefix and its 16-token padding are written.
+    """
+    op = getattr(flash_attn_v100_cuda, "nvfp4_paged_kv_to_fp16", None)
+    if op is None:
+        raise RuntimeError("Rebuild Flash-V100 for the NVFP4 KV bridge")
+    op(
+        key_cache,
+        value_cache,
+        block_table.contiguous(),
+        seq_lens.contiguous(),
         key_out,
         value_out,
         float(k_scale),

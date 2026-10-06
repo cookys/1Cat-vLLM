@@ -31,7 +31,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &flash_attention_grouped_e4m3_fp32_precision_version,
         "E4M3 grouped FP32 numerical implementation revision");
   m.def("nvfp4_kv_version", &flash_attention_nvfp4_kv_version,
-        "Capability revision of the NVFP4 KV read path in XQA decode");
+        "Capability revision of the NVFP4 KV paths: 1 = XQA decode, 2 = + FP16 bridge");
   m.def("tp2_e4m3_scalar_fast_version",
         &flash_attention_tp2_e4m3_scalar_fast_version,
         "Capability for the opt-in TP2 E4M3 scalar decoder");
@@ -77,4 +77,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Expand paged FP8 E5M2 K/V into a preallocated FP16 paged workspace");
   m.def("fp8_e4m3_paged_kv_to_fp16", &flash_attention_fp8_e4m3_paged_kv_to_fp16,
         "Expand paged FP8 E4M3 K/V into a preallocated FP16 paged workspace");
+  m.def("nvfp4_paged_kv_to_fp16", &flash_attention_nvfp4_paged_kv_to_fp16,
+        "Expand paged NVFP4 K/V (uint8 [blocks,page,H,144] views) into a "
+        "preallocated FP16 paged workspace");
 }

@@ -117,6 +117,120 @@ __global__ void fp8_paged_kv_to_fp16_kernel(
   *reinterpret_cast<__half2*>(value_out + value_output_offset) = value_pair;
 }
 
+// NVFP4 -> FP16 bridge kernel. One thread expands 8 consecutive head dims
+// (one 4-byte e2m1 data word + the shared E4M3FN group scale byte, 2 threads
+// share a scale byte) into one 16-byte fp16 store. Scheduling mirrors the FP8
+// kernel: grid.x covers the output capacity, grid.y the batch.
+//
+// Input page side (uint8 view [blocks, page, H, 144], 144 is logical): a data
+// region of page*H rows x 128 bytes, then a scale region of page*H rows x 16
+// bytes. Rounding point matches the FP8 bridge: the e2m1 x E4M3 product is an
+// exact fp16 value (nvfp4_data4_to_half8), the layer scale is then applied in
+// fp32 with one final rounding to fp16.
+constexpr int kNvfp4HeadDim = 256;
+constexpr int kNvfp4DimsPerThread = 8;
+constexpr int kNvfp4ThreadsPerHead = kNvfp4HeadDim / kNvfp4DimsPerThread;
+
+__device__ __forceinline__ uint4 nvfp4_bridge_load8(const uint8_t* __restrict__ cache,
+                                                    int64_t page_base,
+                                                    int input_block_size,
+                                                    int num_heads, int block_offset,
+                                                    int head_idx, int dims,
+                                                    bool unit_scale, float layer_scale) {
+  const int64_t row_index =
+      static_cast<int64_t>(block_offset) * num_heads + head_idx;
+  const uint32_t data = __ldg(
+      reinterpret_cast<const uint32_t*>(cache + page_base + row_index * 128 + (dims >> 1)));
+  const uint8_t scale_byte = __ldg(
+      cache + page_base + static_cast<int64_t>(input_block_size) * num_heads * 128 +
+      row_index * 16 + (dims >> 4));
+  uint4 packed = flash_v100::nvfp4_data4_to_half8(
+      data, flash_v100::fp8_e4m3fn_to_float(scale_byte));
+  if (!unit_scale) {
+    uint32_t* words = reinterpret_cast<uint32_t*>(&packed);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const __half2 pair = *reinterpret_cast<const __half2*>(&words[i]);
+      const float2 f = __half22float2(pair);
+      const __half2 scaled =
+          __float22half2_rn(make_float2(f.x * layer_scale, f.y * layer_scale));
+      words[i] = *reinterpret_cast<const uint32_t*>(&scaled);
+    }
+  }
+  return packed;
+}
+
+__global__ void nvfp4_paged_kv_to_fp16_kernel(
+    const uint8_t* __restrict__ key_cache, const uint8_t* __restrict__ value_cache,
+    const int* __restrict__ block_table, const int* __restrict__ seq_lens,
+    __half* __restrict__ key_out, __half* __restrict__ value_out,
+    int batch_size, int max_num_blocks, int input_block_size,
+    int output_blocks_per_seq, int output_block_size, int num_heads,
+    int64_t key_block_stride, int64_t value_block_stride,
+    int64_t key_out_block_stride, int64_t key_out_token_stride,
+    int64_t key_out_head_stride, int64_t value_out_block_stride,
+    int64_t value_out_token_stride, int64_t value_out_head_stride,
+    float key_scale, float value_scale, bool unit_scale) {
+  const int batch_idx = blockIdx.y;
+  if (batch_idx >= batch_size) {
+    return;
+  }
+
+  const int64_t units_per_token =
+      static_cast<int64_t>(num_heads) * kNvfp4ThreadsPerHead;
+  const int max_tokens = output_blocks_per_seq * output_block_size;
+  const int64_t total_units = static_cast<int64_t>(max_tokens) * units_per_token;
+  const int64_t unit_idx =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (unit_idx >= total_units) {
+    return;
+  }
+
+  const int token_idx = static_cast<int>(unit_idx / units_per_token);
+  const int seq_len = seq_lens[batch_idx];
+  // Same 16-row WMMA tile padding rule as the FP8 bridge.
+  const int padded_seq_len = min(max_tokens, (seq_len + 15) & ~15);
+  if (token_idx >= padded_seq_len) {
+    return;
+  }
+  const int unit_in_token = static_cast<int>(unit_idx % units_per_token);
+  const int head_idx = unit_in_token / kNvfp4ThreadsPerHead;
+  const int dims = (unit_in_token % kNvfp4ThreadsPerHead) * kNvfp4DimsPerThread;
+
+  uint4 key_vec = make_uint4(0u, 0u, 0u, 0u);
+  uint4 value_vec = key_vec;
+  if (token_idx < seq_len) {
+    const int logical_block = token_idx / input_block_size;
+    const int input_block_offset = token_idx - logical_block * input_block_size;
+    const int physical_block =
+        __ldg(&block_table[batch_idx * max_num_blocks + logical_block]);
+    key_vec = nvfp4_bridge_load8(
+        key_cache, static_cast<int64_t>(physical_block) * key_block_stride,
+        input_block_size, num_heads, input_block_offset, head_idx, dims,
+        unit_scale, key_scale);
+    value_vec = nvfp4_bridge_load8(
+        value_cache, static_cast<int64_t>(physical_block) * value_block_stride,
+        input_block_size, num_heads, input_block_offset, head_idx, dims,
+        unit_scale, value_scale);
+  }
+
+  const int output_block_offset = token_idx / output_block_size;
+  const int output_token_offset =
+      token_idx - output_block_offset * output_block_size;
+  const int output_block =
+      batch_idx * output_blocks_per_seq + output_block_offset;
+  const int64_t key_output_offset =
+      static_cast<int64_t>(output_block) * key_out_block_stride +
+      static_cast<int64_t>(output_token_offset) * key_out_token_stride +
+      static_cast<int64_t>(head_idx) * key_out_head_stride + dims;
+  const int64_t value_output_offset =
+      static_cast<int64_t>(output_block) * value_out_block_stride +
+      static_cast<int64_t>(output_token_offset) * value_out_token_stride +
+      static_cast<int64_t>(head_idx) * value_out_head_stride + dims;
+  *reinterpret_cast<uint4*>(key_out + key_output_offset) = key_vec;
+  *reinterpret_cast<uint4*>(value_out + value_output_offset) = value_vec;
+}
+
 }  // namespace
 
 template <int KV_DTYPE>
@@ -246,4 +360,103 @@ void flash_attention_fp8_e4m3_paged_kv_to_fp16(
   flash_attention_fp8_paged_kv_to_fp16<flash_v100::KV_CACHE_DTYPE_FP8_E4M3>(
       key_cache, value_cache, block_table, seq_lens, key_out, value_out,
       key_scale, value_scale);
+}
+
+void flash_attention_nvfp4_paged_kv_to_fp16(
+    const at::Tensor& key_cache, const at::Tensor& value_cache,
+    const at::Tensor& block_table, const at::Tensor& seq_lens,
+    at::Tensor& key_out, at::Tensor& value_out, const float key_scale,
+    const float value_scale) {
+  TORCH_CHECK(key_cache.is_cuda() && value_cache.is_cuda() &&
+                  key_out.is_cuda() && value_out.is_cuda() &&
+                  block_table.is_cuda() && seq_lens.is_cuda(),
+              "NVFP4 KV bridge tensors must be CUDA tensors");
+  TORCH_CHECK(key_cache.scalar_type() == at::kByte &&
+                  value_cache.scalar_type() == at::kByte,
+              "NVFP4 input caches must be stored as uint8");
+  TORCH_CHECK(key_out.scalar_type() == at::kHalf &&
+                  value_out.scalar_type() == at::kHalf,
+              "NVFP4 KV bridge output caches must be fp16");
+  TORCH_CHECK(block_table.scalar_type() == at::kInt &&
+                  seq_lens.scalar_type() == at::kInt,
+              "NVFP4 KV bridge block_table and seq_lens must be int32");
+  TORCH_CHECK(key_cache.dim() == 4 && value_cache.dim() == 4 &&
+                  key_out.dim() == 4 && value_out.dim() == 4,
+              "NVFP4 KV bridge expects paged [blocks,tokens,heads,dim] caches");
+  TORCH_CHECK(key_cache.sizes() == value_cache.sizes(),
+              "NVFP4 K/V input cache shapes must match");
+  TORCH_CHECK(key_out.sizes() == value_out.sizes(),
+              "FP16 K/V output cache shapes must match");
+  TORCH_CHECK(key_cache.size(3) == 144 && key_out.size(3) == kNvfp4HeadDim &&
+                  key_cache.size(2) == key_out.size(2),
+              "NVFP4 KV bridge maps a [..,H,144] input view to a [..,H,256] "
+              "fp16 output");
+  for (const auto* side : {&key_cache, &value_cache}) {
+    TORCH_CHECK(side->stride(3) == 1 && side->stride(2) == 144 &&
+                    side->stride(1) == side->size(2) * 144,
+                "NVFP4 KV view must have token stride H*144 and head stride "
+                "144");
+    TORCH_CHECK(side->stride(0) % 4 == 0 &&
+                    side->stride(0) >= side->size(1) * side->size(2) * 144 &&
+                    reinterpret_cast<uintptr_t>(side->data_ptr()) % 4 == 0,
+                "NVFP4 KV pages and base pointers must be 4-byte aligned and "
+                "cover a full page");
+  }
+  for (const auto* out : {static_cast<const at::Tensor*>(&key_out),
+                          static_cast<const at::Tensor*>(&value_out)}) {
+    TORCH_CHECK(out->stride(3) == 1 && out->stride(0) % 8 == 0 &&
+                    out->stride(1) % 8 == 0 && out->stride(2) % 8 == 0 &&
+                    reinterpret_cast<uintptr_t>(out->data_ptr()) % 16 == 0,
+                "NVFP4 KV bridge output requires 16-byte aligned storage");
+  }
+  TORCH_CHECK(block_table.dim() == 2 && seq_lens.dim() == 1 &&
+                  block_table.size(0) == seq_lens.size(0),
+              "NVFP4 KV bridge metadata shape mismatch");
+  TORCH_CHECK(std::isfinite(key_scale) && std::isfinite(value_scale) &&
+                  key_scale > 0.f && value_scale > 0.f,
+              "NVFP4 KV bridge scales must be finite and positive");
+  TORCH_CHECK(block_table.is_contiguous() && seq_lens.is_contiguous(),
+              "NVFP4 KV bridge metadata must be contiguous");
+  for (const auto* tensor : {&value_cache, &block_table, &seq_lens,
+                             static_cast<const at::Tensor*>(&key_out),
+                             static_cast<const at::Tensor*>(&value_out)}) {
+    TORCH_CHECK(tensor->device() == key_cache.device(),
+                "NVFP4 KV bridge tensors must share a device");
+  }
+  TORCH_CHECK(key_cache.size(0) > 0 && key_cache.size(1) > 0 &&
+                  key_cache.size(2) > 0 && key_out.size(1) > 0 &&
+                  block_table.size(1) > 0,
+              "NVFP4 KV bridge dimensions must be non-empty");
+
+  const int batch_size = block_table.size(0);
+  TORCH_CHECK(batch_size > 0, "NVFP4 KV bridge batch must be non-empty");
+  TORCH_CHECK(key_out.size(0) % batch_size == 0,
+              "FP16 output blocks must divide evenly across the batch");
+  const int output_blocks_per_seq = key_out.size(0) / batch_size;
+  const int input_capacity = block_table.size(1) * key_cache.size(1);
+  const int output_capacity = output_blocks_per_seq * key_out.size(1);
+  TORCH_CHECK(output_capacity >= input_capacity,
+              "FP16 output cache capacity must cover the input block table");
+
+  c10::cuda::CUDAGuard device_guard(key_cache.device());
+  const int64_t total_units = static_cast<int64_t>(output_capacity) *
+                              key_cache.size(2) * kNvfp4ThreadsPerHead;
+  const dim3 grid(
+      static_cast<unsigned int>((total_units + kThreads - 1) / kThreads),
+      batch_size);
+  const auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+  nvfp4_paged_kv_to_fp16_kernel<<<grid, kThreads, 0, stream>>>(
+      reinterpret_cast<const uint8_t*>(key_cache.data_ptr()),
+      reinterpret_cast<const uint8_t*>(value_cache.data_ptr()),
+      block_table.data_ptr<int>(), seq_lens.data_ptr<int>(),
+      reinterpret_cast<__half*>(key_out.data_ptr()),
+      reinterpret_cast<__half*>(value_out.data_ptr()), batch_size,
+      block_table.size(1), key_cache.size(1), output_blocks_per_seq,
+      key_out.size(1), key_cache.size(2), key_cache.stride(0),
+      value_cache.stride(0), key_out.stride(0), key_out.stride(1),
+      key_out.stride(2), value_out.stride(0), value_out.stride(1),
+      value_out.stride(2), key_scale, value_scale,
+      key_scale == 1.f && value_scale == 1.f);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
