@@ -113,6 +113,9 @@ def _run(monkeypatch, knob, seq_lens, q_lens, max_q=16):
     self._grouped_verify_per_request_enabled = types.MethodType(
         cls._grouped_verify_per_request_enabled, self
     )
+    self._run_grouped_per_request_rows = types.MethodType(
+        cls._run_grouped_per_request_rows, self
+    )
     self.flash_attn_grouped_verify_paged = None
     monkeypatch.setattr(mod, "_validate_nvfp4_xqa_cache", lambda *a, **k: None)
     monkeypatch.setattr(mod, "_split_paged_kv_cache", lambda c: (c, c))

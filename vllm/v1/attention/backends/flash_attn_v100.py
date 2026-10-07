@@ -6079,39 +6079,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             return set()
 
         consumed = set(rows)
-        if self._grouped_verify_per_request_enabled():
-            # q == 8 decoders go through the per-request B1 grouped one-pass
-            # instead of 8 XQA rows each (host qsl is exact: eager batch).
-            width = _DFLASH2_VERIFY_WIDTH
-            grouped = [
-                i
-                for i in rows
-                if qsl[i + 1] - qsl[i] == width
-                and self._grouped_verify_request_eligible(
-                    query[qsl[i] : qsl[i] + width],
-                    key_cache,
-                    value_cache,
-                    attn_metadata,
-                    i,
-                )
-            ]
-            if grouped:
-                self._log_grouped_per_request_fallback(len(grouped), query)
-                _record_route("nvfp4_mixed_grouped_per_request")
-                for i in grouped:
-                    self._call_grouped_verify_request(
-                        layer,
-                        query[qsl[i] : qsl[i] + width],
-                        key_cache,
-                        value_cache,
-                        attn_metadata,
-                        i,
-                        output[qsl[i] : qsl[i] + width],
-                    )
-                done = set(grouped)
-                rows = [i for i in rows if i not in done]
-                if not rows:
-                    return consumed
+        rows = self._run_grouped_per_request_rows(
+            layer, query, key_cache, value_cache, attn_metadata, output, qsl, rows
+        )
+        if not rows:
+            return consumed
 
         token_idx: list[int] = []
         token_rows: list[int] = []
@@ -6555,7 +6527,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             out=out_i,
         )
 
-    def _log_grouped_per_request_fallback(self, num_reqs: int, query) -> None:
+    def _log_grouped_per_request_fallback(
+        self, num_reqs: int, query, padded: int | None = None
+    ) -> None:
         global _logged_grouped_per_request_fallback_capture
         global _logged_grouped_per_request_fallback_eager
         capturing = _is_cuda_graph_capturing(query)
@@ -6569,10 +6543,59 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             _logged_grouped_per_request_fallback_eager = True
         logger.info(
             "FLASH_ATTN_V100 DFlash2 per-request grouped fallback: n=%d "
-            "(during_cuda_graph_capture=%s)",
+            "(padded=%d, during_cuda_graph_capture=%s)",
             num_reqs,
+            num_reqs if padded is None else padded,
             capturing,
         )
+
+    def _run_grouped_per_request_rows(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+        qsl: list[int],
+        rows: list[int],
+    ) -> list[int]:
+        """Mixed batch: q == 8 decoders take the per-request B1 grouped call.
+
+        ``qsl`` is the exact host query_start_loc (eager batch, never captured).
+        Returns the rows still needing the P6 per-token decode expansion.
+        """
+        if not self._grouped_verify_per_request_enabled():
+            return rows
+        width = _DFLASH2_VERIFY_WIDTH
+        grouped = [
+            i
+            for i in rows
+            if qsl[i + 1] - qsl[i] == width
+            and self._grouped_verify_request_eligible(
+                query[qsl[i] : qsl[i] + width],
+                key_cache,
+                value_cache,
+                attn_metadata,
+                i,
+            )
+        ]
+        if not grouped:
+            return rows
+        self._log_grouped_per_request_fallback(len(grouped), query)
+        _record_route("dflash2_mixed_grouped_per_request")
+        for i in grouped:
+            self._call_grouped_verify_request(
+                layer,
+                query[qsl[i] : qsl[i] + width],
+                key_cache,
+                value_cache,
+                attn_metadata,
+                i,
+                output[qsl[i] : qsl[i] + width],
+            )
+        done = set(grouped)
+        return [i for i in rows if i not in done]
 
     def _try_grouped_verify_per_request(
         self,
@@ -6598,11 +6621,21 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         block_table = getattr(attn_metadata, "block_table", None)
         if block_table is None:
             return False
-        num_reqs = int(block_table.shape[0])
+        # block_table.shape[0] is the PADDED request count under FULL cudagraph.
+        # num_actual_tokens ("tokens excluding padding", triton_attn.py:81) gives
+        # the real count; rows [real, padded) are left untouched, exactly like
+        # the existing grouped/persistent paths which only write
+        # output[:num_query_tokens] (num_query_tokens = min(num_actual_tokens,
+        # ...), see _forward_nvfp4 / the gate call above).
+        padded = int(block_table.shape[0])
         width = _DFLASH2_VERIFY_WIDTH
+        num_actual = int(getattr(attn_metadata, "num_actual_tokens", 0))
+        num_reqs = num_actual // width
         if (
             num_reqs < 2
+            or num_reqs > padded
             or int(getattr(attn_metadata, "max_query_len", 0)) != width
+            or num_actual != num_reqs * width
             or num_query_tokens != num_reqs * width
         ):
             return False
@@ -6616,8 +6649,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 i,
             ):
                 return False
-        self._log_grouped_per_request_fallback(num_reqs, query)
-        _record_route("nvfp4_verify_grouped_per_request")
+        self._log_grouped_per_request_fallback(num_reqs, query, padded)
+        _record_route("dflash2_verify_grouped_per_request")
         for i in range(num_reqs):
             self._call_grouped_verify_request(
                 layer,
@@ -9112,6 +9145,13 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         if not rows or len(rows) == num_seqs:
             return set()
 
+        consumed = set(rows)
+        rows = self._run_grouped_per_request_rows(
+            layer, query, key_cache, value_cache, attn_metadata, out_view, qsl, rows
+        )
+        if not rows:
+            return consumed
+
         token_idx: list[int] = []
         token_rows: list[int] = []
         token_seq_lens: list[int] = []
@@ -9264,7 +9304,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         )
         _record_route(route)
         out_view.index_copy_(0, start_idx, out_rows)
-        return set(rows)
+        return consumed
 
     def _run_prefill_paged_call(
         self,

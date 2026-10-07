@@ -67,6 +67,12 @@ def _make_self(cls, calls, *, marker=True):
         )
         out.copy_(qq * 10)
 
+    def fake_scalar(qq, kc, vc, block_table, sl, *, out, **kw):
+        calls["xqa"].append(
+            dict(rows=int(qq.shape[0]), q_vals=qq[:, 0, 0].tolist(), seq_lens=sl.tolist())
+        )
+        out.copy_(qq * 10)
+
     def fake_bridge(**kwargs):
         calls["bridge"].append(int(kwargs["query"].shape[1]))
         kwargs["out"].fill_(-1)
@@ -87,6 +93,9 @@ def _make_self(cls, calls, *, marker=True):
         _call_flash_attn_smallq_decode_paged=fake_xqa,
         _run_fp8_prefill_bridge=fake_bridge,
         _nvfp4_first_chunk_fp16_applies=None,
+        use_decode_xqa=False,
+        flash_attn_decode_paged_xqa=None,
+        _call_flash_attn_decode_paged=fake_scalar,
     )
     for name in (
         "_dflash2_grouped_verify_allowed",
@@ -97,6 +106,9 @@ def _make_self(cls, calls, *, marker=True):
         "_log_grouped_per_request_fallback",
         "_try_grouped_verify_per_request",
         "_run_nvfp4_mixed_decode_rows",
+        "_run_grouped_per_request_rows",
+        "_run_prefill_prefix_decode_rows",
+        "_run_prefill_paged_call",
         "_flash_v100_small_query_prefill_as_decode",
         "_nvfp4_first_chunk_fp16_applies",
     ):
@@ -104,9 +116,14 @@ def _make_self(cls, calls, *, marker=True):
     return self
 
 
-def _meta(seq_lens, q_lens, *, marker=True):
+def _meta(seq_lens, q_lens, *, marker=True, padded_reqs=None, actual=None):
     n = len(q_lens)
     total = sum(q_lens)
+    if padded_reqs is not None:
+        # FULL-cudagraph padding: tables/seq_lens carry dummy rows beyond the
+        # real requests; num_actual_tokens counts only real tokens.
+        pad = padded_reqs - n
+        seq_lens = list(seq_lens) + [0] * pad
     qsl = torch.tensor([0] + list(torch.tensor(q_lens).cumsum(0)), dtype=torch.int32)
     return types.SimpleNamespace(
         causal=True,
@@ -114,13 +131,15 @@ def _meta(seq_lens, q_lens, *, marker=True):
         is_dflash_selector_target=marker,
         is_mtp_verify_target=False,
         max_model_len=131072,
-        num_actual_tokens=total,
+        num_actual_tokens=total if actual is None else actual,
         num_reqs=n,
         max_query_len=max(q_lens),
         query_start_loc_cpu=qsl,
         query_start_loc=qsl,
         seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
-        block_table=torch.arange(n * 4, dtype=torch.int32).reshape(n, 4),
+        block_table=torch.arange(
+            (n if padded_reqs is None else padded_reqs) * 4, dtype=torch.int32
+        ).reshape(-1, 4),
         # persistent smallq metadata so the legacy per-row path is reachable
         smallq_decode_block_table=torch.zeros(total, 4, dtype=torch.int32),
         smallq_decode_seq_lens=torch.ones(total, dtype=torch.int32),
@@ -263,3 +282,87 @@ def test_mixed_knob1_only_q8_decoders_no_xqa_call(monkeypatch):
     calls, out, consumed = _run_mixed(monkeypatch, "1", [8, 8, 1500], [70000, 80000, 9000])
     assert consumed == {0, 1}
     assert len(calls["grouped"]) == 2 and calls["xqa"] == []
+
+
+# ---- padding (FULL cudagraph) ------------------------------------------------
+
+
+def test_knob1_padded_batch_runs_only_real_requests(monkeypatch):
+    cls = _impl_cls()
+    _set_knob(monkeypatch, "1")
+    calls = {"grouped": [], "xqa": [], "bridge": []}
+    self = _make_self(cls, calls)
+    meta, qsl = _meta(SEQ10, [8] * 10, padded_reqs=16)
+    assert meta.block_table.shape[0] == 16 and meta.seq_lens.shape[0] == 16
+    q = _query([8] * 10, qsl)
+    # query/output buffers are padded too (16*8 rows); padded rows untouched
+    qp = torch.cat([q, torch.zeros(48, 6, 256, dtype=torch.float16)])
+    out = torch.full_like(qp, -7)
+    kc = _cache()
+    layer = types.SimpleNamespace(_k_scale_float=1.0, _v_scale_float=1.0)
+    self._flash_v100_small_query_prefill_as_decode(
+        layer, qp, kc, kc, meta, out, qsl, meta.seq_lens
+    )
+    assert len(calls["grouped"]) == 10 and calls["xqa"] == []
+    assert [c["bt_first"] for c in calls["grouped"]] == [[4 * i] for i in range(10)]
+    assert (out[80:] == -7).all()  # padded rows left untouched
+
+
+def test_knob1_padded_log_prints_real_and_padded(monkeypatch, caplog):
+    cls = _impl_cls()
+    _set_knob(monkeypatch, "1")
+    self = types.SimpleNamespace()
+    f = types.MethodType(cls._log_grouped_per_request_fallback, self)
+    with caplog.at_level("INFO"):
+        f(10, None, 16)
+    assert "n=10 (padded=16," in caplog.records[-1].message
+
+
+def test_knob1_actual_tokens_disagree_with_uniform_keeps_xqa(monkeypatch):
+    cls = _impl_cls()
+    _set_knob(monkeypatch, "1")
+    calls = {"grouped": [], "xqa": [], "bridge": []}
+    self = _make_self(cls, calls)
+    meta, qsl = _meta(SEQ10, [8] * 10, actual=75)  # 75 != real*8
+    q = _query([8] * 10, qsl)
+    out = torch.zeros_like(q)
+    kc = _cache()
+    layer = types.SimpleNamespace(_k_scale_float=1.0, _v_scale_float=1.0)
+    assert not self._try_grouped_verify_per_request(layer, q, kc, kc, meta, out, 75)
+
+
+# ---- e5m2 mixed batch (_run_prefill_prefix_decode_rows) ----------------------
+
+
+def _run_e5m2_mixed(monkeypatch, knob, q_lens, seq_lens):
+    cls = _impl_cls()
+    _set_knob(monkeypatch, knob)
+    monkeypatch.setattr(mod, "_logged_prefill_prefix_decode_rows", False)
+    calls = {"grouped": [], "xqa": [], "bridge": []}
+    self = _make_self(cls, calls)
+    meta, qsl = _meta(seq_lens, q_lens)
+    q = _query(q_lens, qsl)
+    out = torch.zeros_like(q)
+    kc = _cache()
+    layer = types.SimpleNamespace(_k_scale_float=1.0, _v_scale_float=1.0)
+    consumed = self._run_prefill_prefix_decode_rows(
+        layer, q, kc, kc, meta, out, qsl, meta.seq_lens, (-1, -1)
+    )
+    return calls, out, consumed
+
+
+def test_e5m2_mixed_knob0_expands_q8(monkeypatch):
+    calls, out, consumed = _run_e5m2_mixed(monkeypatch, "0", MQ, MS)
+    assert calls["grouped"] == [] and consumed == {0, 1, 2, 3}
+    assert len(calls["xqa"]) == 1 and calls["xqa"][0]["rows"] == 18
+
+
+def test_e5m2_mixed_knob1_q8_grouped_q1_decode_rows(monkeypatch):
+    calls, out, consumed = _run_e5m2_mixed(monkeypatch, "1", MQ, MS)
+    assert consumed == {0, 1, 2, 3}
+    assert [c["q_val"] for c in calls["grouped"]] == [2, 4]
+    assert [c["seq_lens"] for c in calls["grouped"]] == [[70000], [131000]]
+    assert len(calls["xqa"]) == 1 and calls["xqa"][0]["rows"] == 2
+    assert calls["xqa"][0]["seq_lens"] == [5000, 6000]
+    assert (out[1:9, 0, 0] == 6).all() and (out[10:18, 0, 0] == 12).all()
+    assert out[0, 0, 0].item() == 10 and out[9, 0, 0].item() == 30

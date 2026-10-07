@@ -8,7 +8,7 @@ collected and skipped on CPU. NOT RUN when it was written (CPU-only session).
 Real NVFP4 and E5M2 paged caches (page 1728 = a page size the grouped gate
 admits natively), a batch of 10 requests with q=8 at ctx 4K / 70K / 131K mixed
 (reqs=10 is rejected by the whole-batch gate, which only admits 2/4/8), and an
-NVFP4 mixed batch (three q=8 decoders + one q=1 decoder + one 1500-token prefix
+NVFP4 and E5M2 mixed batches (three q=8 decoders + one q=1 decoder + one 1500-token prefix
 append).
 
   * knob=1, every q=8 request is BIT-IDENTICAL to running that request alone
@@ -228,30 +228,44 @@ def test_reqs10_knob0_and_knob1_match_float32_reference(monkeypatch, dtype):
         assert rel <= 2e-3, f"knob={knob} rel-L2 {rel:.3e}"
 
 
-def test_nvfp4_mixed_batch_q8_rows_use_per_request_grouped(monkeypatch):
-    _require("nvfp4")
-    impl, calls = _make_impl(monkeypatch, "nvfp4")
+@pytest.mark.parametrize("dtype", ["nvfp4", "fp8_e5m2"])
+def test_mixed_batch_q8_rows_use_per_request_grouped(monkeypatch, dtype):
+    _require(dtype)
+    impl, calls = _make_impl(monkeypatch, dtype)
     seq_lens = [s for _, s in MIXED_ROWS]
     q_lens = [q for q, _ in MIXED_ROWS]
-    cache, table, kv = _build_cache("nvfp4", seq_lens, seed=7203)
+    cache, table, kv = _build_cache(dtype, seq_lens, seed=7203)
     meta, qsl = _meta(table, seq_lens, q_lens)
     query = torch.randn(int(qsl[-1]), Q_HEADS, HEAD_DIM, device="cuda").mul_(0.5).half()
 
-    # Reserve the bridge workspace the way profile_run does (attn_metadata=None).
-    prof = torch.empty_like(query[: MIXED_ROWS[-1][0]])
-    impl.forward(LAYER, prof, prof[:, :1], prof[:, :1], cache, None, prof.clone())
-
-    def forward():
-        out = torch.full_like(query, -99.0)
+    if dtype == "nvfp4":
+        # Reserve the bridge workspace the way profile_run does.
+        prof = torch.empty_like(query[: MIXED_ROWS[-1][0]])
+        impl.forward(LAYER, prof, prof[:, :1], prof[:, :1], cache, None, prof.clone())
         kvz = torch.zeros(query.shape[0], 1, HEAD_DIM, dtype=torch.float16, device="cuda")
-        impl.forward(LAYER, query, kvz, kvz, cache, meta, out)
-        torch.cuda.synchronize()
-        return out
+
+        def forward():
+            out = torch.full_like(query, -99.0)
+            impl.forward(LAYER, query, kvz, kvz, cache, meta, out)
+            torch.cuda.synchronize()
+            return out
+    else:
+        # e5m2 mixed batch: the chunked-prefill-with-prefix route, which owns
+        # _run_prefill_prefix_decode_rows. kv layout there is [2, blocks, ...].
+        kv_cache = torch.stack([cache[:, 0], cache[:, 1]])
+
+        def forward():
+            out = torch.full_like(query, -99.0)
+            impl._flash_v100_prefill_with_prefix(
+                LAYER, query, None, None, kv_cache, meta, out
+            )
+            torch.cuda.synchronize()
+            return out
 
     monkeypatch.setenv(KNOB, "0")
     calls.clear()
     off = forward()
-    assert calls == []  # q=8 decoders were expanded to XQA rows
+    assert calls == []  # q=8 decoders were expanded to per-row decode
     monkeypatch.setenv(KNOB, "1")
     calls.clear()
     on = forward()
