@@ -295,19 +295,25 @@ def test_mixed_batch_q8_rows_use_per_request_grouped(monkeypatch, dtype):
     # The append chunk is untouched by the knob: bit-identical.
     s1 = int(qsl[3])
     assert torch.equal(on[s1 + 1 :], off[s1 + 1 :])
-    # The q=1 decoder shares a batch with the 24 expanded rows, so its split
-    # order differs from the knob-0 run: allow <= 1 fp16 ulp and check rel-L2
-    # against the float32 reference (Fable's reading of the relay 16 P7G failure).
+    # The q=1 decoder takes the paged-decode entry alone with the knob on but
+    # shares a batch with the 24 expanded rows with it off, so the two are not
+    # bit-identical. Fable 23:34 final criterion: rel-L2 vs the float32
+    # reference must be <= 2e-3 and <= 1.25x the knob-off rel-L2; ulp is
+    # recorded only.
     a = on[s1 : s1 + 1].contiguous().view(torch.int16).long()
     b = off[s1 : s1 + 1].contiguous().view(torch.int16).long()
     ord_a = torch.where(a < 0, -(a & 0x7FFF), a & 0x7FFF)
     ord_b = torch.where(b < 0, -(b & 0x7FFF), b & 0x7FFF)
     max_ulp = int((ord_a - ord_b).abs().max().item())
     ref1 = _reference(query[s1 : s1 + 1], *kv[3], seq_lens[3])
-    rel1 = ((on[s1 : s1 + 1].float() - ref1).norm() / ref1.norm()).item()
-    print(f"mixed q=1 decoder: max ulp on-vs-off {max_ulp}, rel-L2 {rel1:.3e}")
-    assert max_ulp <= 1, max_ulp
-    assert rel1 <= 2e-3
+    rel_on = ((on[s1 : s1 + 1].float() - ref1).norm() / ref1.norm()).item()
+    rel_off = ((off[s1 : s1 + 1].float() - ref1).norm() / ref1.norm()).item()
+    print(
+        f"mixed q=1 decoder: max ulp on-vs-off {max_ulp} (not asserted), "
+        f"rel-L2 on {rel_on:.3e} off {rel_off:.3e}"
+    )
+    assert rel_on <= 2e-3, rel_on
+    assert rel_on <= 1.25 * rel_off, (rel_on, rel_off)
 
 
 def _pad(query, start, i):
