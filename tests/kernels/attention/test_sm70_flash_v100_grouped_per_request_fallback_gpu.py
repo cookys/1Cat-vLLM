@@ -17,6 +17,17 @@ append).
   * knob=0 (per-row XQA) and knob=1 both stay within rel-L2 <= 2e-3 of a float32
     causal reference over the dequantized cache.
 
+Graph-baked loop count (test_graph_baked_16_loop_with_6_zero_seqlen_rows): the
+loop count ``real = num_actual_tokens // 8`` is a Python int fixed when the
+CUDA graph is captured, while ``block_table`` / ``seq_lens`` are device tensors
+refreshed on every replay. A graph captured at 16 requests and replayed with 10
+live ones therefore still issues 16 B1 launches, and the 6 padded tail requests
+carry ``seq_len == 0`` (block_table rows of 0). The native kernel's behaviour
+for ``seq_len == 0`` could not be read from source (only the .so ships), so the
+test pins it empirically: no exception, the 10 real outputs bit-identical to
+B1 alone, no NaN/Inf in the real slices, and what B1 writes into the padded
+slices is printed (-s) for the record.
+
 Run in a GPU window (needs an idle V100; never on :8001's cards):
 
   CUDA_VISIBLE_DEVICES=<idx> PYTHONPATH=/data/src/1cat-wt-grpfb \\
@@ -292,3 +303,40 @@ def _pad(query, start, i):
     buf = torch.zeros(8 * (i + 1), Q_HEADS, HEAD_DIM, dtype=query.dtype, device=query.device)
     buf[8 * i : 8 * i + 8] = query[start : start + 8]
     return buf
+
+
+@pytest.mark.parametrize("dtype", ["nvfp4", "fp8_e5m2"])
+def test_graph_baked_16_loop_with_6_zero_seqlen_rows(monkeypatch, dtype):
+    _require(dtype)
+    impl, calls = _make_impl(monkeypatch, dtype)
+    cache, table10, _ = _build_cache(dtype, CTX10, seed=7204)
+    # Padded tail as after capture@16 / replay with 10 live requests.
+    table = torch.zeros(16, table10.shape[1], dtype=torch.int32, device="cuda")
+    table[:10] = table10
+    seq_lens = CTX10 + [0] * 6
+    query = torch.randn(128, Q_HEADS, HEAD_DIM, device="cuda").mul_(0.5).half()
+    meta, qsl = _meta(table, seq_lens, [8] * 16)
+    assert meta.num_actual_tokens == 128  # loop count baked at 16
+
+    monkeypatch.setenv(KNOB, "1")
+    calls.clear()
+    out = torch.full_like(query, -99.0)
+    ok = impl._try_grouped_verify_per_request(
+        LAYER, query, cache[:, 0], cache[:, 1], meta, out, 128
+    )
+    torch.cuda.synchronize()
+    assert ok and calls == [1] * 16, calls
+
+    real, tail = out[:80], out[80:]
+    assert torch.isfinite(real).all(), "NaN/Inf leaked into the real requests' rows"
+    for i in range(10):
+        meta1, qsl1 = _meta(table[i : i + 1], [seq_lens[i]], [8])
+        alone = _verify(impl, cache, query[8 * i : 8 * i + 8], meta1, qsl1)
+        assert torch.equal(real[8 * i : 8 * i + 8], alone), f"request {i} differs"
+    untouched = (tail == -99.0).all().item()
+    print(
+        f"[{dtype}] B1 on seq_len=0 rows: untouched={untouched} "
+        f"nan={torch.isnan(tail).sum().item()} inf={torch.isinf(tail).sum().item()} "
+        f"all_zero={(tail == 0).all().item()} "
+        f"min={tail.float().min().item():.4g} max={tail.float().max().item():.4g}"
+    )
