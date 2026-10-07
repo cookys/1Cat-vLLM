@@ -192,10 +192,42 @@ __device__ __forceinline__ uint4 nvfp4_word_to_half8(const uint32_t word,
 __device__ __forceinline__ void nvfp4_data16_to_half32(const uint4 data,
                                                        const uint32_t scales2,
                                                        uint4 (&out)[4]) {
-  const __half2 s0 = __half2half2(
-      __float2half_rn(fp8_e4m3fn_to_float(static_cast<uint8_t>(scales2))));
-  const __half2 s1 = __half2half2(__float2half_rn(
-      fp8_e4m3fn_to_float(static_cast<uint8_t>(scales2 >> 8))));
+  // Branch-free, conversion-free E4M3FN -> fp16 for the two block scales
+  // (replaces fp8_e4m3fn_to_float + __float2half_rn: I2F/F2F/BSSY/BSYNC).
+  // Bit math: E4M3 = s eeee mmm (bias 7). Placing the 4 exponent bits at fp16
+  // exponent bits 10..13 and the 3 mantissa bits at fp16 mantissa bits 9..7
+  // ((raw << 7) & 0x3f80) gives an fp16 whose value is E4M3 * 2^-8 for every
+  // code: normals (fp16 bias 15 = 7 + 8) and subnormals (E4M3: m*2^-9; fp16
+  // subnormal with m<<7: m*128*2^-24 = m*2^-17 = m*2^-9 * 2^-8) alike. So one
+  // exact fp16 multiply by 2^8 = 256 (0x5c00) restores the value; every E4M3
+  // magnitude (2^-9..448) is a normal fp16, so the product is exact, and the
+  // sign bit (raw << 8) & 0x8000 keeps -0. E4M3FN NaN (low 7 bits == 0x7f)
+  // would decode to 480 here, so its lane is forced to 0x7fff (the half bits
+  // the old float path quiet_nan_f -> __float2half_rn produced) BEFORE the
+  // multiply; HMUL2 keeps a NaN input NaN (canonical 0x7fff). The NaN test is
+  // pure integer arithmetic: ((raw & 0x7f) + 1) has bit 7 set iff raw&0x7f ==
+  // 0x7f, so no ISETP/SEL/branch is needed.
+  const uint32_t pair = __byte_perm(scales2, 0u, 0x4140);  // b0 | b1 << 16
+  uint32_t raw_h = ((pair << 7) & 0x3f803f80u) | ((pair << 8) & 0x80008000u);
+  // per-lane NaN (low 7 bits == 0x7f): (x & 0x7f) + 1 sets bit 7 only then.
+  const uint32_t y = ((pair & 0x007f007fu) + 0x00010001u) & 0x00800080u;
+  const uint32_t nanm = (y << 8) - (y >> 7);  // 0x7fff in NaN lanes else 0
+  raw_h = (raw_h & ~(y << 8)) | nanm;         // NaN lane -> 0x7fff (x256 keeps NaN)
+  union {
+    uint32_t u;
+    __half2 h;
+  } m, c256;
+  c256.u = 0x5c005c00u;
+  m.u = raw_h;
+  m.h = __hmul2(m.h, c256.h);
+  union {
+    uint32_t u;
+    __half2 h;
+  } s0u, s1u;
+  s0u.u = __byte_perm(m.u, 0u, 0x1010);
+  s1u.u = __byte_perm(m.u, 0u, 0x3232);
+  const __half2 s0 = s0u.h;
+  const __half2 s1 = s1u.h;
   out[0] = nvfp4_word_to_half8(data.x, s0);
   out[1] = nvfp4_word_to_half8(data.y, s0);
   out[2] = nvfp4_word_to_half8(data.z, s1);
