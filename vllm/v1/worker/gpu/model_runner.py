@@ -30,6 +30,7 @@ import torch.nn as nn
 
 from vllm import envs
 from vllm.compilation.counter import compilation_counter
+from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import (
@@ -1531,6 +1532,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             empty_output = self.kv_connector.no_forward(scheduler_output)
             return empty_output
 
+        cudagraph_stats = None
+        if (
+            not dummy_run
+            and not is_profile
+            and self.vllm_config.observability_config.cudagraph_metrics
+        ):
+            # Report the final DP-synchronized dispatch, as in the V1 runner.
+            # All fields are host metadata; collecting them adds no device sync.
+            cudagraph_stats = CUDAGraphStat(
+                num_unpadded_tokens=num_toks,
+                num_padded_tokens=batch_desc.num_tokens,
+                num_paddings=batch_desc.num_tokens - num_toks,
+                runtime_mode=str(batch_desc.cg_mode),
+            )
+
         early_ple_model_inputs: dict[str, Any] | None = None
         if not dummy_run:
             # Common case.
@@ -1756,6 +1772,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
+            cudagraph_stats=cudagraph_stats,
         )
         self._sm70_v2_mtp_profile_pending = mtp_profile_ctx
 
@@ -1779,6 +1796,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
+        cudagraph_stats = self.execute_model_state.cudagraph_stats
         self.execute_model_state = None
         mtp_profile_ctx = self._sm70_v2_mtp_profile_pending
         self._sm70_v2_mtp_profile_pending = None
@@ -1834,6 +1852,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
+            cudagraph_stats=cudagraph_stats,
         )
         # Start async output copy here so that it can overlap with speculator proposal.
         async_output = AsyncOutput(
@@ -1992,6 +2011,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         input_batch = self.execute_model_state.input_batch
         hidden_states = self.execute_model_state.hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
+        cudagraph_stats = self.execute_model_state.cudagraph_stats
         self.execute_model_state = None
 
         # Post-step KV connector related operations.
@@ -2011,6 +2031,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_ids=input_batch.req_ids,
             req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
             kv_connector_output=kv_connector_output,
+            cudagraph_stats=cudagraph_stats,
         )
         async_output = AsyncPoolingOutput(
             model_runner_output=model_runner_output,
@@ -2104,3 +2125,4 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     finished_req_ids: set[str]
+    cudagraph_stats: CUDAGraphStat | None = None
