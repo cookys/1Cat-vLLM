@@ -6,7 +6,21 @@ VLLM_FLASH_V100_KV_DUMP_DIR (default "" = disabled) turns on a hook in the
 SM70 Flash-V100 ``do_kv_cache_update``. It runs *before* any quantizing store
 and copies the fresh K/V of the first request (request 0 of the batch, only
 while its context grows contiguously) into per-layer CPU buffers until
-VLLM_FLASH_V100_KV_DUMP_MAX_TOKENS tokens were collected. Output:
+VLLM_FLASH_V100_KV_DUMP_MAX_TOKENS tokens were collected. v2 (relay 14 step D
+produced 8-token warm-up dumps and mixed draft layers into the meta):
+
+* VLLM_FLASH_V100_KV_DUMP_MIN_TOKENS (default 4096): a layer only latches onto a
+  request whose first chunk has >= MIN_TOKENS tokens and no cached prefix
+  (seq_len == chunk), so warm-up / profile / draft calls never qualify.
+* VLLM_FLASH_V100_KV_DUMP_LAYER_PREFIX (default "language_model.model.layers."):
+  only layers whose name starts with it are hooked; others (the DFlash2 draft's
+  "model.layers.64..68") are listed under ``skipped_layers`` in meta.
+* meta is per layer (``layers_info``): tokens, complete, shapes at the hook,
+  saved shape, dtype, this layer's own kv_cache_dtype / num_kv_heads / head_dim.
+  (relay 14's head_dim=128/num_kv_heads=2 came from the *draft* layers
+  overwriting one global meta field; main 27B layers are [tokens, 256], 1 head.)
+
+Output:
 
     <dir>/rank<r>/layer<L>_k.npy   fp16 [tokens, head_dim]  ([tokens, heads, head_dim] if heads > 1)
     <dir>/rank<r>/layer<L>_v.npy
@@ -39,9 +53,20 @@ _DUMPER: KVDumper | None = None
 
 
 class KVDumper:
-    def __init__(self, dump_dir: str, max_tokens: int, rank: int = 0) -> None:
+    def __init__(
+        self,
+        dump_dir: str,
+        max_tokens: int,
+        rank: int = 0,
+        min_tokens: int = 4096,
+        layer_prefix: str = "language_model.model.layers.",
+    ) -> None:
         import os
 
+        self.min_tokens = int(min_tokens)
+        self.layer_prefix = layer_prefix
+        self._skipped: set[str] = set()
+        self._shapes: dict[str, dict[str, Any]] = {}
         self.dir = os.path.join(dump_dir, f"rank{rank}")
         self.root = dump_dir
         self.max_tokens = int(max_tokens)
@@ -53,9 +78,12 @@ class KVDumper:
         self._logged_written = False
         self._meta_extra: dict[str, Any] = {}
         logger.info(
-            "FLASH_ATTN_V100 KV dump active dir=%s max_tokens=%d rank=%d",
+            "FLASH_ATTN_V100 KV dump active dir=%s max_tokens=%d min_tokens=%d "
+            "layer_prefix=%r rank=%d",
             dump_dir,
             self.max_tokens,
+            self.min_tokens,
+            layer_prefix,
             rank,
         )
 
@@ -84,20 +112,36 @@ class KVDumper:
         k_scale: float | None = None,
         v_scale: float | None = None,
     ) -> None:
+        if self.layer_prefix and not (layer_name or "").startswith(self.layer_prefix):
+            self._skipped.add(layer_name)
+            return
         if layer_name in self._written:
             if self._log_pending:
                 self._emit_written_log()
             return
-        st = self._state.setdefault(layer_name, {"k": [], "v": [], "n": 0})
         if len(query_start_loc) < 2:
             return
         q0 = int(query_start_loc[1]) - int(query_start_loc[0])
         s0 = int(seq_lens[0])
+        st = self._state.get(layer_name)
+        if st is None:
+            # Not latched yet: only a big, prefix-free first chunk qualifies.
+            if q0 < self.min_tokens or s0 != q0:
+                return
+            st = self._state[layer_name] = {"k": [], "v": [], "n": 0}
+            self._shapes[layer_name] = {
+                # shapes exactly as seen at the hook (before any reshape)
+                "k_shape": list(key.shape),
+                "v_shape": list(value.shape),
+                "in_dtype": str(key.dtype).replace("torch.", ""),
+                "kv_cache_dtype": kv_cache_dtype,
+                "num_kv_heads": num_kv_heads,
+                "head_dim": head_dim,
+                "block_size": block_size,
+            }
         collected = st["n"]
         contiguous = q0 >= 1 and (s0 - q0) == collected
         decode_like = q0 == 1 and collected > 0
-        if collected == 0 and q0 < 2:
-            return  # warmup / dummy decode, not a prompt
         if not contiguous or decode_like:
             if collected > 0:
                 self._finalize(layer_name, kv_cache_dtype, block_size, k_scale, v_scale,
@@ -136,18 +180,17 @@ class KVDumper:
             k, v = k[:, 0, :], v[:, 0, :]
         np.save(os.path.join(self.dir, f"layer{idx}_k.npy"), k)
         np.save(os.path.join(self.dir, f"layer{idx}_v.npy"), v)
-        self._written[layer_name] = {
-            "index": idx,
-            "tokens": int(st["n"]),
-            "k_scale": k_scale,
-            "v_scale": v_scale,
-        }
-        self._meta_extra.update(
-            head_dim=head_dim,
-            num_kv_heads=num_kv_heads,
-            kv_cache_dtype=kv_cache_dtype,
-            block_size=block_size,
+        info = dict(self._shapes.get(layer_name, {}))
+        info.update(
+            index=idx,
+            tokens=int(st["n"]),
+            complete=bool(st["n"] >= self.max_tokens),
+            saved_shape=list(k.shape),
+            dtype="float16",
+            k_scale=k_scale,
+            v_scale=v_scale,
         )
+        self._written[layer_name] = info
         self._write_meta()
         self._log_pending = True
 
@@ -156,18 +199,31 @@ class KVDumper:
 
         done = {n: w for n, w in self._written.items() if w.get("tokens")}
         tokens = max((w["tokens"] for w in done.values()), default=0)
+        tokens_min = min((w["tokens"] for w in done.values()), default=0)
+        first = next(iter(done.values()), {})
         meta = {
             "layers": sorted(w["index"] for w in done.values()),
             "layer_names": {str(w["index"]): n for n, w in done.items()},
             "tokens": tokens,
+            "tokens_min": tokens_min,
+            "complete": bool(done) and all(w["complete"] for w in done.values()),
             "tokens_per_layer": {str(w["index"]): w["tokens"] for w in done.values()},
+            "layers_info": {str(w["index"]): w for w in done.values()},
+            "skipped_layers": sorted(self._skipped),
+            "layer_prefix": self.layer_prefix,
+            "min_tokens": self.min_tokens,
             "max_tokens": self.max_tokens,
             "k_scale": {str(w["index"]): w["k_scale"] for w in done.values()},
             "v_scale": {str(w["index"]): w["v_scale"] for w in done.values()},
             "tp_rank": self.rank,
             "dtype": "float16",
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            **self._meta_extra,
+            # convenience copies from the first dumped (main-model) layer only;
+            # the per-layer truth is layers_info.
+            "head_dim": first.get("head_dim"),
+            "num_kv_heads": first.get("num_kv_heads"),
+            "kv_cache_dtype": first.get("kv_cache_dtype"),
+            "block_size": first.get("block_size"),
         }
         os.makedirs(self.dir, exist_ok=True)
         with open(os.path.join(self.dir, "meta.json"), "w") as f:
@@ -180,11 +236,15 @@ class KVDumper:
         self._log_pending = False
         done = [w for w in self._written.values() if w.get("tokens")]
         logger.info(
-            "FLASH_ATTN_V100 KV dump written dir=%s rank=%d layers=%d tokens=%d",
+            "FLASH_ATTN_V100 KV dump written dir=%s rank=%d layers=%d tokens=%d "
+            "tokens_max=%d complete=%d skipped=%d",
             self.root,
             self.rank,
             len(done),
+            min((w["tokens"] for w in done), default=0),
             max((w["tokens"] for w in done), default=0),
+            sum(1 for w in done if w["complete"]),
+            len(self._skipped),
         )
 
 
@@ -212,6 +272,8 @@ def _get_dumper() -> KVDumper:
             envs.VLLM_FLASH_V100_KV_DUMP_DIR,
             envs.VLLM_FLASH_V100_KV_DUMP_MAX_TOKENS,
             rank,
+            envs.VLLM_FLASH_V100_KV_DUMP_MIN_TOKENS,
+            envs.VLLM_FLASH_V100_KV_DUMP_LAYER_PREFIX,
         )
     return _DUMPER
 

@@ -490,6 +490,8 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_NVFP4_PREFIX_DECODE_ROWS: bool = True
     VLLM_FLASH_V100_KV_DUMP_DIR: str = ""
     VLLM_FLASH_V100_KV_DUMP_MAX_TOKENS: int = 32768
+    VLLM_FLASH_V100_KV_DUMP_MIN_TOKENS: int = 4096
+    VLLM_FLASH_V100_KV_DUMP_LAYER_PREFIX: str = "language_model.model.layers."
 
     VLLM_FLASH_V100_E4M3_GROUPED_FP32: bool = True
     VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN: int = 32768
@@ -3249,6 +3251,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FLASH_V100_KV_DUMP_DIR": lambda: os.getenv("VLLM_FLASH_V100_KV_DUMP_DIR", ""),
     "VLLM_FLASH_V100_KV_DUMP_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_FLASH_V100_KV_DUMP_MAX_TOKENS", "32768")
+    ),
+    # KV dump latches only onto a request whose first prefill chunk has at
+    # least this many tokens (warm-up / profile / draft calls never qualify).
+    "VLLM_FLASH_V100_KV_DUMP_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_FLASH_V100_KV_DUMP_MIN_TOKENS", "4096")
+    ),
+    # KV dump hooks only layers whose name starts with this prefix (main model;
+    # excludes DFlash2/speculator draft layers named model.layers.N).
+    "VLLM_FLASH_V100_KV_DUMP_LAYER_PREFIX": lambda: os.getenv(
+        "VLLM_FLASH_V100_KV_DUMP_LAYER_PREFIX", "language_model.model.layers."
     ),
     "VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY", "0"))

@@ -45,6 +45,10 @@ def env(monkeypatch, tmp_path):
                         raising=False)
     monkeypatch.setattr(kv_dump.envs, "VLLM_FLASH_V100_KV_DUMP_MAX_TOKENS", 6,
                         raising=False)
+    monkeypatch.setattr(kv_dump.envs, "VLLM_FLASH_V100_KV_DUMP_MIN_TOKENS", 3,
+                        raising=False)
+    monkeypatch.setattr(kv_dump.envs, "VLLM_FLASH_V100_KV_DUMP_LAYER_PREFIX",
+                        "language_model.model.layers.", raising=False)
     fake = types.ModuleType("vllm.models.qwen4_exp.nvidia.ops.nvfp4_kv_triton")
     fake.store_nvfp4_kv_triton = lambda *a, **k: state.stored.append((a, k))
     monkeypatch.setitem(
@@ -67,7 +71,7 @@ def env(monkeypatch, tmp_path):
 
 def _layer(i):
     return types.SimpleNamespace(
-        layer_name=f"model.layers.{i}.self_attn.attn",
+        layer_name=f"language_model.model.layers.{i}.self_attn.attn",
         _k_scale=torch.tensor(1.0),
         _v_scale=torch.tensor(1.0),
         _k_scale_float=1.0,
@@ -129,6 +133,10 @@ def test_dump_first_request_only(monkeypatch, env):
     assert meta["head_dim"] == HEAD_DIM and meta["num_kv_heads"] == 1
     assert meta["kv_cache_dtype"] == "nvfp4" and meta["tp_rank"] == 0
     assert meta["block_size"] == 16
+    assert meta["complete"] is True and meta["tokens_min"] == 6
+    info = meta["layers_info"]["3"]
+    assert info["k_shape"] == [7, 1, HEAD_DIM] and info["saved_shape"] == [6, HEAD_DIM]
+    assert info["kv_cache_dtype"] == "nvfp4" and info["complete"] is True
     assert meta["k_scale"]["3"] == 1.0
     # the quantized store saw the original tensors, untouched, every call
     assert len(env.stored) == 3
@@ -146,5 +154,95 @@ def test_new_request_finalizes_short_dump(monkeypatch, env):
     env.md = _md([5], [5])
     env.call(layer, torch.randn(5, 1, HEAD_DIM).half(), k)
     meta = json.loads((env.dir / "rank0" / "meta.json").read_text())
-    assert meta["tokens"] == 3
+    assert meta["tokens"] == 3 and meta["complete"] is False
+    assert meta["layers_info"]["0"]["complete"] is False
     assert np.load(env.dir / "rank0" / "layer0_k.npy").shape == (3, HEAD_DIM)
+
+
+def _draft_layer(i):
+    layer = _layer(i)
+    layer.layer_name = f"model.layers.{i}.self_attn.attn"
+    return layer
+
+
+def test_v2_warmup_draft_and_32k_request(monkeypatch, env):
+    """relay 14 D regression: 8-token warm-up and draft layers must not be dumped."""
+    cap, chunk, hd = 32768, 4096, 4
+    monkeypatch.setattr(kv_dump, "ENABLED", True)
+    monkeypatch.setattr(kv_dump.envs, "VLLM_FLASH_V100_KV_DUMP_MAX_TOKENS", cap)
+    monkeypatch.setattr(kv_dump.envs, "VLLM_FLASH_V100_KV_DUMP_MIN_TOKENS", 4096)
+    main = [_layer(3 + 4 * i) for i in range(16)]
+    draft = [_draft_layer(64 + i) for i in range(5)]
+    impl_draft = types.SimpleNamespace(
+        kv_cache_dtype="auto", nvfp4_kv_available=False,
+        attn_type=mod.AttentionType.DECODER, num_kv_heads=2, head_size=128,
+    )
+    cls = _impl_cls()
+
+    def call_main(layer, k):
+        env.call(layer, k, k)
+
+    # 1) warm-up: 8 tokens on every main layer -> ignored (< MIN_TOKENS)
+    env.md = _md([8], [8])
+    w = torch.zeros(8, 1, hd).half()
+    for layer in main:
+        call_main(layer, w)
+    assert not (env.dir / "rank0").exists()
+    # 2) draft layer calls (2 heads x 128 view) -> ignored by prefix, even if big
+    env.md = _md([chunk], [chunk])
+    dk = torch.zeros(chunk, 2, 128).half()
+    for layer in draft:
+        monkeypatch.setattr(kv_dump, "_metadata_for_layer", lambda n: env.md)
+        # draft attention impl is a different impl instance (kv_cache_dtype=auto)
+        kv_dump.on_kv_update(layer, impl_draft, dk, dk)
+    assert not (env.dir / "rank0").exists()
+    # 3) the real 32K request in 4096-token chunks on all 16 main layers
+    g = torch.Generator().manual_seed(1)
+    ref = {}
+    for c in range(cap // chunk):
+        env.md = _md([chunk], [(c + 1) * chunk])
+        for layer in main:
+            k = torch.randn(chunk, 1, hd, generator=g).half()
+            ref.setdefault(layer.layer_name, []).append(k[:, 0].clone())
+            call_main(layer, k)
+        for layer in draft:  # draft keeps being called every forward
+            kv_dump.on_kv_update(layer, impl_draft, dk, dk)
+    # the next forward (decode) emits the written line
+    env.md = _md([1], [cap + 1])
+    lines = []
+    monkeypatch.setattr(
+        kv_dump.logger, "info", lambda fmt, *args, **kw: lines.append(fmt % args)
+    )
+    call_main(main[0], torch.zeros(1, 1, hd).half())
+    written = [l for l in lines if "KV dump written" in l]
+    assert len(written) == 1
+    assert f"layers=16 tokens={cap} tokens_max={cap} complete=16 skipped=5" in written[0]
+    meta = json.loads((env.dir / "rank0" / "meta.json").read_text())
+    assert meta["layers"] == [3 + 4 * i for i in range(16)]
+    assert meta["tokens"] == cap and meta["tokens_min"] == cap
+    assert meta["complete"] is True
+    assert sorted(meta["skipped_layers"]) == sorted(l.layer_name for l in draft)
+    assert meta["head_dim"] == hd and meta["num_kv_heads"] == 1
+    assert meta["kv_cache_dtype"] == "nvfp4"
+    for layer in main:
+        i = meta["layer_names"]
+        idx = [k for k, n in i.items() if n == layer.layer_name][0]
+        info = meta["layers_info"][idx]
+        assert info["tokens"] == cap and info["complete"] is True
+        assert info["k_shape"] == [chunk, 1, hd] and info["saved_shape"] == [cap, hd]
+        assert info["dtype"] == "float16"
+        kk = np.load(env.dir / "rank0" / f"layer{idx}_k.npy")
+        np.testing.assert_array_equal(kk, torch.cat(ref[layer.layer_name]).numpy())
+    # no draft files at all
+    assert not list((env.dir / "rank0").glob("layer6[4-8]_*"))
+    dumper = kv_dump._DUMPER
+    assert dumper._logged_written
+
+
+def test_v2_prefixed_cached_chunk_does_not_latch(monkeypatch, env):
+    """A big chunk that is not a request start (cached prefix) cannot latch."""
+    monkeypatch.setattr(kv_dump, "ENABLED", True)
+    env.md = _md([4], [100])
+    k = torch.zeros(4, 1, HEAD_DIM).half()
+    env.call(_layer(3), k, k)
+    assert not (env.dir / "rank0").exists()
