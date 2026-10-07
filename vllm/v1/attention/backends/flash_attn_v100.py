@@ -539,6 +539,7 @@ _logged_prefill_prefix_splitkv = False
 _logged_prefill_paged_cache = False
 _logged_prefill_smallq_decode = False
 _logged_prefill_prefix_decode_rows = False
+_logged_nvfp4_mixed_split_fired = False
 _logged_prefill_smallq_decode_xqa = False
 _logged_prefill_smallq_grouped_verify = False
 _logged_prefill_smallq_grouped_verify_gate = False
@@ -5969,7 +5970,21 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             _record_route("nvfp4_first_chunk_fp16")
             return self._flash_v100_prefill(query, key, value, attn_metadata, output)
         _record_route("nvfp4_prefill_bridge")
+        decode_rows: set[int] = set()
+        if envs.VLLM_FLASH_V100_NVFP4_PREFIX_DECODE_ROWS:
+            decode_rows = self._run_nvfp4_mixed_decode_rows(
+                layer,
+                query,
+                key_cache,
+                value_cache,
+                attn_metadata,
+                output,
+                qsl,
+                seq_lens_cpu,
+            )
         for request in range(len(qsl) - 1):
+            if request in decode_rows:
+                continue
             start, end = int(qsl[request]), int(qsl[request + 1])
             end = min(end, int(attn_metadata.num_actual_tokens))
             if start >= end:
@@ -5996,6 +6011,97 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             if not is_destination:
                 output[start:end].copy_(value_out.squeeze(0))
         return output
+
+    def _run_nvfp4_mixed_decode_rows(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+    ) -> set[int]:
+        """Send decode/verify rows of a mixed NVFP4 batch to the paged path.
+
+        Same row selection and per-token expansion as the e5m2
+        ``_run_prefill_prefix_decode_rows``: a row with ``q <=
+        smallq_decode_max_query_len`` and prior context becomes one decode row
+        per query token whose visible KV grows by one, so the causal mask is
+        kept. Without this every resident decoder dequantized its whole
+        sequence to FP16 through the prefix bridge whenever a chunk joined the
+        batch. Returns the consumed row indices (empty when the batch is not
+        mixed, so the caller's bridge loop is unchanged).
+        """
+        global _logged_nvfp4_mixed_split_fired
+        max_q = max(1, int(self.smallq_decode_max_query_len))
+        logger.info_once(
+            "FLASH_ATTN_V100 NVFP4 mixed-batch decode-row split active "
+            "(threshold=%d)",
+            max_q,
+            scope="process",
+        )
+        num_seqs = len(query_start_loc) - 1
+        qsl = [int(x) for x in query_start_loc[: num_seqs + 1].tolist()]
+        seq_lens_host = [int(x) for x in seq_lens_cpu[:num_seqs].tolist()]
+        num_actual = int(attn_metadata.num_actual_tokens)
+        rows = [
+            i
+            for i in range(num_seqs)
+            if 1 <= qsl[i + 1] - qsl[i] <= max_q
+            and qsl[i + 1] <= num_actual
+            and seq_lens_host[i] > qsl[i + 1] - qsl[i]
+        ]
+        if not rows or len(rows) == num_seqs:
+            return set()
+
+        token_idx: list[int] = []
+        token_rows: list[int] = []
+        token_seq_lens: list[int] = []
+        for i in rows:
+            q_len = qsl[i + 1] - qsl[i]
+            for j in range(q_len):
+                token_idx.append(qsl[i] + j)
+                token_rows.append(i)
+                token_seq_lens.append(seq_lens_host[i] - q_len + 1 + j)
+        device = query.device
+        idx = torch.tensor(token_idx, device=device, dtype=torch.long)
+        q_rows = query.index_select(0, idx)
+        out_rows = torch.empty_like(q_rows)
+        block_table = attn_metadata.block_table.index_select(
+            0, torch.tensor(token_rows, device=device, dtype=torch.long)
+        )
+        seq_lens_rows = torch.tensor(
+            token_seq_lens, device=device, dtype=attn_metadata.seq_lens.dtype
+        )
+        max_seq = max(token_seq_lens)
+        if not _logged_nvfp4_mixed_split_fired:
+            logger.info(
+                "FLASH_ATTN_V100 NVFP4 mixed-batch decode-row split fired: "
+                "decode_rows=%d prefill_rows=%d",
+                len(rows),
+                num_seqs - len(rows),
+            )
+            _logged_nvfp4_mixed_split_fired = True
+        _record_route("nvfp4_mixed_decode_rows")
+        self._call_flash_attn_smallq_decode_paged(
+            layer,
+            q_rows,
+            key_cache,
+            value_cache,
+            block_table,
+            seq_lens_rows,
+            attn_metadata,
+            out=out_rows,
+            max_seq_len_hint=max_seq,
+            workspace_seq_capacity_hint=min(
+                int(block_table.shape[1]) * int(key_cache.shape[1]), max_seq
+            ),
+            partition_size_hint=None,
+        )
+        output.index_copy_(0, idx, out_rows)
+        return set(rows)
 
     def _nvfp4_first_chunk_fp16_applies(
         self, query, key, value, qsl, seq_lens_cpu, attn_metadata

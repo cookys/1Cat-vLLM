@@ -507,7 +507,13 @@ def test_nvfp4_bridge_key_ignores_stream(monkeypatch):
 
 
 @pytest.mark.parametrize("destination", [False, True])
-def test_p3_mixed_prefill_uses_actual_lengths_and_ignores_padding(destination):
+def test_p3_mixed_prefill_uses_actual_lengths_and_ignores_padding(
+    destination, monkeypatch
+):
+    # Pins the bridge-for-every-request behaviour; the decode-row split that
+    # now handles the q=1 row by default is covered in
+    # test_sm70_flash_v100_nvfp4_mixed_decode_rows.py.
+    monkeypatch.setenv("VLLM_FLASH_V100_NVFP4_PREFIX_DECODE_ROWS", "0")
     obj = impl()
     obj.nvfp4_paged_kv_to_fp16 = Mock()
     q = torch.zeros(38, 6, 256, dtype=torch.float16)  # 33 live + 5 graph padding

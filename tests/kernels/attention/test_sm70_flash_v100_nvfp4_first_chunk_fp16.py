@@ -68,12 +68,16 @@ def _run(monkeypatch, knob, seq_lens, q_lens):
         num_kv_heads=1,
         nvfp4_paged_kv_to_fp16=object(),
         use_dflash2_grouped_verify=False,
+        smallq_decode_max_query_len=16,
         _flash_v100_has_sliding_window=lambda: False,
         _flash_v100_prefill=fake_prefill,
         _run_fp8_prefill_bridge=fake_bridge,
     )
     self._nvfp4_first_chunk_fp16_applies = types.MethodType(
         cls._nvfp4_first_chunk_fp16_applies, self
+    )
+    self._run_nvfp4_mixed_decode_rows = types.MethodType(
+        cls._run_nvfp4_mixed_decode_rows, self
     )
     monkeypatch.setattr(mod, "_validate_nvfp4_xqa_cache", lambda *a, **k: None)
     monkeypatch.setattr(mod, "_split_paged_kv_cache", lambda c: (c, c))

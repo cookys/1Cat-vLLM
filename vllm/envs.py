@@ -487,6 +487,7 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY: bool = True
     VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY: bool = False
     VLLM_FLASH_V100_NVFP4_FIRST_CHUNK_FP16: bool = True
+    VLLM_FLASH_V100_NVFP4_PREFIX_DECODE_ROWS: bool = True
     VLLM_FLASH_V100_KV_DUMP_DIR: str = ""
     VLLM_FLASH_V100_KV_DUMP_MAX_TOKENS: int = 32768
 
@@ -3236,6 +3237,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fp8 paths) instead of dequantized pages. 0 restores the paged bridge.
     "VLLM_FLASH_V100_NVFP4_FIRST_CHUNK_FP16": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_NVFP4_FIRST_CHUNK_FP16", "1"))
+    ),
+    # NVFP4 KV mixed batch (decode/verify rows + a prefix chunk): decode-like
+    # rows (q <= SMALLQ_DECODE_MAX_Q) take the paged NVFP4 decode path and only
+    # the remaining rows use the FP16 bridge. 0 restores bridge-for-all.
+    "VLLM_FLASH_V100_NVFP4_PREFIX_DECODE_ROWS": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_NVFP4_PREFIX_DECODE_ROWS", "1"))
     ),
     # Diagnostic: dump pre-quantization fp16 K/V of the first request (see
     # vllm/v1/attention/backends/sm70_kv_dump.py). "" = disabled.
