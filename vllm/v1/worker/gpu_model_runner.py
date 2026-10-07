@@ -1346,6 +1346,16 @@ class GPUModelRunner(
         scheduler_config = self.scheduler_config
         parallel_config = self.parallel_config
         self.device = device
+        from vllm.v1.worker.mixed_prefill import MixedPrefillTimer
+
+        self.mixed_prefill_timer = (
+            MixedPrefillTimer()
+            if device.type == "cuda"
+            and scheduler_config.mixed_prefill_step_latency_ms > 0
+            and scheduler_config.mixed_prefill_min_tokens
+            < scheduler_config.mixed_prefill_max_tokens
+            else None
+        )
         self.pin_memory = is_pin_memory_available()
         self.dtype = self.model_config.dtype
 
@@ -8500,6 +8510,9 @@ class GPUModelRunner(
                 "after execute_model() returns None."
             )
 
+        if self.mixed_prefill_timer is not None:
+            self.mixed_prefill_timer.begin(scheduler_output)
+
         trace_enabled = _sm70_worker_trace_enabled(self.use_async_scheduling)
         trace_step = self._sm70_async_worker_execute_trace_step
         trace_log = trace_enabled and (
@@ -9495,6 +9508,11 @@ class GPUModelRunner(
             trace_output_t0 = time.perf_counter() if trace_log else 0.0
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
+                mixed_prefill_timing=(
+                    self.mixed_prefill_timer.finish()
+                    if self.mixed_prefill_timer is not None
+                    else None
+                ),
                 req_id_to_index=req_id_to_index_output_copy,
                 sampled_token_ids=valid_sampled_token_ids,
                 logprobs=logprobs_lists,

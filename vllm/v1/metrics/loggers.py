@@ -625,6 +625,23 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             counter_num_preempted_reqs, per_engine_labelvalues
         )
 
+        self.counter_mixed_prefill_steps = create_metric_per_engine(
+            self._counter_cls(
+                name="vllm:mixed_prefill_steps",
+                documentation="Completed latency-controlled mixed steps.",
+                labelnames=labelnames,
+            ),
+            per_engine_labelvalues,
+        )
+        self.counter_mixed_prefill_tokens = create_metric_per_engine(
+            self._counter_cls(
+                name="vllm:mixed_prefill_tokens",
+                documentation="Prefill rows in completed controlled mixed steps.",
+                labelnames=labelnames,
+            ),
+            per_engine_labelvalues,
+        )
+
         counter_prompt_tokens = self._counter_cls(
             name="vllm:prompt_tokens",
             documentation="Number of prefill tokens processed.",
@@ -1079,6 +1096,12 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 scheduler_stats.num_skipped_waiting_reqs
             )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
+            self.counter_mixed_prefill_steps[engine_idx].inc(
+                scheduler_stats.mixed_prefill_steps
+            )
+            self.counter_mixed_prefill_tokens[engine_idx].inc(
+                scheduler_stats.mixed_prefill_tokens
+            )
 
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries

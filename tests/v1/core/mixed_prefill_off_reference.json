@@ -1,0 +1,13 @@
+{
+  "base": "4a470cc3a (P7 104c33e55 + prefix f6707f55b)",
+  "sha256": {
+    "async=0,spec=0,blocks=20": "294825af63a96f541b6efa20e7a56a00f66758022aa99355b546910a03e94748",
+    "async=0,spec=0,blocks=64": "853c5ce6bfb197e663ce346d150a41276df800eec55ca614d098027897eb73c1",
+    "async=0,spec=7,blocks=20": "62f97cbbc7210f4147f8df48dde4eb3cc5e2a9618f55b31bd961f3de8fc71b36",
+    "async=0,spec=7,blocks=64": "8810cc7e7bf31916ad52273901e04ef5298e91aa93f619a550e347d01e67fec9",
+    "async=1,spec=0,blocks=20": "294825af63a96f541b6efa20e7a56a00f66758022aa99355b546910a03e94748",
+    "async=1,spec=0,blocks=64": "853c5ce6bfb197e663ce346d150a41276df800eec55ca614d098027897eb73c1",
+    "async=1,spec=7,blocks=20": "cee8863f5839c4a81ee700b61ad2cc1d7f67b9825960eb2409aec5ef0bcf5c5e",
+    "async=1,spec=7,blocks=64": "6317b075390bdfe55438eb7cd415333d8ba35ce4c85685151f4f810219a38e69"
+  }
+}

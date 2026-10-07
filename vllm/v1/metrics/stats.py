@@ -182,6 +182,10 @@ class SchedulerStats:
 
     kv_cache_usage: float = 0.0
 
+    # Completed controlled mixed work since the preceding stats delivery.
+    mixed_prefill_steps: int = 0
+    mixed_prefill_tokens: int = 0
+
     prefix_cache_stats: PrefixCacheStats = field(default_factory=PrefixCacheStats)
     connector_prefix_cache_stats: PrefixCacheStats | None = None
 

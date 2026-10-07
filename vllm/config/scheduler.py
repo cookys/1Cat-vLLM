@@ -81,6 +81,24 @@ class SchedulerConfig:
     """For chunked prefill, a request is considered long if the prompt is
     longer than this number of tokens."""
 
+    mixed_prefill_step_latency_ms: float = Field(default=0.0, ge=0)
+    """GPU step latency target when prefill shares a batch with resident decode.
+    The prefill token budget adapts to completed GPU measurements. Pure prefill
+    keeps the normal token budget. Zero disables latency control."""
+
+    mixed_prefill_max_tokens: int = Field(default=512, ge=1)
+    """Hard limit on aggregate prefill rows in a controlled mixed step, not a
+    per-request allowance. Resident decode/verify rows have a separate reserve.
+    Ignored when mixed_prefill_step_latency_ms is zero."""
+
+    mixed_prefill_min_tokens: int = Field(default=128, ge=1)
+    """Lower bound on the adaptive prefill allowance. When enabled, it must not
+    exceed the effective maximum (prefill cap and scheduler token budget).
+    Prevents a decode-only latency floor from driving prefill progress
+    down to tiny chunks. Token/KV availability and alignment may still schedule
+    fewer rows. With latency target > 0, min=max selects a static cap without
+    GPU timing events; latency target 0 always disables the entire controller."""
+
     enable_chunked_prefill: bool = True
     """If True, prefill requests can be chunked based
     on the remaining `max_num_batched_tokens`.
@@ -226,6 +244,15 @@ class SchedulerConfig:
         return None if value is None else handler(value)
 
     def __post_init__(self, max_model_len: int, is_encoder_decoder: bool) -> None:
+        if (
+            self.mixed_prefill_step_latency_ms > 0
+            and self.mixed_prefill_min_tokens
+            > min(self.mixed_prefill_max_tokens, self.max_num_batched_tokens)
+        ):
+            raise ValueError(
+                "mixed_prefill_min_tokens must not exceed mixed_prefill_max_tokens "
+                "or max_num_batched_tokens when mixed prefill control is enabled"
+            )
         if is_encoder_decoder:
             # Chunked prefill should be disabled for encoder-decoder models.
             self.disable_chunked_mm_input = True
