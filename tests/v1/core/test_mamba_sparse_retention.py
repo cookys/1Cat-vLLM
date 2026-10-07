@@ -19,6 +19,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
+    SlidingWindowSpec,
 )
 
 # These tests allocate only block metadata; no device/distributed state exists.
@@ -133,8 +134,8 @@ def test_long_b_does_not_flush_a_when_sparse_enabled(interval, expected):
     assert pool.get_num_free_blocks() == 649
 
 
-@pytest.mark.parametrize("alignment", [800, 1600])
-def test_admission_falls_back_for_different_alignment(alignment):
+@pytest.mark.parametrize("alignment", [800, 1600, 3200])
+def test_admission_handles_integral_alignment_multiples(alignment):
     def retained(interval):
         pool = BlockPool(80, True, 8)
         manager = _mamba(pool, 800, 1)
@@ -144,10 +145,113 @@ def test_admission_falls_back_for_different_alignment(alignment):
         return [i for i, h in enumerate(hashes) if pool.get_cached_block(h, [1])]
 
     dense, sparse = retained(None), retained(16000)
-    if alignment == 800:
-        assert len(sparse) < len(dense)
-    else:
-        assert sparse == dense
+    assert len(sparse) < len(dense)
+    assert sparse == [19]
+
+
+@pytest.mark.parametrize("alignment", [400, 1200])
+def test_admission_keeps_dense_fallback_for_nonintegral_alignment(alignment):
+    spec = _mamba(BlockPool(8, True, 8), 800, 0).kv_cache_spec
+    assert MambaManager.reachable_block_mask(0, 8, alignment, spec, 0) is None
+
+
+@pytest.mark.parametrize("alignment", [800, 1600, 3200])
+@pytest.mark.parametrize("boundary", [0, 799, 800, 1599, 1600, 1601, 3199, 3200])
+def test_mixed_mask_retains_only_reachable_state(alignment, boundary):
+    spec = _mamba(BlockPool(8, True, 8), 800, 0).kv_cache_spec
+    mask = MambaManager.reachable_block_mask(0, 5, alignment, spec, 0, (boundary,))
+    expected = boundary // alignment * alignment // 800 - 1
+    assert mask == [i == expected for i in range(5)]
+    assert (
+        MambaManager.reachable_block_mask(0, 5, alignment, spec, None, (boundary,))
+        is None
+    )
+
+
+@pytest.mark.parametrize("ratio", [2, 4])
+@pytest.mark.parametrize("periods", [1, 3])
+def test_mixed_periodic_mask_uses_alignment_grid_across_slices(ratio, periods):
+    spec = _mamba(BlockPool(8, True, 8), 800, 0).kv_cache_spec
+    alignment = ratio * 800
+    interval = periods * alignment
+    boundaries = [alignment + 123, 5 * alignment - 1]
+    whole = MambaManager.reachable_block_mask(
+        0, 17, alignment, spec, interval, boundaries
+    )
+    pieces = []
+    for start, end in ((0, 3), (3, 8), (8, 17)):
+        pieces.extend(
+            MambaManager.reachable_block_mask(
+                start, end, alignment, spec, interval, boundaries
+            )
+        )
+    assert pieces == whole
+    for index, retained in enumerate(whole):
+        expected = (index + 1) * 800 % interval == 0 or (index + 1) * 800 in (
+            alignment,
+            4 * alignment,
+        )
+        assert retained == expected
+        if retained:
+            assert (index + 1) % ratio == 0
+
+
+def _dflash_mixed_manager(nvfp4, capacity=None):
+    # Resolved 27B TP4 geometry. This allocates Python block metadata only.
+    block = 4096 if nvfp4 else 2048
+    full = FullAttentionSpec(
+        block_size=4096, num_kv_heads=1, head_size=256, dtype=torch.uint8
+    )
+    mamba = MambaSpec(
+        block_size=block,
+        shapes=((1,),),
+        dtypes=(torch.float16,),
+        mamba_cache_mode="align",
+        num_speculative_blocks=7,
+    )
+    sw = SlidingWindowSpec(
+        block_size=1024 if nvfp4 else 2048,
+        num_kv_heads=2,
+        head_size=128,
+        dtype=torch.float16,
+        sliding_window=2048,
+    )
+    groups = [KVCacheGroupSpec([f"mamba{i}"], mamba) for i in range(6)]
+    groups += [KVCacheGroupSpec([f"full{i}"], full) for i in range(2)]
+    groups += [KVCacheGroupSpec(["draft"], sw)]
+    groups[-1].is_eagle_group = True
+    config = KVCacheConfig(capacity or (1804 if nvfp4 else 1054), [], groups)
+    return KVCacheManager(
+        config, 262144, 8, use_eagle=True, prefix_cache_retention_interval=0
+    )
+
+
+@pytest.mark.parametrize("nvfp4", [False, True])
+def test_mixed_dflash_ten_long_prefills_preserve_prior_replay_states(nvfp4):
+    cm = _dflash_mixed_manager(nvfp4)
+    lengths = [29594, 44703, 88692, 62834, 136608, 109214, 47982, 41052, 84716, 157068]
+    requests = [_request(f"producer{i}", n) for i, n in enumerate(lengths)]
+    for request in requests:
+        _coordinated_prefill(cm, request, 4096 if nvfp4 else 2048)
+    for request in requests:
+        _, hit = cm.get_computed_blocks(request)
+        # Replay certificate lies one shared alignment before the prompt end.
+        assert hit == ((request.num_tokens - 1) // 4096 - 1) * 4096
+    assert cm.block_pool.get_num_free_blocks() == cm.block_pool.num_gpu_blocks - 1
+
+
+@pytest.mark.parametrize("nvfp4", [False, True])
+@pytest.mark.parametrize("length", [32767, 32768, 32769])
+def test_mixed_dflash_resend_and_append(nvfp4, length):
+    cm = _dflash_mixed_manager(nvfp4)
+    original = _request("conversation", length)
+    _coordinated_prefill(cm, original, 4096 if nvfp4 else 2048)
+    _, resend = cm.get_computed_blocks(original)
+    _, append = cm.get_computed_blocks(_request("conversation", length + 8192))
+    # At an exact prompt boundary the extension checkpoint can also serve a
+    # resend: the smaller draft page supplies the required lookahead suffix.
+    assert resend == (length // 4096 - 1) * 4096
+    assert append == (length // 4096 - 1) * 4096
 
 
 @pytest.mark.parametrize("enable_caching", [False, True])

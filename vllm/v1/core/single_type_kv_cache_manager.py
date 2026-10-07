@@ -1457,8 +1457,15 @@ class MambaManager(SingleTypeKVCacheManager):
             return None
         assert isinstance(kv_cache_spec, MambaSpec)
         block_size = kv_cache_spec.block_size
-        # Preserve the previous dense fallback for unproven mixed alignments.
-        if kv_cache_spec.mamba_cache_mode != "align" or alignment_tokens != block_size:
+        # Hybrid page unification can grow attention blocks while preserving an
+        # explicitly configured Mamba checkpoint grid. A shared replay boundary
+        # remains a valid state index whenever the alignment is a multiple of
+        # that grid. Falling back to dense admission here fills the shared LRU
+        # with intermediate recurrent states that sparse retention meant to omit.
+        if (
+            kv_cache_spec.mamba_cache_mode != "align"
+            or alignment_tokens % block_size != 0
+        ):
             return None
         mask = [False] * (end_block - start_block)
         if retention_interval:
