@@ -24,6 +24,7 @@ from typing import cast
 import torch
 
 import vllm.envs as envs
+import vllm.v1.attention.backends.sm70_kv_dump as _kv_dump
 from vllm.config.speculative import get_dflash_model_draft_tokens
 from vllm.forward_context import CUDAGRAPH_VARIANT_LONG_CONTEXT
 from vllm.logger import init_logger
@@ -5808,6 +5809,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         )
 
     def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
+        if _kv_dump.ENABLED:
+            _kv_dump.on_kv_update(layer, self, key, value)
         if self.kv_cache_dtype != "nvfp4":
             return super().do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)
         if not self.nvfp4_kv_available:
