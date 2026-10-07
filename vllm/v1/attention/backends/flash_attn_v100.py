@@ -530,6 +530,7 @@ _warned_prefill_gather_oom = False
 _warned_prefill_dense_splitkv3_oom = False
 _warned_prefill_d256_gqa_architecture_oom = False
 _logged_prefill_flash = False
+_logged_nvfp4_first_chunk_fp16 = False
 _logged_prefill_prefix_flash = False
 _logged_prefill_prefix_contig_dense = False
 _logged_prefill_prefix_bfla = False
@@ -5955,6 +5956,15 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         # Dense cu_seqlens/slices need exact lengths, not scheduler upper bounds.
         # One eager transfer per layer also covers mixed decode/prefill batches.
         seq_lens_cpu = seq_lens.to(device="cpu")
+        if self._nvfp4_first_chunk_fp16_applies(
+            query, key, value, qsl, seq_lens_cpu, attn_metadata
+        ):
+            # The K/V of this chunk were already written to the NVFP4 pages by
+            # do_kv_cache_update (runs before forward), so later chunks and
+            # decode still read them. This chunk itself attends over the
+            # fresh FP16 K/V, exactly like the fp8/fp16 no-prefix route.
+            _record_route("nvfp4_first_chunk_fp16")
+            return self._flash_v100_prefill(query, key, value, attn_metadata, output)
         _record_route("nvfp4_prefill_bridge")
         for request in range(len(qsl) - 1):
             start, end = int(qsl[request]), int(qsl[request + 1])
@@ -5983,6 +5993,45 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             if not is_destination:
                 output[start:end].copy_(value_out.squeeze(0))
         return output
+
+    def _nvfp4_first_chunk_fp16_applies(
+        self, query, key, value, qsl, seq_lens_cpu, attn_metadata
+    ) -> bool:
+        """True when this NVFP4 prefill batch is entirely no-prefix chunks.
+
+        Gated by VLLM_FLASH_V100_NVFP4_FIRST_CHUNK_FP16 (default on). Mixed
+        batches (any request with prefix context) keep the paged bridge.
+        """
+        global _logged_nvfp4_first_chunk_fp16
+        if not envs.VLLM_FLASH_V100_NVFP4_FIRST_CHUNK_FP16:
+            if not _logged_nvfp4_first_chunk_fp16:
+                logger.info(
+                    "FLASH_ATTN_V100 NVFP4 first-chunk fp16 route disabled "
+                    "(VLLM_FLASH_V100_NVFP4_FIRST_CHUNK_FP16=0); first chunk "
+                    "reads quantized KV via the paged bridge."
+                )
+                _logged_nvfp4_first_chunk_fp16 = True
+            return False
+        num_actual = int(attn_metadata.num_actual_tokens)
+        if key is None or value is None:
+            return False
+        if key.shape[0] < num_actual or value.shape[0] < num_actual:
+            return False
+        for request in range(len(qsl) - 1):
+            start = int(qsl[request])
+            end = min(int(qsl[request + 1]), num_actual)
+            if start >= end:
+                continue
+            if int(seq_lens_cpu[request]) != end - start:
+                return False
+        if not _logged_nvfp4_first_chunk_fp16:
+            logger.info(
+                "FLASH_ATTN_V100 NVFP4 first-chunk fp16 route active "
+                "(no-prefix prefill chunk uses fp16 K/V; "
+                "VLLM_FLASH_V100_NVFP4_FIRST_CHUNK_FP16=1)."
+            )
+            _logged_nvfp4_first_chunk_fp16 = True
+        return True
 
     def _supports_flash_v100_path(self) -> bool:
         """Check whether current layer/config can run Flash V100 safely."""

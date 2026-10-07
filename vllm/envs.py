@@ -486,6 +486,7 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_DECODE_USE_XQA: bool = True
     VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY: bool = True
     VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY: bool = False
+    VLLM_FLASH_V100_NVFP4_FIRST_CHUNK_FP16: bool = True
 
     VLLM_FLASH_V100_E4M3_GROUPED_FP32: bool = True
     VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN: int = 32768
@@ -3229,6 +3230,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Keep batched admission independent until the request-major kernel has
     # passed B2/B4/B8 operator, graph, endpoint, and quality gates.
+    # NVFP4 KV: no-prefix prefill chunk attends over fresh fp16 K/V (like the
+    # fp8 paths) instead of dequantized pages. 0 restores the paged bridge.
+    "VLLM_FLASH_V100_NVFP4_FIRST_CHUNK_FP16": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_NVFP4_FIRST_CHUNK_FP16", "1"))
+    ),
     "VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY", "0"))
     ),
