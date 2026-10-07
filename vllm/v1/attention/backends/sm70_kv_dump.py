@@ -50,6 +50,7 @@ ENABLED: bool = bool(envs.VLLM_FLASH_V100_KV_DUMP_DIR)
 
 _LAYER_RE = re.compile(r"layers?\.(\d+)")
 _DUMPER: KVDumper | None = None
+_NO_CTX_LOGGED = False
 
 
 class KVDumper:
@@ -74,7 +75,6 @@ class KVDumper:
         self._state: dict[str, dict[str, Any]] = {}
         self._layer_ids: dict[str, int] = {}  # layer_name -> file index
         self._written: dict[str, dict[str, Any]] = {}
-        self._log_pending = False
         self._logged_written = False
         self._meta_extra: dict[str, Any] = {}
         logger.info(
@@ -116,8 +116,6 @@ class KVDumper:
             self._skipped.add(layer_name)
             return
         if layer_name in self._written:
-            if self._log_pending:
-                self._emit_written_log()
             return
         if len(query_start_loc) < 2:
             return
@@ -171,6 +169,7 @@ class KVDumper:
         st = self._state.pop(layer_name, None)
         if st is None or st["n"] == 0:
             self._written[layer_name] = {"tokens": 0}
+            self._maybe_emit_written_log()
             return
         idx = self._file_index(layer_name, len(self._written))
         os.makedirs(self.dir, exist_ok=True)
@@ -192,7 +191,17 @@ class KVDumper:
         )
         self._written[layer_name] = info
         self._write_meta()
-        self._log_pending = True
+        self._maybe_emit_written_log()
+
+    def _maybe_emit_written_log(self) -> None:
+        # Synchronous at finalize (v3): print once, as soon as no latched layer
+        # is still collecting, i.e. right after the last layer's meta.json write.
+        # Never depends on a later hook call (those may have no forward context).
+        if self._state:
+            return
+        if not any(w.get("tokens") for w in self._written.values()):
+            return
+        self._emit_written_log()
 
     def _write_meta(self) -> None:
         import os
@@ -233,7 +242,6 @@ class KVDumper:
         if self._logged_written:
             return
         self._logged_written = True
-        self._log_pending = False
         done = [w for w in self._written.values() if w.get("tokens")]
         logger.info(
             "FLASH_ATTN_V100 KV dump written dir=%s rank=%d layers=%d tokens=%d "
@@ -249,13 +257,26 @@ class KVDumper:
 
 
 def _metadata_for_layer(layer_name: str) -> Any:
-    from vllm.forward_context import get_forward_context
+    """Per-layer attn metadata, or None when unavailable (warm-up, cudagraph
+    capture, calls outside a forward context, layer absent). Never raises."""
+    global _NO_CTX_LOGGED
+    try:
+        from vllm.forward_context import get_forward_context
 
-    raw = get_forward_context().attn_metadata
-    if isinstance(raw, list):
-        raw = raw[0] if raw else None
-    if isinstance(raw, dict):
-        return raw.get(layer_name)
+        raw = get_forward_context().attn_metadata
+        if isinstance(raw, list):
+            raw = raw[0] if raw else None
+        if isinstance(raw, dict):
+            raw = raw.get(layer_name)
+    except Exception as e:
+        raw = None
+        why = f"{type(e).__name__}: {e}"
+    else:
+        why = "attn_metadata missing for layer"
+    if raw is None and not _NO_CTX_LOGGED:
+        _NO_CTX_LOGGED = True
+        logger.debug("FLASH_ATTN_V100 KV dump: no usable forward context (%s); "
+                     "ignoring such calls silently", why)
     return raw
 
 

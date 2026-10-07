@@ -16,6 +16,7 @@ import vllm.v1.attention.backends.flash_attn_v100 as mod
 import vllm.v1.attention.backends.sm70_kv_dump as kv_dump
 
 HEAD_DIM = 8
+_REAL_MD = kv_dump._metadata_for_layer
 
 
 def _impl_cls():
@@ -197,6 +198,10 @@ def test_v2_warmup_draft_and_32k_request(monkeypatch, env):
         kv_dump.on_kv_update(layer, impl_draft, dk, dk)
     assert not (env.dir / "rank0").exists()
     # 3) the real 32K request in 4096-token chunks on all 16 main layers
+    lines = []
+    monkeypatch.setattr(
+        kv_dump.logger, "info", lambda fmt, *args, **kw: lines.append(fmt % args)
+    )
     g = torch.Generator().manual_seed(1)
     ref = {}
     for c in range(cap // chunk):
@@ -207,12 +212,8 @@ def test_v2_warmup_draft_and_32k_request(monkeypatch, env):
             call_main(layer, k)
         for layer in draft:  # draft keeps being called every forward
             kv_dump.on_kv_update(layer, impl_draft, dk, dk)
-    # the next forward (decode) emits the written line
+    # v3: the written line was already printed at finalize (captured in `lines`)
     env.md = _md([1], [cap + 1])
-    lines = []
-    monkeypatch.setattr(
-        kv_dump.logger, "info", lambda fmt, *args, **kw: lines.append(fmt % args)
-    )
     call_main(main[0], torch.zeros(1, 1, hd).half())
     written = [l for l in lines if "KV dump written" in l]
     assert len(written) == 1
@@ -246,3 +247,133 @@ def test_v2_prefixed_cached_chunk_does_not_latch(monkeypatch, env):
     k = torch.zeros(4, 1, HEAD_DIM).half()
     env.call(_layer(3), k, k)
     assert not (env.dir / "rank0").exists()
+
+
+def test_v3_no_forward_context_ignored_and_written_line_at_finalize(
+    monkeypatch, env, caplog
+):
+    """relay 16 D0 regression: calls without a usable forward context (before,
+    between, after the chunks) are ignored without ERROR logs, and the written
+    line is printed exactly once, synchronously, when the cap is reached."""
+    import logging
+
+    import vllm.forward_context as fc
+
+    cap, chunk, hd = 32768, 4096, 4
+    monkeypatch.setattr(kv_dump, "ENABLED", True)
+    monkeypatch.setattr(kv_dump, "_NO_CTX_LOGGED", False)
+    monkeypatch.setattr(kv_dump.envs, "VLLM_FLASH_V100_KV_DUMP_MAX_TOKENS", cap)
+    monkeypatch.setattr(kv_dump.envs, "VLLM_FLASH_V100_KV_DUMP_MIN_TOKENS", 4096)
+    # use the REAL _metadata_for_layer on top of a controllable forward context
+    monkeypatch.setattr(kv_dump, "_metadata_for_layer", _REAL_MD)
+    mode = {"m": "raise", "md": None}
+
+    def fake_ctx():
+        if mode["m"] == "raise":
+            raise AssertionError("Forward context is not set.")
+        if mode["m"] == "none":
+            return types.SimpleNamespace(attn_metadata=None)
+        if mode["m"] == "missing":
+            return types.SimpleNamespace(attn_metadata={"other.layer": mode["md"]})
+        if mode["m"] == "empty_list":
+            return types.SimpleNamespace(attn_metadata=[])
+        return types.SimpleNamespace(
+            attn_metadata={l.layer_name: mode["md"] for l in main + draft}
+        )
+
+    monkeypatch.setattr(fc, "get_forward_context", fake_ctx)
+    main = [_layer(3 + 4 * i) for i in range(16)]
+    draft = [_draft_layer(64 + i) for i in range(5)]
+    impl_main = types.SimpleNamespace(
+        kv_cache_dtype="nvfp4", num_kv_heads=1, head_size=hd
+    )
+    impl_draft = types.SimpleNamespace(
+        kv_cache_dtype="auto", num_kv_heads=2, head_size=128
+    )
+    dk = torch.zeros(chunk, 2, 128).half()
+    caplog.set_level(logging.DEBUG)
+    old_level = kv_dump.logger.level
+    kv_dump.logger.setLevel(logging.DEBUG)
+    try:
+
+        def junk_calls():
+            kk = torch.zeros(chunk, 1, hd).half()
+            for m in ("raise", "none", "missing", "empty_list"):
+                mode["m"] = m
+                for layer in main:
+                    kv_dump.on_kv_update(layer, impl_main, kk, kk)
+                for layer in draft:
+                    kv_dump.on_kv_update(layer, impl_draft, dk, dk)
+            mode["m"] = "ok"
+
+        junk_calls()  # before
+        g = torch.Generator().manual_seed(2)
+        ref = {}
+        n_chunks = cap // chunk
+        for c in range(n_chunks):
+            mode["md"] = _md([chunk], [(c + 1) * chunk])
+            mode["m"] = "ok"
+            for i, layer in enumerate(main):
+                k = torch.randn(chunk, 1, hd, generator=g).half()
+                ref.setdefault(layer.layer_name, []).append(k[:, 0].clone())
+                kv_dump.on_kv_update(layer, impl_main, k, k)
+                if i < len(draft):  # draft layers run every forward, ctx ok
+                    kv_dump.on_kv_update(draft[i], impl_draft, dk, dk)
+                last = c == n_chunks - 1
+                n_written = sum("KV dump written" in r.getMessage()
+                                for r in caplog.records)
+                # nothing before the very last layer of the last chunk
+                assert n_written == (1 if last and i == len(main) - 1 else 0)
+            if c < n_chunks - 1:
+                junk_calls()  # between chunks
+        # printed already, with no further call needed
+        written = [r.getMessage() for r in caplog.records
+                   if "KV dump written" in r.getMessage()]
+        assert len(written) == 1
+        assert (f"layers=16 tokens={cap} tokens_max={cap} complete=16 skipped=5"
+                in written[0])
+        assert written[0].startswith("FLASH_ATTN_V100 KV dump written dir=")
+        junk_calls()  # after finalize
+        mode["md"] = _md([1], [cap + 1])
+        kv_dump.on_kv_update(main[0], impl_main, torch.zeros(1, 1, hd).half(),
+                             torch.zeros(1, 1, hd).half())
+    finally:
+        kv_dump.logger.setLevel(old_level)
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert sum("KV dump written" in r.getMessage() for r in caplog.records) == 1
+    assert sum("no usable forward context" in r.getMessage()
+               for r in caplog.records) == 1  # debug, first time only
+    meta = json.loads((env.dir / "rank0" / "meta.json").read_text())
+    assert meta["tokens"] == cap and meta["complete"] is True
+    assert len(meta["layers"]) == 16
+    for layer in main:
+        idx = [k for k, n in meta["layer_names"].items() if n == layer.layer_name][0]
+        kk = np.load(env.dir / "rank0" / f"layer{idx}_k.npy")
+        np.testing.assert_array_equal(kk, torch.cat(ref[layer.layer_name]).numpy())
+
+
+def test_v3_early_finalize_prints_written_once(monkeypatch, env, caplog):
+    import logging
+
+    monkeypatch.setattr(kv_dump, "ENABLED", True)
+    caplog.set_level(logging.INFO)
+    old_level = kv_dump.logger.level
+    kv_dump.logger.setLevel(logging.INFO)
+    try:
+        k = torch.randn(3, 1, HEAD_DIM).half()
+        env.md = _md([3], [3])
+        for i in (0, 1):
+            env.call(_layer(i), k, k)
+        env.md = _md([5], [5])  # new request before cap
+        env.call(_layer(0), torch.randn(5, 1, HEAD_DIM).half(), k)
+        assert not [r for r in caplog.records if "KV dump written" in r.getMessage()]
+        env.call(_layer(1), torch.randn(5, 1, HEAD_DIM).half(), k)
+        env.call(_layer(1), torch.randn(5, 1, HEAD_DIM).half(), k)
+    finally:
+        kv_dump.logger.setLevel(old_level)
+    written = [r.getMessage() for r in caplog.records
+               if "KV dump written" in r.getMessage()]
+    assert len(written) == 1
+    assert "layers=2 tokens=3 tokens_max=3 complete=0 skipped=0" in written[0]
+    meta = json.loads((env.dir / "rank0" / "meta.json").read_text())
+    assert meta["complete"] is False
