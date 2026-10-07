@@ -486,6 +486,7 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_DECODE_USE_XQA: bool = True
     VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY: bool = True
     VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY: bool = False
+    VLLM_FLASH_V100_GROUPED_VERIFY_PER_REQUEST_FALLBACK: bool = True
     VLLM_FLASH_V100_NVFP4_FIRST_CHUNK_FP16: bool = True
     VLLM_FLASH_V100_NVFP4_PREFIX_DECODE_ROWS: bool = True
     VLLM_FLASH_V100_KV_DUMP_DIR: str = ""
@@ -3249,6 +3250,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FLASH_V100_KV_DUMP_DIR": lambda: os.getenv("VLLM_FLASH_V100_KV_DUMP_DIR", ""),
     "VLLM_FLASH_V100_KV_DUMP_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_FLASH_V100_KV_DUMP_MAX_TOKENS", "32768")
+    ),
+    # When the whole-batch grouped-verify gate rejects (e.g. reqs=10), run the
+    # single-request B1 grouped one-pass once per eligible q=8 request instead
+    # of expanding to per-row XQA; also routes q=8 decoders of an NVFP4 mixed
+    # batch through it. 0 = previous behaviour, bit-identical.
+    "VLLM_FLASH_V100_GROUPED_VERIFY_PER_REQUEST_FALLBACK": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_GROUPED_VERIFY_PER_REQUEST_FALLBACK", "1"))
     ),
     "VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY", "0"))

@@ -502,6 +502,7 @@ _flash_attn_bhmd_func = None
 _flash_attn_decode_paged = None
 _flash_attn_decode_paged_xqa = None
 _flash_attn_decode_paged_wmma = None
+_DFLASH2_VERIFY_WIDTH = 8
 _flash_attn_grouped_verify_paged = None
 _flash_attn_grouped_verify_max_query_tokens = 8
 _flash_attn_grouped_verify_request_major_abi_version = 0
@@ -540,6 +541,8 @@ _logged_prefill_paged_cache = False
 _logged_prefill_smallq_decode = False
 _logged_prefill_prefix_decode_rows = False
 _logged_nvfp4_mixed_split_fired = False
+_logged_grouped_per_request_fallback_capture = False
+_logged_grouped_per_request_fallback_eager = False
 _logged_prefill_smallq_decode_xqa = False
 _logged_prefill_smallq_grouped_verify = False
 _logged_prefill_smallq_grouped_verify_gate = False
@@ -969,6 +972,25 @@ def _e4m3_batch_xqa_allowed(query: torch.Tensor) -> bool:
 
 def _same_storage(left: torch.Tensor, right: torch.Tensor) -> bool:
     return left.untyped_storage().data_ptr() == right.untyped_storage().data_ptr()
+
+
+class _GroupedVerifyRequestView:
+    """Single-request (B1) view of batch attention metadata.
+
+    Row slices ``[i:i+1]`` of the device ``block_table`` / ``seq_lens`` are
+    views (no copy, no host read), so the grouped-verify gate and the native
+    one-pass see exactly the shapes of a lone q8 request.
+    """
+
+    def __init__(self, meta, index: int, query_len: int = 8):
+        self._meta = meta
+        self.num_reqs = 1
+        self.max_query_len = query_len
+        self.block_table = meta.block_table[index : index + 1]
+        self.seq_lens = meta.seq_lens[index : index + 1]
+
+    def __getattr__(self, name):
+        return getattr(self._meta, name)
 
 
 def _is_cuda_graph_capturing(tensor: torch.Tensor) -> bool:
@@ -6056,6 +6078,41 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         if not rows or len(rows) == num_seqs:
             return set()
 
+        consumed = set(rows)
+        if self._grouped_verify_per_request_enabled():
+            # q == 8 decoders go through the per-request B1 grouped one-pass
+            # instead of 8 XQA rows each (host qsl is exact: eager batch).
+            width = _DFLASH2_VERIFY_WIDTH
+            grouped = [
+                i
+                for i in rows
+                if qsl[i + 1] - qsl[i] == width
+                and self._grouped_verify_request_eligible(
+                    query[qsl[i] : qsl[i] + width],
+                    key_cache,
+                    value_cache,
+                    attn_metadata,
+                    i,
+                )
+            ]
+            if grouped:
+                self._log_grouped_per_request_fallback(len(grouped), query)
+                _record_route("nvfp4_mixed_grouped_per_request")
+                for i in grouped:
+                    self._call_grouped_verify_request(
+                        layer,
+                        query[qsl[i] : qsl[i] + width],
+                        key_cache,
+                        value_cache,
+                        attn_metadata,
+                        i,
+                        output[qsl[i] : qsl[i] + width],
+                    )
+                done = set(grouped)
+                rows = [i for i in rows if i not in done]
+                if not rows:
+                    return consumed
+
         token_idx: list[int] = []
         token_rows: list[int] = []
         token_seq_lens: list[int] = []
@@ -6101,7 +6158,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             partition_size_hint=None,
         )
         output.index_copy_(0, idx, out_rows)
-        return set(rows)
+        return consumed
 
     def _nvfp4_first_chunk_fp16_applies(
         self, query, key, value, qsl, seq_lens_cpu, attn_metadata
@@ -6454,6 +6511,124 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             )
             _logged_prefill_smallq_grouped_verify_gate = True
         return allowed
+
+    def _grouped_verify_per_request_enabled(self) -> bool:
+        return bool(
+            envs.VLLM_FLASH_V100_GROUPED_VERIFY_PER_REQUEST_FALLBACK
+            and self.use_dflash2_grouped_verify
+            and self.flash_attn_grouped_verify_paged is not None
+        )
+
+    def _grouped_verify_request_eligible(
+        self,
+        query_i: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        index: int,
+    ) -> bool:
+        """Per-request B1 gate: the existing gate on a one-request view."""
+        return self._dflash2_grouped_verify_allowed(
+            query_i,
+            key_cache,
+            value_cache,
+            _GroupedVerifyRequestView(attn_metadata, index),
+            num_query_tokens=_DFLASH2_VERIFY_WIDTH,
+        )
+
+    def _call_grouped_verify_request(
+        self,
+        layer: torch.nn.Module,
+        query_i: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        index: int,
+        out_i: torch.Tensor,
+    ) -> None:
+        self._call_dflash2_grouped_verify(
+            layer,
+            query_i,
+            key_cache,
+            value_cache,
+            _GroupedVerifyRequestView(attn_metadata, index),
+            out=out_i,
+        )
+
+    def _log_grouped_per_request_fallback(self, num_reqs: int, query) -> None:
+        global _logged_grouped_per_request_fallback_capture
+        global _logged_grouped_per_request_fallback_eager
+        capturing = _is_cuda_graph_capturing(query)
+        if capturing:
+            if _logged_grouped_per_request_fallback_capture:
+                return
+            _logged_grouped_per_request_fallback_capture = True
+        else:
+            if _logged_grouped_per_request_fallback_eager:
+                return
+            _logged_grouped_per_request_fallback_eager = True
+        logger.info(
+            "FLASH_ATTN_V100 DFlash2 per-request grouped fallback: n=%d "
+            "(during_cuda_graph_capture=%s)",
+            num_reqs,
+            capturing,
+        )
+
+    def _try_grouped_verify_per_request(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+        num_query_tokens: int,
+    ) -> bool:
+        """Pure-decode batch of q=8 requests the whole-batch gate rejected.
+
+        Runs the single-request B1 grouped one-pass once per request, each on
+        its own ``[8*i, 8*i+8)`` rows. Only the uniform shape (every request
+        q == 8, ``tokens == reqs * 8``) is taken: there the row offsets are
+        static Python ints, so nothing host-side that changes between CUDA
+        graph replays is read. Every request must pass the B1 gate or the
+        caller keeps today's per-row path.
+        """
+        if not self._grouped_verify_per_request_enabled():
+            return False
+        block_table = getattr(attn_metadata, "block_table", None)
+        if block_table is None:
+            return False
+        num_reqs = int(block_table.shape[0])
+        width = _DFLASH2_VERIFY_WIDTH
+        if (
+            num_reqs < 2
+            or int(getattr(attn_metadata, "max_query_len", 0)) != width
+            or num_query_tokens != num_reqs * width
+        ):
+            return False
+        query = query[:num_query_tokens]
+        for i in range(num_reqs):
+            if not self._grouped_verify_request_eligible(
+                query[i * width : (i + 1) * width],
+                key_cache,
+                value_cache,
+                attn_metadata,
+                i,
+            ):
+                return False
+        self._log_grouped_per_request_fallback(num_reqs, query)
+        _record_route("nvfp4_verify_grouped_per_request")
+        for i in range(num_reqs):
+            self._call_grouped_verify_request(
+                layer,
+                query[i * width : (i + 1) * width],
+                key_cache,
+                value_cache,
+                attn_metadata,
+                i,
+                output[i * width : (i + 1) * width],
+            )
+        return True
 
     def _call_dflash2_grouped_verify(
         self,
@@ -8356,6 +8531,17 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 attn_metadata,
                 out=out_view,
             )
+            return output
+
+        if self.use_dflash2_grouped_verify and self._try_grouped_verify_per_request(
+            layer,
+            query,
+            key_cache,
+            value_cache,
+            attn_metadata,
+            output,
+            num_query_tokens,
+        ):
             return output
 
         persistent_decode_block_table = getattr(
