@@ -84,10 +84,19 @@ class CPUOffloadingSpec(OffloadingSpec):
                 isinstance(group.kv_cache_spec, MambaSpec)
                 for group in cacheable_groups.values()
             )
-            and len(
-                {group.kv_cache_spec.block_size for group in cacheable_groups.values()}
+            and (
+                len(
+                    {
+                        group.kv_cache_spec.block_size
+                        for group in cacheable_groups.values()
+                    }
+                )
+                == 1
+                # Parking validates factor=1 and one Mamba grid. Each group
+                # then has its own native-sized host slots; a 1024-token draft
+                # SW page need not share the 4096-token target's token count.
+                or getattr(self, "host_parking", False) is True
             )
-            == 1
         )
         # Mamba state slots follow the prefix-cache retention policy (see
         # CacheConfig.prefix_cache_retention_interval): sparse retention keeps

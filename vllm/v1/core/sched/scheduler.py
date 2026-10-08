@@ -2784,7 +2784,31 @@ class Scheduler(SchedulerInterface):
             marked_invalid_block = False
             req_id = request.request_id
             # TODO (davidb): add support for hybrid memory allocator
-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
+            block_groups = self.kv_cache_manager.get_block_ids(req_id)
+            if (
+                len(block_groups) > 1
+                and getattr(
+                    getattr(self.connector, "connector_scheduler", None),
+                    "host_parking",
+                    False,
+                )
+                is True
+            ):
+                # A hybrid snapshot is atomic for recovery: a damaged group
+                # invalidates the whole external hit, including GDN state.
+                # Native async loads are not published to prefix cache until
+                # every rank reports finished_recving. Keep those pages owned
+                # until then; _update_waiting_for_remote_kv frees them at zero.
+                all_ids = {bid for group in block_groups for bid in group}
+                if all_ids.isdisjoint(invalid_block_ids):
+                    continue
+                if request.status != RequestStatus.WAITING_FOR_REMOTE_KVS:
+                    raise RuntimeError("parking load failure outside async wait")
+                total_affected_tokens += request.num_computed_tokens
+                request.num_computed_tokens = 0
+                affected_req_ids.add(req_id)
+                continue
+            (req_block_ids,) = block_groups
             # We iterate only over blocks that may contain externally computed
             # tokens
             req_num_computed_tokens = (

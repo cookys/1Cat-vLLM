@@ -461,6 +461,7 @@ class CpuGpuOffloadingHandlers:
         group_page_sizes: dict[int, int] | None = None,
         group_mmap_regions: dict[int, SharedOffloadRegion] | None = None,
         group_num_blocks: dict[int, int] | None = None,
+        cpu_tensor_factory=None,
     ):
         gpu_tensors: list[torch.Tensor] = []
         cpu_tensors: list[torch.Tensor] = []
@@ -517,6 +518,9 @@ class CpuGpuOffloadingHandlers:
                 tensor_region = tensor_regions.get(tensor_idx, mmap_region)
                 if tensor_region is not None:
                     cpu_tensor = tensor_region.create_next_view(cpu_page_size_bytes)
+                elif cpu_tensor_factory is not None:
+                    tensor_slots = tensor_num_blocks.get(tensor_idx, num_cpu_blocks)
+                    cpu_tensor = cpu_tensor_factory(tensor_slots, cpu_page_size_bytes)
                 else:
                     t0 = time.monotonic()
                     tensor_slots = tensor_num_blocks.get(tensor_idx, num_cpu_blocks)

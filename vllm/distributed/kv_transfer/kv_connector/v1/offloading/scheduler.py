@@ -58,6 +58,7 @@ class TransferJobStatus:
     # Store src block IDs that may be freed before the request finishes.
     # Registered in _block_id_to_pending_jobs at store creation time.
     sliding_window_block_ids: list[int] | None = None
+    failed_count: int = 0
 
 
 class GroupOffloadConfig(NamedTuple):
@@ -119,6 +120,7 @@ class SchedulerOffloadConfig(NamedTuple):
     offload_prompt_only: bool
     # Worker/state arrays retain original group indices, including scratch.
     num_kv_cache_groups: int
+    key_namespace: bytes = b""
 
     @classmethod
     def from_spec(cls, spec: OffloadingSpec) -> "SchedulerOffloadConfig":
@@ -223,6 +225,7 @@ class SchedulerOffloadConfig(NamedTuple):
             block_size_factor=spec.block_size_factor,
             offload_prompt_only=spec.offload_prompt_only,
             num_kv_cache_groups=len(spec.kv_cache_config.kv_cache_groups),
+            key_namespace=getattr(spec, "key_namespace", b""),
         )
 
 
@@ -262,6 +265,7 @@ class RequestOffloadState:
     # In-flight job IDs. Per the connector's invariant, at any given time
     # this contains either a single load job, or one or more store jobs.
     transfer_jobs: set[int] = field(default_factory=set)
+    key_generation: int = 0
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
@@ -294,6 +298,12 @@ class RequestOffloadState:
                 None,
                 group_config.hash_block_size_factor,
             ):
+                if self.config.key_namespace:
+                    from vllm.v1.kv_offload.cpu.parking import parking_hash
+
+                    req_block_hash = parking_hash(
+                        self.config.key_namespace, self.key_generation, req_block_hash
+                    )
                 group_state.offload_keys.append(
                     make_offload_key(req_block_hash, group_config.group_idx)
                 )
@@ -332,12 +342,18 @@ def _create_req_context(req: Request) -> ReqContext:
 class OffloadingConnectorScheduler:
     """Implementation of Scheduler side methods"""
 
+    host_parking = False
+
     def __init__(self, spec: OffloadingSpec):
         self.config = SchedulerOffloadConfig.from_spec(spec)
         self._group_config_by_idx = {
             group.group_idx: group for group in self.config.kv_group_configs
         }
         self.manager: OffloadingManager = spec.get_manager()
+        self.host_parking = getattr(spec, "host_parking", False) is True
+        self._parking_generation = 0
+        self._parking_held_finished: set[str] = set()
+        self._parking_failure_count = 0
 
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
@@ -616,6 +632,7 @@ class OffloadingConnectorScheduler:
             req=request,
             req_context=req_context,
             offloading_context=offloading_context,
+            key_generation=getattr(self, "_parking_generation", 0),
         )
         self._req_status[request.request_id] = req_status
 
@@ -1177,16 +1194,37 @@ class OffloadingConnectorScheduler:
                 )
                 continue
             job_status = self._jobs[job_id]
+            job_status.failed_count += meta.failed_jobs.get(job_id, 0)
             job_status.pending_count -= count
             if job_status.pending_count > 0:
                 continue
             assert job_status.pending_count == 0
 
             req_status = self._req_status[job_status.req_id]
+            success = job_status.failed_count == 0
+            if not success:
+                if not self.host_parking:
+                    raise RuntimeError("native offload received failed worker job")
+                self._parking_failure_count += 1
+                logger.warning(
+                    "HOST_PARKING snapshot_discard total=%d job=%d direction=%s "
+                    "failed_ranks=%d; cold recompute",
+                    self._parking_failure_count,
+                    job_id,
+                    "D2H" if job_status.is_store else "H2D",
+                    job_status.failed_count,
+                )
             if job_status.is_store:
-                self.manager.complete_store(job_status.keys, req_status.req_context)
+                if success:
+                    self.manager.complete_store(job_status.keys, req_status.req_context)
+                else:
+                    self.manager.complete_store(
+                        job_status.keys, req_status.req_context, success=False
+                    )
             else:
                 self.manager.complete_load(job_status.keys, req_status.req_context)
+                if not success:
+                    self.manager.invalidate(job_status.keys)
                 if self._blocks_being_loaded:
                     self._blocks_being_loaded.difference_update(job_status.keys)
             if self._block_id_to_pending_jobs:
@@ -1203,6 +1241,14 @@ class OffloadingConnectorScheduler:
             del self._jobs[job_id]
             req_status.transfer_jobs.remove(job_id)
             if not req_status.transfer_jobs and req_status.req.is_finished():
+                if (
+                    self.host_parking
+                    and job_status.req_id in self._parking_held_finished
+                ):
+                    self._parking_held_finished.remove(job_status.req_id)
+                    if connector_output.finished_sending is None:
+                        connector_output.finished_sending = set()
+                    connector_output.finished_sending.add(job_status.req_id)
                 del self._req_status[job_status.req_id]
 
     def request_finished(
@@ -1242,6 +1288,11 @@ class OffloadingConnectorScheduler:
             job_status = self._jobs[job_id]
             for bid in job_status.non_sliding_window_block_ids or ():
                 self._block_id_to_pending_jobs.setdefault(bid, set()).add(job_id)
+        if self.host_parking and all(
+            self._jobs[jid].is_store for jid in req_status.transfer_jobs
+        ):
+            self._parking_held_finished.add(request.request_id)
+            return True, None
         return False, None
 
     def take_events(self) -> Iterable[KVCacheEvent]:
@@ -1277,11 +1328,18 @@ class OffloadingConnectorScheduler:
 
         # Reset offloading manager cache
         self.manager.reset_cache()
+        if self.host_parking:
+            self._parking_generation += 1
 
         # Reset store progress so active requests re-offload from block 0
         for status in self._req_status.values():
+            if self.host_parking:
+                status.key_generation = self._parking_generation
+                status.transfer_jobs.clear()
             for group_state in status.group_states:
                 group_state.next_stored_block_idx = 0
+                if self.host_parking:
+                    group_state.offload_keys.clear()
 
         # Discard jobs and save job_counter to be able to discard worker responses
         self._stale_job_threshold = self._job_counter

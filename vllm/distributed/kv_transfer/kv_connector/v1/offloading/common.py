@@ -43,10 +43,16 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
     """
 
     completed_jobs: dict[int, int] = field(default_factory=dict)
+    # Parking: failed copies are completed only after their stream is drained.
+    failed_jobs: dict[int, int] = field(default_factory=dict)
 
     def mark_completed(self, job_id: int) -> None:
         """Record a transfer job completion from this worker."""
         self.completed_jobs[job_id] = 1
+
+    def mark_failed(self, job_id: int) -> None:
+        self.mark_completed(job_id)
+        self.failed_jobs[job_id] = 1
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
@@ -57,4 +63,7 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
         for job_id, v in other.completed_jobs.items():
             merged[job_id] = merged.get(job_id, 0) + v
 
-        return OffloadingWorkerMetadata(completed_jobs=merged)
+        failed = dict(self.failed_jobs)
+        for job_id, count in other.failed_jobs.items():
+            failed[job_id] = failed.get(job_id, 0) + count
+        return OffloadingWorkerMetadata(completed_jobs=merged, failed_jobs=failed)

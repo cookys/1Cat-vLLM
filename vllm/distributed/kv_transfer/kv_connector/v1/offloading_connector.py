@@ -133,6 +133,10 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransf
             return self.connector_worker.build_connector_worker_meta()
         return None
 
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        assert self.connector_worker is not None
+        return self.connector_worker.get_invalid_blocks()
+
     def on_new_request(self, request: "Request") -> None:
         assert self.connector_scheduler is not None
         self.connector_scheduler.on_new_request(request)
@@ -189,6 +193,13 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransf
 
     def reset_cache(self) -> bool | None:
         assert self.connector_scheduler is not None
+        if self.connector_scheduler.host_parking and (
+            self.connector_scheduler._jobs
+            or self.connector_scheduler._parking_held_finished
+        ):
+            # A generation change cannot strand an async restore or finish-held
+            # source. Retry once all TP transfers have been polled.
+            return False
         self.connector_scheduler.reset_cache()
         return True
 

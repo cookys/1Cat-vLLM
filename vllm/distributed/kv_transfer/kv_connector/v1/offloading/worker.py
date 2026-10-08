@@ -49,6 +49,9 @@ class OffloadingConnectorWorker:
         self._load_jobs: dict[int, ReqId] = {}
         self._unsubmitted_store_jobs: list[tuple[int, TransferSpec]] = []
         self._connector_worker_meta = OffloadingWorkerMetadata()
+        self.host_parking = getattr(spec, "host_parking", False) is True
+        self._load_block_ids: dict[int, set[int]] = {}
+        self._invalid_block_ids: set[int] = set()
 
     def _register_handlers(self, kv_caches: CanonicalKVCaches):
         for src_cls, dst_cls, handler in self.spec.get_handlers(kv_caches):
@@ -246,6 +249,10 @@ class OffloadingConnectorWorker:
 
         for job_id, entry in metadata.load_jobs.items():
             self._load_jobs[job_id] = entry.req_id
+            if self.host_parking:
+                self._load_block_ids[job_id] = set(
+                    map(int, entry.transfer_spec[1].block_ids)
+                )
             success = self.worker.transfer_async(job_id, entry.transfer_spec)
             assert success
 
@@ -268,9 +275,12 @@ class OffloadingConnectorWorker:
         """
         finished_recving: set[str] = set()
         for transfer_result in self.worker.get_finished():
-            # we currently do not support job failures
             job_id = transfer_result.job_id
-            assert transfer_result.success
+            if not transfer_result.success:
+                if not self.host_parking:
+                    assert transfer_result.success
+                self._invalid_block_ids.update(self._load_block_ids.get(job_id, ()))
+                self._connector_worker_meta.mark_failed(job_id)
             if (
                 transfer_result.transfer_time
                 and transfer_result.transfer_size is not None
@@ -283,11 +293,17 @@ class OffloadingConnectorWorker:
                 )
 
             self._connector_worker_meta.mark_completed(job_id)
+            self._load_block_ids.pop(job_id, None)
             req_id = self._load_jobs.pop(job_id, None)
             if req_id is not None:
                 finished_recving.add(req_id)
 
         return set(), finished_recving
+
+    def get_invalid_blocks(self) -> set[int]:
+        invalid = self._invalid_block_ids
+        self._invalid_block_ids = set()
+        return invalid
 
     def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:
         """Return completed transfer job IDs since the last call."""
@@ -314,3 +330,5 @@ class OffloadingConnectorWorker:
         self._load_jobs.clear()
         self._connector_worker_meta = OffloadingWorkerMetadata()
         self.worker.shutdown()
+        self._load_block_ids.clear()
+        self._invalid_block_ids.clear()
