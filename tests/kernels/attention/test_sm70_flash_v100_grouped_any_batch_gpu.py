@@ -9,6 +9,7 @@ Capture/replay 16 -> 10 -> 16 verifies that this cannot affect real rows.
 
 import pytest
 import torch
+from grouped_verify_metadata_utils import serving_metadata
 from test_sm70_flash_v100_grouped_per_request_fallback_gpu import (
     CTX10,
     HEAD_DIM,
@@ -41,6 +42,7 @@ def test_batched_q8_and_graph_replay_equal_b1(monkeypatch, dtype, bucket):
     cache, table, _ = _build_cache(dtype, seqs, seed=7901)
     q = torch.randn(bucket * 8, Q_HEADS, HEAD_DIM, device="cuda").mul_(0.5).half()
     meta, qsl = _meta(table, seqs, [8] * bucket)
+    meta = serving_metadata(meta)
     monkeypatch.setenv(ANY, "0")
     calls.clear()
     off = _verify(impl, cache, q, meta, qsl)
@@ -92,6 +94,7 @@ def test_mixed_p9_append_equal_and_q1_p7g_bound(monkeypatch, dtype):
     qlens = [q for q, _ in MIXED_ROWS]
     cache, table, kv = _build_cache(dtype, seqs, seed=7902)
     meta, qsl = _meta(table, seqs, qlens)
+    meta = serving_metadata(meta)
     query = torch.randn(int(qsl[-1]), Q_HEADS, HEAD_DIM, device="cuda").mul_(0.5).half()
     if dtype == "nvfp4":
         prof = torch.empty_like(query[: qlens[-1]])

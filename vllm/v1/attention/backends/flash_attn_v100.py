@@ -6717,7 +6717,12 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     "FLASH_ATTN_V100 any-batch grouped verify: B=%d bucket=%d "
                     "q=8 capture=%s configured_max=%d; B includes padding "
                     "at graph capture, not replay live requests.",
-                    int(attn_metadata.num_reqs),
+                    # TritonAttentionMetadata has no num_reqs. This route
+                    # admits uniform q8; its Python token count avoids a
+                    # device read and distinguishes eager real rows from the
+                    # padded bucket. At capture the count is capture-static,
+                    # not a measurement of live requests during replay.
+                    int(attn_metadata.num_actual_tokens) // _DFLASH2_VERIFY_WIDTH,
                     num_reqs,
                     capturing,
                     self.dflash2_grouped_verify_any_batch_max_reqs,

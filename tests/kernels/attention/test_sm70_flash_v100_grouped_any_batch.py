@@ -2,10 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """P9 CPU dispatch/metadata tests. Native math is mocked, not GPU parity."""
 
+import ast
+import inspect
+import textwrap
 import types
+from dataclasses import fields
 
 import pytest
 import torch
+from grouped_verify_metadata_utils import serving_metadata
 from test_sm70_flash_v100_grouped_per_request_fallback import (
     _cache,
     _impl_cls,
@@ -18,6 +23,7 @@ from test_sm70_flash_v100_grouped_per_request_fallback import (
 
 import vllm.envs as envs
 import vllm.v1.attention.backends.flash_attn_v100 as mod
+from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
 
 ANY = "VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY_ANY_BATCH"
 
@@ -38,6 +44,7 @@ def setup_case(monkeypatch, n, knob, *, padded=False):
     if padded:
         seqs[10:] = [0] * (n - 10)
     meta, qsl = _meta(seqs, [8] * n)
+    meta = serving_metadata(meta)
     q = _query([8] * n, qsl)
     return impl, calls, meta, qsl, q, _cache()
 
@@ -146,3 +153,44 @@ def test_new_route_log_once_per_bucket_and_capture_phase(monkeypatch, caplog):
     assert all("B=16 bucket=16" in m and "configured_max=16" in m for m in messages)
     assert "capture=False" in messages[0] and "capture=True" in messages[1]
     assert all(c["rows"] == 128 for c in calls["grouped"])
+
+
+def test_new_route_direct_fields_exist_on_serving_metadata():
+    fields_available = {f.name for f in fields(TritonAttentionMetadata)}
+    for name in ("_dflash2_grouped_verify_allowed", "_call_dflash2_grouped_verify"):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(getattr(_impl_cls(), name))))
+        reads = {
+            node.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "attn_metadata"
+        }
+        assert reads <= fields_available, reads - fields_available
+
+
+def test_real_metadata_log_actual_vs_padded_without_device_scalar_read(
+    monkeypatch, caplog
+):
+    impl, _, meta, _, q, cache = setup_case(monkeypatch, 16, "1", padded=True)
+    meta.num_actual_tokens = 80
+    assert isinstance(meta, TritonAttentionMetadata)
+    assert meta.query_start_loc.numel() - 1 == 16  # not the live request count
+    layer = types.SimpleNamespace(_k_scale_float=1.0, _v_scale_float=1.0)
+    with caplog.at_level("INFO"):
+        impl._call_dflash2_grouped_verify(
+            layer, q, cache, cache, meta, out=torch.empty_like(q)
+        )
+    assert any("B=10 bucket=16" in r.message for r in caplog.records)
+
+
+def test_capture_bucket_capacity_guard_with_real_metadata(monkeypatch):
+    impl, _, meta, _, q, cache = setup_case(monkeypatch, 24, "1")
+    assert not impl._dflash2_grouped_verify_allowed(
+        q, cache, cache, meta, num_query_tokens=q.shape[0]
+    )
+    # A 256-token maximum capture bucket configures max_seqs-or-256/8 = 32.
+    impl.dflash2_grouped_verify_any_batch_max_reqs = 32
+    assert impl._dflash2_grouped_verify_allowed(
+        q, cache, cache, meta, num_query_tokens=q.shape[0]
+    )
