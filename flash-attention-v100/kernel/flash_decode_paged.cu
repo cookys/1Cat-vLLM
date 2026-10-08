@@ -964,8 +964,24 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel(
         static_cast<int64_t>(block_size) * num_kv_heads * 128;
     for (int unit_idx = copy_thread_idx; unit_idx < unit_count;
          unit_idx += NUM_THREADS) {
-      const int row = unit_idx / units_per_row;
-      const int unit = unit_idx - row * units_per_row;
+      int row = unit_idx / units_per_row;
+      int unit = unit_idx - row * units_per_row;
+      // kv_smem_stride_uint4 is 33 (odd): with row-major lane order 8
+      // consecutive lanes share one row and hit 2 bank classes (4-way STS
+      // conflict). Within a full 4-row block of 4*units_per_row indices the
+      // map (row&3, unit) -> (within&3, within>>2) is a bijection, so the
+      // same global addresses are read and the same smem slots written; 8
+      // consecutive lanes now cover 4 rows x 2 units, bank classes
+      // row + 4*unit mod 8 all distinct. Tail block (<4 rows) keeps the
+      // original mapping.
+      {
+        const int group = row >> 2;
+        const int within = ((row & 3) * units_per_row) + unit;
+        if (group * 4 + 4 <= valid_kv_tile_rows) {
+          row = (group << 2) | (within & 3);
+          unit = within >> 2;
+        }
+      }
       const int token_offset = tile_page_offset + kv_tile_start + row;
       const int logical_block = token_offset / block_size;
       const int block_offset = token_offset - logical_block * block_size;
@@ -1929,7 +1945,10 @@ constexpr int kGroupedVerifyRows = 48;
 constexpr int kGroupedVerifyBlockN = 32;
 constexpr int kGroupedVerifyQStride = 264;
 constexpr int kGroupedVerifyKVStride = 264;
-constexpr int kGroupedVerifyScoreStride = 32;
+// 32 floats = 128 B puts every score row in bank 0 for store_matrix_sync; 36
+// keeps the 16-byte ldm alignment wmma requires (multiple of 4 floats) and
+// spreads rows over banks.
+constexpr int kGroupedVerifyScoreStride = 36;
 constexpr int kGroupedVerifyProbStride = 40;
 constexpr int kGroupedVerifyPageIdsCapacity = 16;
 // One packed head group times eighty context splits maps one 512-thread CTA to
