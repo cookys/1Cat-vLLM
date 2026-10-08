@@ -227,6 +227,22 @@ def failure_gate(out):
     for mode in ("pre_submit", "completed_copy"):
         arm = "fault-" + mode
         cases = load(out / (arm + ".json"))["cases"]
+        by_label = {row["label"]: row for row in cases}
+        required = {
+            "producer",
+            "first-good-return",
+            "injected-return",
+            "failed-key-retry",
+            "unrelated",
+            "after-reset",
+            "after-aborts",
+        }
+        if not required.issubset(by_label):
+            return gate(
+                "INCONCLUSIVE",
+                "partial recovery checkpoint",
+                missing=sorted(required - by_label.keys()),
+            )
         text = (out / (arm + ".serve.log")).read_text(errors="replace")
         quotas = [
             json.loads(line.split("HOST_PARKING quota ", 1)[1])
@@ -239,9 +255,9 @@ def failure_gate(out):
             "one_rank_failed": "failed_ranks=1" in text,
             "discarded": "snapshot_discard" in text,
             "affected_recomputed": any(
-                not e["success"] for e in cases[1].get("loads", [])
+                not e["success"] for e in by_label["injected-return"].get("loads", [])
             )
-            and cases[1]["ids"] == cases[0]["ids"],
+            and by_label["injected-return"]["ids"] == by_label["producer"]["ids"],
             "failed_host_key_missed": "HOST_PARKING invalid_lookup_miss" in text,
             "quota_reset": bool(quotas)
             and all(
@@ -255,7 +271,7 @@ def failure_gate(out):
             "reset_generation": bool(
                 re.search(r"HOST_PARKING reset generation=[1-9]", text)
             ),
-            "reset_miss": not cases[3].get("loads"),
+            "reset_miss": not by_label["after-reset"].get("loads"),
             "aborted_during_load": bool(
                 re.search(r"HOST_PARKING abort .*pending_loads=[1-9]", text)
             ),
@@ -324,6 +340,16 @@ def judge(out):
             {a: load(out / (a + ".copy.json")) for a in ORDER},
         ),
     )
+    # Per-step diagnostic scans/logs change host timing. Keep their counters,
+    # but never promote a diagnostic run into the uninstrumented speed gate.
+    prereg = out / "prereg.json"
+    if prereg.exists() and load(prereg).get("parking_diagnostics", False):
+        measured = gates["4 interference"]
+        gates["4 interference"] = gate(
+            "INCONCLUSIVE",
+            "parking diagnostics enabled; timing requires an OFF run",
+            diagnostic_result=measured,
+        )
     guarded(
         "5 useful work",
         lambda: utility_gate({a: load(out / (a + ".returns.json")) for a in ORDER}),

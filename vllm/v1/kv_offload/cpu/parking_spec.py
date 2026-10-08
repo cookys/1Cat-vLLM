@@ -97,7 +97,11 @@ class HostParkingSpec(CPUOffloadingSpec):
 
         manager = super().get_manager()
         if not isinstance(manager, ParkingManager):
-            self._manager = ParkingManager(manager, self.cpu_group_page_sizes)
+            self._manager = ParkingManager(
+                manager,
+                self.cpu_group_page_sizes,
+                diagnostics=self.extra_config.get("parking_diagnostics") is True,
+            )
         return self._manager
 
     def validate_layers(self):

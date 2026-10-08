@@ -410,3 +410,12 @@ with seven top-level packages, both venv native binaries and
 `cuda_initialized=false`; `old-path-rejected.json` has the expected
 `RuntimeError`. Ruff and `git diff --check` pass. No GPU execution was performed
 for these changes; no parking runtime or numerical code changed.
+
+## m37b rerun amendment (2026-10-09)
+
+See [deadline, partial evidence and group-quota audit](c4140_host_parking_m37b_rerun.md).
+This follow-up preserves numerical/sample-count gates, raises only the extensive
+arm's time budget, and adds optional diagnostics plus selected-arm recovery.
+The independent 10×32K CPU model fits within 16 GiB total but exceeds the current
+draft-SW quota; a GDN-only capacity explanation is not supported by the native
+sparse-handoff test. Pool allocation and eviction policy remain unchanged.

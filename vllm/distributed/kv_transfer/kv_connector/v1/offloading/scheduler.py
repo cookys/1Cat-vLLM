@@ -1196,6 +1196,8 @@ class OffloadingConnectorScheduler:
                 logger.info(
                     "HOST_PARKING store_submitted request_id=%s job=%d", job.req_id, jid
                 )
+        if self.host_parking and getattr(self.manager, "diagnostics", False):
+            self.manager.sample_stats()
         self._current_batch_load_jobs = {}
         self._current_batch_jobs_to_flush = set()
         return meta

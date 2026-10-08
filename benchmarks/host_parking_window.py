@@ -9,11 +9,13 @@ and M37_GO=1. The external lead wrapper owns production stop/restore and fence.
 import argparse
 import concurrent.futures
 import contextlib
+import hashlib
 import http.client
 import json
 import math
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -25,6 +27,61 @@ from pathlib import Path
 
 MODEL = "Qwen3.8-27B-QUASAR-NVFP4"
 ORDER = ("off1", "on1", "on2", "off2", "off3", "on3")
+FAULT_ARMS = ("fault-pre_submit", "fault-completed_copy")
+ALL_ARMS = ORDER + FAULT_ARMS
+
+
+class WindowInterrupted(BaseException):
+    """Do not let a request's broad Exception handler swallow the deadline."""
+
+
+def arm_timeout(args, arm):
+    if arm in FAULT_ARMS:
+        return getattr(args, "fault_timeout_s", 1500)
+    if arm == "on1":
+        return getattr(args, "on1_timeout_s", 5400)
+    return getattr(args, "cell_timeout_s", 2700)
+
+
+def window_budget(args):
+    # Per-server: import 120 + startup 900 + cleanup 120. Raw preflight includes
+    # the negative provenance control. Keep the outer cap above the inner sum.
+    arms = getattr(args, "arms", ALL_ARMS)
+    return (
+        240
+        + (0 if getattr(args, "skip_raw", False) else 600)
+        + sum(1140 + arm_timeout(args, arm) for arm in arms)
+        + 300
+    )
+
+
+@contextlib.contextmanager
+def phase(args, arm, name):
+    def emit(status):
+        with (args.out / "phases.jsonl").open("a") as f:
+            f.write(
+                json.dumps(
+                    dict(
+                        arm=arm,
+                        phase=name,
+                        status=status,
+                        epoch_ns=time.time_ns(),
+                        monotonic_ns=time.monotonic_ns(),
+                    )
+                )
+                + "\n"
+            )
+
+    emit("begin")
+    try:
+        yield
+    except BaseException:
+        emit("interrupted")
+        raise
+    else:
+        emit("complete")
+
+
 SPEC = {
     "method": "dflash",
     "model": "incoai/Qwen3.8-27B-DFlash2",
@@ -54,7 +111,10 @@ FLAGS = {
 
 
 def write(path, data):
-    Path(path).write_text(json.dumps(data, indent=2, allow_nan=False) + "\n")
+    path = Path(path)
+    temp = path.with_name(path.name + ".tmp")
+    temp.write_text(json.dumps(data, indent=2, allow_nan=False) + "\n")
+    temp.replace(path)
 
 
 def make_staging(args):
@@ -136,8 +196,8 @@ def percentile(xs, q):
     return a[i] + (a[min(i + 1, len(a) - 1)] - a[i]) * (x - i)
 
 
-def config():
-    return {
+def config(diagnostics=False):
+    result = {
         "kv_connector": "OffloadingConnector",
         "kv_role": "kv_both",
         "kv_load_failure_policy": "recompute",
@@ -154,6 +214,9 @@ def config():
             "mamba_state_slots_reference_tokens": 32768,
         },
     }
+    if diagnostics:
+        result["kv_connector_extra_config"]["parking_diagnostics"] = True
+    return result
 
 
 def command(args, arm, fault=None):
@@ -207,7 +270,7 @@ def command(args, arm, fault=None):
         "--enable-prompt-tokens-details",
     ]
     if arm.startswith("on") or fault:
-        cfg = config()
+        cfg = config(getattr(args, "parking_diagnostics", False))
         if fault:
             cfg["kv_connector_extra_config"].update(
                 parking_validation=True,
@@ -396,7 +459,7 @@ def complete(args, tokens, label, count=128, temperature=0.0, seed=0):
     return rec
 
 
-def suite(args):
+def suite(args, checkpoint=None):
     rows = []
     for n in (1024, 16384):
         for temp in (0.0, 1.0):
@@ -411,6 +474,8 @@ def suite(args):
                         seed=seed,
                     )
                 )
+                if checkpoint:
+                    checkpoint(rows)
     for chain in range(3):
         reset(args, True)
         base = prompt(args, 32767, f"chain-{chain}")
@@ -418,10 +483,12 @@ def suite(args):
             reset(args)  # force a host return, not a GPU-local hit
             tokens = base + prompt(args, turn * 1024 + 1, f"append-{chain}")
             rows.append(complete(args, tokens, f"chain-{chain}-{turn}", seed=chain))
+            if checkpoint:
+                checkpoint(rows)
     return rows
 
 
-def returns(args, arm, extensive):
+def returns(args, arm, extensive, checkpoint=None):
     rows = []
     for concurrency, n, repetitions in (
         (1, 262000, 100 if extensive else 1),
@@ -447,6 +514,8 @@ def returns(args, arm, extensive):
                 for row in batch:
                     row["return_concurrency"] = concurrency
                 rows.extend(batch)
+                if checkpoint:
+                    checkpoint(rows)
     return rows
 
 
@@ -598,7 +667,12 @@ def server(args, arm, fault=None):
             else:
                 raise TimeoutError(f"{arm} startup exceeded 900 s")
             write(args.out / (arm + ".numa.json"), numa_pools(logpath))
-            signal.alarm(2700)
+            seconds = arm_timeout(args, arm)
+            write(
+                args.out / (arm + ".deadline.json"),
+                dict(seconds=seconds, armed_epoch_ns=time.time_ns()),
+            )
+            signal.alarm(seconds)
             yield logpath
         finally:
             signal.alarm(0)
@@ -696,13 +770,58 @@ def join_loads(rows, events):
     return rows
 
 
+def reuse_evidence(args):
+    """Copy immutable evidence, never relabel one run as multiple samples."""
+    source = getattr(args, "reuse_from", None)
+    if source is None:
+        return
+    selected = set(getattr(args, "arms", ALL_ARMS))
+    manifest = []
+    for path in sorted(source.iterdir()):
+        raw = re.fullmatch(r"raw-rank[0-3]\.json", path.name)
+        arm = next((a for a in ALL_ARMS if path.name.startswith(a + ".")), None)
+        if not path.is_file() or not (
+            (raw and getattr(args, "skip_raw", False))
+            or (arm is not None and arm not in selected)
+        ):
+            continue
+        # Results/logs only; never copy executable code or Python overlay links.
+        if path.suffix not in (".json", ".log", ".out") and not path.name.endswith(
+            (".metrics-before", ".metrics-after")
+        ):
+            continue
+        dest = args.out / path.name
+        if dest.exists():
+            raise RuntimeError(f"evidence collision: {dest}")
+        data = path.read_bytes()
+        shutil.copy2(path, dest)
+        manifest.append(
+            dict(
+                source=str(path.resolve()),
+                file=path.name,
+                sha256=hashlib.sha256(data).hexdigest(),
+            )
+        )
+    write(args.out / "reused-evidence.json", manifest)
+    if getattr(args, "skip_raw", False) and not all(
+        (args.out / f"raw-rank{rank}.json").is_file() for rank in range(4)
+    ):
+        raise RuntimeError("--skip-raw requires all four prior raw result files")
+
+
 def run(args):
     args.out.mkdir(parents=True, exist_ok=False)
     args.staging = make_staging(args)
     write(
         args.out / "prereg.json",
         {
-            "order": ORDER,
+            "order": list(getattr(args, "arms", ALL_ARMS)),
+            "full_gate_order": list(ALL_ARMS),
+            "arm_timeout_s": {
+                a: arm_timeout(args, a) for a in getattr(args, "arms", ALL_ARMS)
+            },
+            "outer_timeout_s": window_budget(args),
+            "parking_diagnostics": getattr(args, "parking_diagnostics", False),
             "restore_count_c1": 100,
             "restore_count_c10": 100,
             "latency_limits_s": {"p50": 2.0, "p99": 4.0},
@@ -710,13 +829,14 @@ def run(args):
             "chains": 3,
             "turns_per_chain": 4,
             "max_output_tokens": 128,
-            "host_config": config(),
+            "host_config": config(getattr(args, "parking_diagnostics", False)),
             "gpu_blocks": args.gpu_blocks,
             "git_tip": subprocess.check_output(
                 ["git", "-C", str(args.worktree), "rev-parse", "HEAD"], text=True
             ).strip(),
         },
     )
+    reuse_evidence(args)
     import_preflight(args, "raw", negative_control=True)
     env = engine_env(args)
     with Monitor(args.out / "memory.jsonl") as monitor:
@@ -731,78 +851,102 @@ def run(args):
             "--output",
             str(args.out / "raw-rank{rank}.json"),
         ]
-        timed_command(raw, env, args.out / "raw.out", 600, cwd=args.staging)
-        for arm in ORDER:
+        if not getattr(args, "skip_raw", False):
+            timed_command(raw, env, args.out / "raw.out", 600, cwd=args.staging)
+        for arm in (a for a in getattr(args, "arms", ALL_ARMS) if a in ORDER):
             if ram_safe(monitor.samples) is False:
                 raise RuntimeError("RAM/las stop threshold exceeded")
             with server(args, arm) as log:
                 started = time.time()
-                cases = suite(args)
-                reset(args, True)
-                before, counters_before = metrics(args)
-                (args.out / (arm + ".metrics-before")).write_text(before)
-                t0 = time.time()
-                traffic(args, arm)
-                settle(args)
-                after, counters_after = metrics(args)
-                (args.out / (arm + ".metrics-after")).write_text(after)
-                duration = time.time() - t0
-                restored = returns(args, arm, arm == "on1")
-                settle(args)
-                join_loads(cases + restored, event_rows(log))
-                write(args.out / (arm + ".cases.json"), cases)
-                write(args.out / (arm + ".returns.json"), restored)
-                write(
-                    args.out / (arm + ".copy.json"),
-                    {
-                        "wall_s": duration,
-                        "delta": {
-                            k: counters_after.get(k, 0) - counters_before.get(k, 0)
-                            for k in set(counters_before) | set(counters_after)
+
+                def checkpoint(kind, rows, arm=arm, log=log):
+                    join_loads(rows, event_rows(log))
+                    write(args.out / (arm + "." + kind + ".json"), rows)
+
+                with phase(args, arm, "parity"):
+                    suite(args, lambda rows: checkpoint("cases", rows))
+                with phase(args, arm, "traffic"):
+                    reset(args, True)
+                    before, counters_before = metrics(args)
+                    (args.out / (arm + ".metrics-before")).write_text(before)
+                    t0 = time.time()
+                    traffic(args, arm)
+                    settle(args)
+                    after, counters_after = metrics(args)
+                    (args.out / (arm + ".metrics-after")).write_text(after)
+                    write(
+                        args.out / (arm + ".copy.json"),
+                        {
+                            "wall_s": time.time() - t0,
+                            "delta": {
+                                k: counters_after.get(k, 0) - counters_before.get(k, 0)
+                                for k in set(counters_before) | set(counters_after)
+                            },
+                            "elapsed_cell_s_at_checkpoint": time.time() - started,
                         },
-                        "cell_s": time.time() - started,
-                    },
+                    )
+                with phase(args, arm, "returns"):
+                    restored = returns(
+                        args,
+                        arm,
+                        arm == "on1",
+                        lambda rows: checkpoint("returns", rows),
+                    )
+                    settle(args)
+                    checkpoint("returns", restored)
+                write(
+                    args.out / (arm + ".cell.json"),
+                    dict(status="complete", cell_s=time.time() - started),
                 )
-        for mode in ("pre_submit", "completed_copy"):
-            arm = "fault-" + mode
-            with server(args, arm, mode) as log:
+        for arm in (a for a in getattr(args, "arms", ALL_ARMS) if a in FAULT_ARMS):
+            mode = arm.removeprefix("fault-")
+            with server(args, arm, mode) as log, phase(args, arm, "recovery"):
+                cases, aborts = [], []
+
+                def save_fault(row=None, cases=cases, aborts=aborts, arm=arm, log=log):
+                    if row is not None:
+                        cases.append(row)
+                    join_loads(cases, event_rows(log))
+                    write(
+                        args.out / (arm + ".json"), {"cases": cases, "aborts": aborts}
+                    )
+
                 tokens = prompt(args, 32769, arm)
                 producer = complete(args, tokens, "producer", count=1)
+                save_fault(producer)
                 reset(args)
                 first_return = complete(args, tokens, "first-good-return", count=1)
+                save_fault(first_return)
                 reset(args)
                 failed_return = complete(args, tokens, "injected-return", count=1)
+                save_fault(failed_return)
                 reset(args)
                 miss_return = complete(args, tokens, "failed-key-retry", count=1)
+                save_fault(miss_return)
                 # Do not assume a 200 is proof: require native snapshot_discard.
                 followup = complete(
                     args, prompt(args, 4095, arm + "-unrelated"), "unrelated", count=1
                 )
+                save_fault(followup)
                 reset(args, True)
                 after_reset = complete(args, tokens, "after-reset", count=1)
+                save_fault(after_reset)
                 reset(args)
-                aborts = [abort_attempt(args, tokens, log, "H2D")]
+                aborts.append(abort_attempt(args, tokens, log, "H2D"))
+                save_fault()
                 reset(args, True)
                 aborts.append(
                     abort_attempt(
                         args, prompt(args, 131073, arm + "-abort"), log, "D2H"
                     )
                 )
+                save_fault()
                 final = complete(
                     args, prompt(args, 4097, arm + "-final"), "after-aborts", count=1
                 )
+                save_fault(final)
                 settle(args)
-                cases = [
-                    producer,
-                    failed_return,
-                    followup,
-                    after_reset,
-                    final,
-                    first_return,
-                    miss_return,
-                ]
-                join_loads(cases, event_rows(log))
-                write(args.out / (arm + ".json"), {"cases": cases, "aborts": aborts})
+                save_fault()
     return analyze(args.out)
 
 
@@ -827,6 +971,14 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--execute", action="store_true")
     p.add_argument("--analyze", action="store_true")
+    p.add_argument("--budget-only", action="store_true")
+    p.add_argument("--arms", nargs="+", choices=ALL_ARMS, default=list(ALL_ARMS))
+    p.add_argument("--reuse-from", type=Path)
+    p.add_argument("--skip-raw", action="store_true")
+    p.add_argument("--parking-diagnostics", action="store_true")
+    p.add_argument("--on1-timeout-s", type=int, default=5400)
+    p.add_argument("--cell-timeout-s", type=int, default=2700)
+    p.add_argument("--fault-timeout-s", type=int, default=1500)
     p.add_argument("--out", type=Path, default=Path("/data/bench/m37"))
     p.add_argument("--port", type=int, default=18037)
     p.add_argument("--gpu-blocks", type=int, default=1800)
@@ -841,12 +993,29 @@ def main():
     )
     p.add_argument("--plan", type=Path, default=Path("/data/bench/m19/Ap_c10fit.json"))
     a = p.parse_args()
+    if len(set(a.arms)) != len(a.arms):
+        p.error("each arm must be unique; repeated evidence is not replication")
+    if a.arms != [x for x in a.arms if x in ORDER] + [
+        x for x in a.arms if x in FAULT_ARMS
+    ]:
+        p.error("normal arms must precede fault arms")
+    if min(a.on1_timeout_s, a.cell_timeout_s, a.fault_timeout_s) <= 0:
+        p.error("timeouts must be positive")
+    if a.skip_raw and a.reuse_from is None:
+        p.error("--skip-raw requires --reuse-from")
+    if a.reuse_from is not None:
+        a.reuse_from = a.reuse_from.absolute()
+        if not a.reuse_from.is_dir():
+            p.error("--reuse-from must be an existing evidence directory")
     # Child processes run from staging, not the caller's (possibly engine) repo.
     # Keep the venv interpreter path lexical: resolving its symlink loses venv.
     for name in ("out", "python", "worktree", "repo", "plan"):
         setattr(a, name, getattr(a, name).absolute())
     if a.port in (8001, 8021) or not 1024 <= a.port <= 65535:
         p.error("dedicated unprivileged test port required; 8001/8021 forbidden")
+    if a.budget_only:
+        print(window_budget(a))
+        return
     if a.analyze:
         print(json.dumps(analyze(a.out), indent=2))
         return
@@ -855,12 +1024,16 @@ def main():
             json.dumps(
                 {
                     "status": "PLAN_ONLY",
-                    "order": ORDER,
+                    "order": a.arms,
                     "out": str(a.out),
                     "argv_off": command(a, "off1"),
                     "argv_on": command(a, "on1"),
-                    "estimate_minutes": [90, 150],
-                    "outer_timeout_s": 10800,
+                    "arm_timeout_s": {arm: arm_timeout(a, arm) for arm in a.arms},
+                    "outer_timeout_s": window_budget(a),
+                    "note": (
+                        "Hard timeout sum, not an expected duration; "
+                        "subset cannot close missing full-matrix gates"
+                    ),
                 },
                 indent=2,
             )
@@ -872,7 +1045,9 @@ def main():
         p.error(f"refuse to overwrite existing output {a.out}")
 
     def interrupted(signum, frame):
-        raise TimeoutError(f"window interruption {signum}; cleaning owned children")
+        raise WindowInterrupted(
+            f"window interruption {signum}; cleaning owned children"
+        )
 
     for sig in (signal.SIGALRM, signal.SIGTERM, signal.SIGUSR1):
         signal.signal(sig, interrupted)

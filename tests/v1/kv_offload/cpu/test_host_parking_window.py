@@ -383,6 +383,202 @@ def test_raw_probe_never_starts_after_failed_preflight(tmp_path, monkeypatch):
         W.run(a)
 
 
+def test_arm_budgets_and_outer_cap_cover_selected_inner_deadlines():
+    a = NS(arms=["on1", *W.FAULT_ARMS], skip_raw=True)
+    assert W.arm_timeout(a, "on1") == 5400
+    assert W.arm_timeout(a, "on2") == 2700
+    assert W.arm_timeout(a, W.FAULT_ARMS[0]) == 1500
+    assert W.window_budget(a) == 12360
+    assert W.window_budget(a) > sum(W.arm_timeout(a, x) + 1140 for x in a.arms)
+    a.on1_timeout_s = 6000
+    assert W.window_budget(a) == 12960
+
+
+def test_window_deadline_is_not_swallowed_as_request_failure(monkeypatch):
+    def alarm(*a, **kw):
+        raise W.WindowInterrupted("deadline")
+
+    monkeypatch.setattr(W.urllib.request, "urlopen", alarm)
+    with pytest.raises(W.WindowInterrupted, match="deadline"):
+        W.complete(args(), [1], "deadline")
+
+
+def test_phase_and_parity_checkpoint_survive_interruption(tmp_path, monkeypatch):
+    a = NS(out=tmp_path)
+    monkeypatch.setattr(W, "reset", lambda *a: None)
+    monkeypatch.setattr(W, "prompt", lambda *a: [1])
+    count = 0
+
+    def complete(*a, **kw):
+        nonlocal count
+        count += 1
+        if count == 3:
+            raise W.WindowInterrupted("deadline")
+        return dict(label=str(count), ok=True)
+
+    monkeypatch.setattr(W, "complete", complete)
+    with pytest.raises(W.WindowInterrupted), W.phase(a, "on1", "parity"):
+        W.suite(a, lambda rows: W.write(tmp_path / "cases.json", rows))
+    assert len(json.loads((tmp_path / "cases.json").read_text())) == 2
+    assert not (tmp_path / "cases.json.tmp").exists()
+    events = [
+        json.loads(x) for x in (tmp_path / "phases.jsonl").read_text().splitlines()
+    ]
+    assert [r["status"] for r in events] == ["begin", "interrupted"]
+    assert all(r["arm"] == "on1" and r["phase"] == "parity" for r in events)
+
+
+def test_return_checkpoint_survives_next_burst_interruption(tmp_path, monkeypatch):
+    monkeypatch.setattr(W, "reset", lambda *a: None)
+    monkeypatch.setattr(W, "prompt", lambda *a: [1])
+
+    def complete(a, tokens, label, **kw):
+        if label == "return-c1-1-0":
+            raise W.WindowInterrupted("burst deadline")
+        return dict(label=label, ok=True)
+
+    monkeypatch.setattr(W, "complete", complete)
+    path = tmp_path / "returns.json"
+    with pytest.raises(W.WindowInterrupted, match="burst deadline"):
+        W.returns(args(), "on1", True, lambda rows: W.write(path, rows))
+    rows = json.loads(path.read_text())
+    assert len(rows) == 1 and rows[0]["label"] == "return-c1-0-0"
+
+
+def test_reused_evidence_is_not_relabelled_or_overwritten(tmp_path):
+    old, new = tmp_path / "old", tmp_path / "new"
+    old.mkdir()
+    new.mkdir()
+    for name in ("off1.cases.json", "on1.cases.json", "on1.serve.log"):
+        (old / name).write_text("[]")
+    for r in range(4):
+        (old / f"raw-rank{r}.json").write_text('{"status":"PASS"}')
+    (old / "off1.evil.py").write_text("do not copy")
+    a = NS(reuse_from=old, out=new, arms=["on1", *W.FAULT_ARMS], skip_raw=True)
+    W.reuse_evidence(a)
+    assert (new / "off1.cases.json").read_bytes() == (
+        old / "off1.cases.json"
+    ).read_bytes()
+    assert not (new / "on1.cases.json").exists()
+    assert not (new / "off2.cases.json").exists()
+    assert not (new / "off1.evil.py").exists()
+    manifest = json.loads((new / "reused-evidence.json").read_text())
+    assert len(manifest) == 5 and all(len(r["sha256"]) == 64 for r in manifest)
+    assert J.judge(new)["status"] != "PASS"
+    with pytest.raises(RuntimeError, match="collision"):
+        W.reuse_evidence(a)
+
+
+def test_skip_raw_requires_all_four_prior_results(tmp_path):
+    old, new = tmp_path / "old", tmp_path / "new"
+    old.mkdir()
+    new.mkdir()
+    (old / "raw-rank0.json").write_text("{}")
+    with pytest.raises(RuntimeError, match="all four"):
+        W.reuse_evidence(NS(reuse_from=old, out=new, arms=["on1"], skip_raw=True))
+
+
+def test_diagnostics_do_not_pass_uninstrumented_interference_gate(
+    tmp_path, monkeypatch
+):
+    W.write(tmp_path / "prereg.json", dict(parking_diagnostics=True))
+    for arm in J.ORDER:
+        W.write(tmp_path / (arm + ".traffic.json"), {})
+        W.write(tmp_path / (arm + ".copy.json"), {})
+    monkeypatch.setattr(J, "interference_gate", lambda *a: J.gate("PASS", "test"))
+    gate = J.judge(tmp_path)["gates"]["4 interference"]
+    assert gate["status"] == "INCONCLUSIVE"
+    assert gate["diagnostic_result"]["status"] == "PASS"
+
+
+def test_partial_fault_checkpoint_does_not_pass(tmp_path):
+    W.write(
+        tmp_path / "fault-pre_submit.json", {"cases": [dict(label="producer", ok=True)]}
+    )
+    assert J.failure_gate(tmp_path)["status"] == "INCONCLUSIVE"
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_complete_fault_evidence_uses_labels_not_record_order(tmp_path, reverse):
+    for mode in ("pre_submit", "completed_copy"):
+        arm = "fault-" + mode
+        labels = [
+            "producer",
+            "first-good-return",
+            "injected-return",
+            "failed-key-retry",
+            "unrelated",
+            "after-reset",
+            "after-aborts",
+        ]
+        rows = [
+            dict(
+                label=x,
+                ok=True,
+                ids=[1],
+                loads=[dict(success=False)] if x == "injected-return" else [],
+            )
+            for x in labels
+        ]
+        W.write(tmp_path / (arm + ".json"), {"cases": rows[::-1] if reverse else rows})
+        quota = dict(
+            in_use_slots=0, in_use_bytes_per_rank=0, read_write_refs=0, invalid_keys=0
+        )
+        (tmp_path / (arm + ".serve.log")).write_text(
+            f"injected_failure mode={mode}\nfailed_ranks=1\nsnapshot_discard\n"
+            "HOST_PARKING invalid_lookup_miss\nHOST_PARKING reset generation=1\n"
+            "HOST_PARKING abort req=x pending_loads=1 pending_stores=0\n"
+            "HOST_PARKING abort req=y pending_loads=0 pending_stores=1\n"
+            + "HOST_PARKING pool_released\n" * 4
+            + "HOST_PARKING quota "
+            + json.dumps(quota)
+            + "\n"
+        )
+    assert J.failure_gate(tmp_path)["status"] == "PASS"
+
+
+def test_selected_arm_plan_runs_no_preflight(tmp_path):
+    path = tmp_path / "must-not-exist"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(BENCH / "host_parking_window.py"),
+            "--out",
+            str(path),
+            "--arms",
+            "on1",
+            "fault-pre_submit",
+            "--parking-diagnostics",
+        ],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    data = json.loads(result.stdout)
+    assert data["status"] == "PLAN_ONLY" and not path.exists()
+    assert data["order"] == ["on1", "fault-pre_submit"]
+    cfg = json.loads(data["argv_on"][-1])["kv_connector_extra_config"]
+    assert cfg["parking_diagnostics"] is True
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--arms", "on1", "on1"],
+        ["--arms", "fault-pre_submit", "on1"],
+        ["--on1-timeout-s", "0"],
+        ["--skip-raw"],
+    ],
+)
+def test_invalid_rerun_selection_rejected_before_any_launch(extra):
+    result = subprocess.run(
+        [sys.executable, str(BENCH / "host_parking_window.py"), *extra],
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 2
+
+
 @pytest.mark.parametrize("cli", [[], ["--out", "cli-out"], ["--out=cli-out"]])
 def test_wrapper_output_plan_and_existing_directory_guard(tmp_path, cli):
     env = dict(

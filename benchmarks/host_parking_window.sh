@@ -28,7 +28,11 @@ fi
 [[ ! -e $parking_out && ! -L $parking_out ]] || { echo "Refuse to overwrite existing $parking_out" >&2; exit 2; }
 # Driver handles SIGTERM/ALRM by reaping only its own isolated child sessions.
 # Fence may lower 48G to preserve 16G system reserve; actual cap is logged.
+parking_cap=$(CUDA_VISIBLE_DEVICES= TRITON_INTERPRET=1 nice -n 19 taskset -c 0-26:2 \
+  "$parking_py" "$parking_wt/benchmarks/host_parking_window.py" \
+  --budget-only "${parking_args[@]}")
+[[ $parking_cap =~ ^[1-9][0-9]*$ ]] || { echo 'Invalid window budget' >&2; exit 2; }
 exec "$parking_repo/scripts/fence.sh" --name m37-parking --mem 48G --cpu 16 --high 100 -- \
-  timeout --signal=TERM --kill-after=180 10800 \
+  timeout --signal=TERM --kill-after=180 "$parking_cap" \
   env TMPDIR=/data/tmp "$parking_py" "$parking_wt/benchmarks/host_parking_window.py" \
   --execute "${parking_args[@]}"
