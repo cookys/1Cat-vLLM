@@ -964,8 +964,24 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel(
         static_cast<int64_t>(block_size) * num_kv_heads * 128;
     for (int unit_idx = copy_thread_idx; unit_idx < unit_count;
          unit_idx += NUM_THREADS) {
-      const int row = unit_idx / units_per_row;
-      const int unit = unit_idx - row * units_per_row;
+      int row = unit_idx / units_per_row;
+      int unit = unit_idx - row * units_per_row;
+      // kv_smem_stride_uint4 is 33 (odd): with row-major lane order 8
+      // consecutive lanes share one row and hit 2 bank classes (4-way STS
+      // conflict). Within a full 4-row block of 4*units_per_row indices the
+      // map (row&3, unit) -> (within&3, within>>2) is a bijection, so the
+      // same global addresses are read and the same smem slots written; 8
+      // consecutive lanes now cover 4 rows x 2 units, bank classes
+      // row + 4*unit mod 8 all distinct. Tail block (<4 rows) keeps the
+      // original mapping.
+      {
+        const int group = row >> 2;
+        const int within = ((row & 3) * units_per_row) + unit;
+        if (group * 4 + 4 <= valid_kv_tile_rows) {
+          row = (group << 2) | (within & 3);
+          unit = within >> 2;
+        }
+      }
       const int token_offset = tile_page_offset + kv_tile_start + row;
       const int logical_block = token_offset / block_size;
       const int block_offset = token_offset - logical_block * block_size;
@@ -1929,7 +1945,10 @@ constexpr int kGroupedVerifyRows = 48;
 constexpr int kGroupedVerifyBlockN = 32;
 constexpr int kGroupedVerifyQStride = 264;
 constexpr int kGroupedVerifyKVStride = 264;
-constexpr int kGroupedVerifyScoreStride = 32;
+// 32 floats = 128 B puts every score row in bank 0 for store_matrix_sync; 36
+// keeps the 16-byte ldm alignment wmma requires (multiple of 4 floats) and
+// spreads rows over banks.
+constexpr int kGroupedVerifyScoreStride = 36;
 constexpr int kGroupedVerifyProbStride = 40;
 constexpr int kGroupedVerifyPageIdsCapacity = 16;
 // One packed head group times eighty context splits maps one 512-thread CTA to
@@ -1990,8 +2009,71 @@ struct alignas(256) GroupedVerifySmem {
 
 static_assert(sizeof(GroupedVerifySmem) <= 64 * 1024,
               "packed grouped verifier must fit Volta's 64 KiB opt-in budget");
+// Proto B (warp-specialised loads): NVFP4 fused single-pass groups overlap the
+// V(t) and K(t+1) panel loads with QK(t). Warps [0, kGroupedVerifyQKWarps) run
+// QK; the remaining warps load. That needs a second K buffer and a separate V
+// buffer. All other specializations keep GroupedVerifySmem unchanged.
+template <int KV_DTYPE, bool TWO_PASS, bool SPARSE_PAGE4, bool ROW_SEQLENS,
+          bool COMPENSATE_P>
+inline constexpr bool kGroupedVerifyOverlapLoads =
+    KV_DTYPE == flash_v100::KV_CACHE_DTYPE_NVFP4 && !TWO_PASS &&
+    !SPARSE_PAGE4 && !ROW_SEQLENS && !COMPENSATE_P;
+
+struct alignas(256) GroupedVerifySmemOverlap {
+  union {
+    struct {
+      alignas(16) __half q[kGroupedVerifyRows * kGroupedVerifyQStride];
+      alignas(16) __half kv[kGroupedVerifyBlockN * kGroupedVerifyKVStride];
+      alignas(16) float scores[kGroupedVerifyRows * kGroupedVerifyScoreStride];
+      alignas(16) __half probs[kGroupedVerifyRows * kGroupedVerifyProbStride];
+      alignas(16) __half kv1[kGroupedVerifyBlockN * kGroupedVerifyKVStride];
+      alignas(16) __half v[kGroupedVerifyBlockN * kGroupedVerifyKVStride];
+    } compute;
+    alignas(16) float output[kGroupedVerifyRows * kGroupedVerifyHeadDim];
+  } storage;
+  alignas(16) float row_max[kGroupedVerifyRows];
+  alignas(16) float row_sum[kGroupedVerifyRows];
+  alignas(16) float row_scale[kGroupedVerifyRows];
+  alignas(16) int page_ids[kGroupedVerifyPageIdsCapacity];
+  alignas(16) uint32_t sparse_token_masks[kGroupedVerifyBlockN / 4];
+};
+
+// Volta's opt-in dynamic shared memory maximum is 96 KiB.
+static_assert(sizeof(GroupedVerifySmemOverlap) <= 96 * 1024,
+              "overlap grouped verifier must fit Volta's 96 KiB opt-in budget");
+
+template <int KV_DTYPE, bool TWO_PASS, bool SPARSE_PAGE4 = false,
+          bool ROW_SEQLENS = false, bool COMPENSATE_P = false>
+constexpr size_t grouped_verify_smem_bytes() {
+  return kGroupedVerifyOverlapLoads<KV_DTYPE, TWO_PASS, SPARSE_PAGE4,
+                                    ROW_SEQLENS, COMPENSATE_P>
+             ? sizeof(GroupedVerifySmemOverlap)
+             : sizeof(GroupedVerifySmem);
+}
+
 static_assert(kGroupedVerifyOutputTiles % kGroupedVerifyWarps == 0,
               "output tiles must divide evenly across warps");
+
+// One NVFP4 K or V tile into `dst` (rows >= valid_rows zero-filled) using
+// NUM_THREADS cooperating threads numbered copy_tid = 0..NUM_THREADS-1.
+template <int NUM_THREADS>
+__device__ __forceinline__ void grouped_verify_load_nvfp4_tile(
+    __half* __restrict__ dst, const void* __restrict__ cache,
+    const int* __restrict__ page_ids, const int valid_rows,
+    const int tile_page_offset, const int block_size, const int64_t block_stride,
+    const int64_t token_stride, const int64_t head_stride, const int copy_tid) {
+  constexpr int kPanelStrideVec = kGroupedVerifyHeadDim / 8;
+  constexpr int kSharedStrideVec = kGroupedVerifyKVStride / 8;
+  load_xqa_tc_kv_panel<0, false, NUM_THREADS,
+                       flash_v100::KV_CACHE_DTYPE_NVFP4, false>(
+      dst, cache, page_ids, valid_rows, kPanelStrideVec, kSharedStrideVec,
+      tile_page_offset, 0, block_size, 0, block_stride, token_stride,
+      head_stride, 0, copy_tid);
+  for (int idx = copy_tid + valid_rows * kSharedStrideVec;
+       idx < kGroupedVerifyBlockN * kSharedStrideVec; idx += NUM_THREADS) {
+    reinterpret_cast<uint4*>(dst)[idx] = make_uint4(0, 0, 0, 0);
+  }
+}
 
 template <int MAX_QUERY_TOKENS, bool SINGLE_QUERY>
 __device__ __forceinline__ int grouped_verify_active_splits(
@@ -2235,8 +2317,12 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
   const int lane_id = tid % kWarpSize;
 
   extern __shared__ char grouped_verify_smem_raw[];
-  GroupedVerifySmem& smem =
-      *reinterpret_cast<GroupedVerifySmem*>(grouped_verify_smem_raw);
+  constexpr bool kOverlapLoads =
+      kGroupedVerifyOverlapLoads<KV_DTYPE, TWO_PASS, SPARSE_PAGE4, ROW_SEQLENS,
+                                 COMPENSATE_P>;
+  using SmemT = std::conditional_t<kOverlapLoads, GroupedVerifySmemOverlap,
+                                   GroupedVerifySmem>;
+  SmemT& smem = *reinterpret_cast<SmemT*>(grouped_verify_smem_raw);
   __half* shared_q = smem.storage.compute.q;
   __half* shared_kv = smem.storage.compute.kv;
   float* shared_scores = smem.storage.compute.scores;
@@ -2424,6 +2510,142 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
   // Recompute QK for the conservative path, or consume it once while updating
   // the online state for the fused path. Both form half P and use identical
   // Volta WMMA P @ V arithmetic.
+  if constexpr (kOverlapLoads) {
+    // Warp-specialised pipeline, three barriers per tile instead of five:
+    //   A: warps [0,QKWarps) QK(t) from k[b]; the other warps load V(t) -> v and
+    //      K(t+1) -> k[b^1]
+    //   B: softmax (all warps)
+    //   C: rescale + P@V from v (all warps)
+    // Race check: v is rewritten only in phase A of tile t+1, after the
+    // barrier that ends P@V(t). k[b^1] is written in phase A of tile t; its
+    // last reader was QK(t-1), which ended at barrier A(t-1). k[b] (read by
+    // QK(t)) is next written in phase A of tile t+1, after QK(t). scores are
+    // written by QK(t+1) after the P@V(t) barrier and read by softmax(t)
+    // before it. probs/row_scale are written by softmax(t) and read by
+    // P@V(t) after barrier B. Arithmetic order is unchanged.
+    constexpr int kLoaderFirstThread = kGroupedVerifyQKWarps * kWarpSize;
+    constexpr int kLoaderThreads = kGroupedVerifyThreads - kLoaderFirstThread;
+    __half* const k_buf0 = smem.storage.compute.kv;
+    __half* const k_buf1 = smem.storage.compute.kv1;
+    __half* const shared_v = smem.storage.compute.v;
+    // Invariant: active_splits <= total_tiles, so split_start < split_end for
+    // every launched split; guard anyway. The barrier stays outside the branch.
+    if (split_start < split_end) {
+      const int valid_first = min(kGroupedVerifyBlockN, split_end - split_start);
+      grouped_verify_load_nvfp4_tile<kGroupedVerifyThreads>(
+          k_buf0, k_cache, page_ids, valid_first,
+          use_staged_page_ids ? split_page_offset : split_start,
+          page_block_size, k_block_stride, k_token_stride, k_head_stride, tid);
+    }
+    __syncthreads();
+    int buf = 0;
+    for (int tile_start = split_start; tile_start < split_end;
+         tile_start += kGroupedVerifyBlockN) {
+      const int valid_k_rows =
+          min(kGroupedVerifyBlockN, split_end - tile_start);
+      const int tile_page_offset =
+          use_staged_page_ids ? split_page_offset + tile_start - split_start
+                              : tile_start;
+      __half* const k_cur = buf ? k_buf1 : k_buf0;
+      __half* const k_nxt = buf ? k_buf0 : k_buf1;
+      if (warp_id < kGroupedVerifyQKWarps) {
+        grouped_verify_qk<false>(shared_q, k_cur, shared_scores, qk_scale, 0x7);
+      } else {
+        const int copy_tid = tid - kLoaderFirstThread;
+        grouped_verify_load_nvfp4_tile<kLoaderThreads>(
+            shared_v, v_cache, page_ids, valid_k_rows, tile_page_offset,
+            page_block_size, v_block_stride, v_token_stride, v_head_stride,
+            copy_tid);
+        const int next_start = tile_start + kGroupedVerifyBlockN;
+        if (next_start < split_end) {
+          const int valid_next =
+              min(kGroupedVerifyBlockN, split_end - next_start);
+          const int next_page_offset =
+              use_staged_page_ids
+                  ? split_page_offset + next_start - split_start
+                  : next_start;
+          grouped_verify_load_nvfp4_tile<kLoaderThreads>(
+              k_nxt, k_cache, page_ids, valid_next, next_page_offset,
+              page_block_size, k_block_stride, k_token_stride, k_head_stride,
+              copy_tid);
+        }
+      }
+      __syncthreads();  // A
+
+#pragma unroll
+      for (int row = warp_id; row < kGroupedVerifyRows;
+           row += kGroupedVerifyWarps) {
+        const int token_idx = row / Traits::kHeadsPerCta;
+        const int local_head = row % Traits::kHeadsPerCta;
+        const int head_idx = head_start + local_head;
+        const int kv_idx = tile_start + lane_id;
+        const bool visible =
+            grouped_verify_key_visible<SPARSE_PAGE4, ROW_SEQLENS>(
+                smem.sparse_token_masks, token_idx, query_len, head_idx, kv_idx,
+                valid_k_rows, lane_id, prefix_kv_len, row_lengths);
+        const float score =
+            visible ? shared_scores[row * kGroupedVerifyScoreStride + lane_id]
+                    : kXQANegInf;
+        const float tile_max_lane = warp_reduce_max(score);
+        const float tile_max = __shfl_sync(0xffffffffu, tile_max_lane, 0);
+        const float old_max = smem.row_max[row];
+        const float new_max = fmaxf(old_max, tile_max);
+        const float probability =
+            visible ? __expf(fmaxf(score - new_max, -80.0f)) : 0.0f;
+        const float tile_sum_lane = warp_reduce_sum(probability);
+        const float tile_sum = __shfl_sync(0xffffffffu, tile_sum_lane, 0);
+        const float exp_diff =
+            tile_sum > 0.0f ? __expf(fmaxf(old_max - new_max, -80.0f)) : 1.0f;
+        shared_probs[row * kGroupedVerifyProbStride + lane_id] =
+            __float2half_rn(probability);
+        __syncwarp();
+        if (lane_id == 0) {
+          if (tile_sum > 0.0f) {
+            smem.row_sum[row] = smem.row_sum[row] * exp_diff + tile_sum;
+            smem.row_max[row] = new_max;
+          }
+          smem.row_scale[row] = exp_diff;
+        }
+      }
+      __syncthreads();  // B
+#pragma unroll
+      for (int fragment_idx = 0;
+           fragment_idx < kGroupedVerifyOutputTilesPerWarp; ++fragment_idx) {
+        const int output_tile = warp_id + fragment_idx * kGroupedVerifyWarps;
+        const int m_tile = output_tile / (kGroupedVerifyHeadDim / 16);
+        grouped_verify_scale_output_fragment(output_fragments[fragment_idx],
+                                             smem.row_scale, m_tile * 16);
+      }
+#pragma unroll
+      for (int fragment_idx = 0;
+           fragment_idx < kGroupedVerifyOutputTilesPerWarp; ++fragment_idx) {
+        const int output_tile = warp_id + fragment_idx * kGroupedVerifyWarps;
+        const int m_tile = output_tile / (kGroupedVerifyHeadDim / 16);
+        const int d_tile = output_tile % (kGroupedVerifyHeadDim / 16);
+        volta::fragment<volta::matrix_a, 16, 16, 16, half, volta::row_major>
+            probability_fragment;
+        volta::fragment<volta::matrix_b, 16, 16, 16, half, volta::row_major>
+            value_fragment;
+        auto& pv_fragment = output_fragments[fragment_idx];
+#pragma unroll
+        for (int k_offset = 0; k_offset < kGroupedVerifyBlockN;
+             k_offset += 16) {
+          volta::load_matrix_sync(
+              probability_fragment,
+              shared_probs + m_tile * 16 * kGroupedVerifyProbStride + k_offset,
+              kGroupedVerifyProbStride);
+          volta::load_matrix_sync(
+              value_fragment,
+              shared_v + k_offset * kGroupedVerifyKVStride + d_tile * 16,
+              kGroupedVerifyKVStride);
+          volta::mma_sync(pv_fragment, probability_fragment, value_fragment,
+                          pv_fragment);
+        }
+      }
+      __syncthreads();  // C
+      buf ^= 1;
+    }
+  } else {
   for (int tile_start = split_start; tile_start < split_end;
        tile_start += kGroupedVerifyBlockN) {
     const int valid_k_rows = min(kGroupedVerifyBlockN, split_end - tile_start);
@@ -2690,6 +2912,7 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
       }
     }
     __syncthreads();
+  }
   }
 
   // The compute buffers are dead. Reuse their storage for the dense FP32
@@ -4843,11 +5066,12 @@ at::Tensor flash_attention_grouped_verify_paged(
 
   const dim3 partial_grid(head_groups, grouped_splits,
                           static_cast<unsigned>(batch_size));
-  const size_t partial_shared_mem = sizeof(GroupedVerifySmem);
 #define LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, PAGE_SIZE,   \
                                       SINGLE_QUERY, CONTIGUOUS_LAYOUT,         \
                                       STAGE_PAGE_IDS, KV_TYPE)                 \
   do {                                                                         \
+    constexpr size_t partial_shared_mem =                                      \
+        grouped_verify_smem_bytes<KV_TYPE, TWO_PASS>();                        \
     auto partial_kernel =                                                      \
         (void*)flash_attention_grouped_verify_e5m2_partial_kernel<             \
             MAX_QUERY_TOKENS, TWO_PASS, PAGE_SIZE, SINGLE_QUERY,               \
