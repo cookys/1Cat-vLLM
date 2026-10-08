@@ -25,9 +25,13 @@ def plan():
             {"group": g, "layers": n, "valid_bytes_per_layer": valid}
             for g, (n, valid) in enumerate(GROUPS)
         ],
-        "gpu_bytes_per_rank": 8 * 36 * PAGE,
+        "gpu_bytes_per_rank": 8 * 72 * PAGE,
         "host_bytes_per_rank": sum(n for n, _ in GROUPS) * 4 * PAGE,
-        "cycles": "all groups x distinct/shuffled destinations x slot reuse",
+        "cycles": "single + three shuffled blocks per group; three slot-reuse cycles",
+        "limitations": (
+            "reset generation and abort are scheduler tests, not raw-copy "
+            "tests; short token tails are not committed snapshots"
+        ),
         "scope": "synthetic raw transfer; no serving arithmetic/parity assertion",
     }
 
@@ -49,7 +53,7 @@ def run(rank):
 
     torch.cuda.set_device(rank)
     backing = [
-        torch.full((36, PAGE), -71, dtype=torch.int8, device=f"cuda:{rank}")
+        torch.full((72, PAGE), -71, dtype=torch.int8, device=f"cuda:{rank}")
         for _ in range(8)
     ]
     refs = [[CanonicalKVCacheRef(i, valid) for i in range(n)] for n, valid in GROUPS]
@@ -77,46 +81,57 @@ def run(rank):
     try:
         for cycle in range(3):
             for g, (n, valid) in enumerate(GROUPS):
-                src, dst = 4 * g + cycle % 2, 4 * g + 2 + cycle % 2
-                value = (g * 17 + cycle * 7 + rank) % 127
-                sizes = [0] * 9
-                sizes[g] = 1
-                source = GPULoadStoreSpec([src], sizes, [0] * 9)
-                dest = GPULoadStoreSpec([dst], sizes, [0] * 9)
-                cpu = CPULoadStoreSpec([cycle % 4])
-                # Enqueue writes without a host synchronize; handler must wait
-                # for the compute stream before reading or restoring a page.
-                for layer, t in enumerate(backing[:n]):
-                    t[src, :valid].copy_(pattern[:valid].bitwise_xor(value + layer))
-                    t[dst].fill_(-71)
-                jid = cycle * 100 + 2 * g
-                assert down.transfer_async(jid, (source, cpu))
-                down.wait({jid})
-                dr = down.get_finished()
-                assert len(dr) == 1 and dr[0].success
-                assert up.transfer_async(jid + 1, (cpu, dest))
-                up.wait({jid + 1})
-                ur = up.get_finished()
-                assert len(ur) == 1 and ur[0].success
-                equal = all(
-                    torch.equal(t[src, :valid], t[dst, :valid]) for t in backing[:n]
-                )
-                padding_ok = all(
-                    bool((t[dst, valid:] == -71).all()) for t in backing[:n]
-                )
-                rows.append(
-                    {
-                        "cycle": cycle,
-                        "group": g,
-                        "byte_equal": equal,
-                        "padding_untouched": padding_ok,
-                        "payload_bytes": n * valid,
-                        "d2h_s": dr[0].transfer_time,
-                        "h2d_s": ur[0].transfer_time,
-                    }
-                )
-                if not (equal and padding_ok):
-                    raise AssertionError(f"raw roundtrip mismatch group={g}")
+                for count in (1, 3):
+                    src_ids = [8 * g + x for x in (2, 0, 1)[:count]]
+                    dst_ids = [8 * g + x for x in (5, 7, 6)[:count]]
+                    sizes = [0] * 9
+                    sizes[g] = count
+                    source = GPULoadStoreSpec(src_ids, sizes, [0] * 9)
+                    dest = GPULoadStoreSpec(dst_ids, sizes, [0] * 9)
+                    cpu = CPULoadStoreSpec([3, 1, 2][:count])
+                    # Source writes must precede native copy-stream reads.
+                    for j, (src, dst) in enumerate(zip(src_ids, dst_ids)):
+                        value = (g * 17 + cycle * 7 + rank + j) % 119
+                        for layer, t in enumerate(backing[:n]):
+                            t[src, :valid].copy_(
+                                pattern[:valid].bitwise_xor(value + layer)
+                            )
+                            t[dst].fill_(-71)
+                    jid = cycle * 1000 + 10 * g + count * 2
+                    assert down.transfer_async(jid, (source, cpu))
+                    down.wait({jid})
+                    dr = down.get_finished()
+                    assert len(dr) == 1 and dr[0].success
+                    assert up.transfer_async(jid + 1, (cpu, dest))
+                    up.wait({jid + 1})
+                    ur = up.get_finished()
+                    assert len(ur) == 1 and ur[0].success
+                    equal = all(
+                        torch.equal(t[src, :valid], t[dst, :valid])
+                        for t in backing[:n]
+                        for src, dst in zip(src_ids, dst_ids)
+                    )
+                    padding_ok = all(
+                        bool((t[dst, valid:] == -71).all())
+                        for t in backing[:n]
+                        for dst in dst_ids
+                    )
+                    rows.append(
+                        {
+                            "cycle": cycle,
+                            "group": g,
+                            "blocks": count,
+                            "source_ids": src_ids,
+                            "destination_ids": dst_ids,
+                            "byte_equal": equal,
+                            "padding_untouched": padding_ok,
+                            "payload_bytes": count * n * valid,
+                            "d2h_s": dr[0].transfer_time,
+                            "h2d_s": ur[0].transfer_time,
+                        }
+                    )
+                    if not (equal and padding_ok):
+                        raise AssertionError(f"raw roundtrip mismatch group={g}")
     finally:
         # Both directions quiesce before host registration is released.
         down.shutdown()

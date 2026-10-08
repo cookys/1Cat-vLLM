@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
+import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from itertools import islice
@@ -59,6 +61,9 @@ class TransferJobStatus:
     # Registered in _block_id_to_pending_jobs at store creation time.
     sliding_window_block_ids: list[int] | None = None
     failed_count: int = 0
+    parking_arrival_ns: int = 0
+    parking_submit_ns: int = 0
+    parking_external_tokens: int = 0
 
 
 class GroupOffloadConfig(NamedTuple):
@@ -786,6 +791,11 @@ class OffloadingConnectorScheduler:
             keys=set(keys_to_load),
             is_store=False,
         )
+        if self.host_parking:
+            job = self._jobs[load_job_id]
+            job.parking_arrival_ns = int(request.arrival_time * 1e9)
+            job.parking_submit_ns = time.time_ns()
+            job.parking_external_tokens = num_external_tokens
 
         if self._blocks_being_loaded is not None:
             self._blocks_being_loaded.update(keys_to_load)
@@ -1227,6 +1237,28 @@ class OffloadingConnectorScheduler:
                     self.manager.invalidate(job_status.keys)
                 if self._blocks_being_loaded:
                     self._blocks_being_loaded.difference_update(job_status.keys)
+                if self.host_parking:
+                    # Observation is after all TP ranks acknowledge their copy
+                    # events. Includes scheduler polling delay: an upper bound
+                    # on event completion, not a CUDA event timestamp.
+                    observed_ns = time.time_ns()
+                    logger.info(
+                        "HOST_PARKING load_timing %s",
+                        json.dumps(
+                            {
+                                "request_id": job_status.req_id,
+                                "job": job_id,
+                                "generation": self._parking_generation,
+                                "arrival_ns": job_status.parking_arrival_ns,
+                                "submit_ns": job_status.parking_submit_ns,
+                                "all_rank_events_observed_ns": observed_ns,
+                                "external_tokens": job_status.parking_external_tokens,
+                                "success": success,
+                                "failed_ranks": job_status.failed_count,
+                            },
+                            sort_keys=True,
+                        ),
+                    )
             if self._block_id_to_pending_jobs:
                 # Sliding window blocks are tracked from store creation
                 # and must be cleaned up unconditionally.

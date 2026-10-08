@@ -151,12 +151,25 @@ class HostParkingSpec(CPUOffloadingSpec):
             except Exception:
                 pool.close()
                 raise
-        from vllm.v1.kv_offload.cpu.parking_transfer import RecoveringHandler
+        from vllm.v1.kv_offload.cpu.parking_transfer import (
+            RecoveringHandler,
+            ValidationFaultHandler,
+        )
 
-        handlers.gpu_to_cpu_handler = RecoveringHandler(
-            handlers.gpu_to_cpu_handler, pool
-        )
-        handlers.cpu_to_gpu_handler = RecoveringHandler(
-            handlers.cpu_to_gpu_handler, pool
-        )
+        fault = self.extra_config.get("parking_test_fail_direction")
+        if fault:
+            from vllm.distributed import get_tensor_model_parallel_rank
+
+            if get_tensor_model_parallel_rank() != 0:
+                fault = None
+        for name, direction in (
+            ("gpu_to_cpu_handler", "GPU_to_CPU"),
+            ("cpu_to_gpu_handler", "CPU_to_GPU"),
+        ):
+            inner = getattr(handlers, name)
+            if fault == direction:
+                inner = ValidationFaultHandler(
+                    inner, self.extra_config["parking_test_fail_mode"]
+                )
+            setattr(handlers, name, RecoveringHandler(inner, pool))
         return handlers

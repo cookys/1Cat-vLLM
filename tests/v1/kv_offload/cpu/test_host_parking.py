@@ -675,3 +675,138 @@ def test_p8_must_remain_off():
     config.scheduler_config.mixed_prefill_step_latency_ms = 10
     with pytest.raises(ValueError, match="P8 disabled"):
         HostParkingSpec(config, caches)
+
+
+def test_draft_identity_is_part_of_snapshot_namespace():
+    config, caches = real_layout()
+    spec = config.speculative_config
+    spec.model = "drafter-A"
+    spec.revision = "revision-1"
+    first = layout_namespace(config, caches)
+    spec.model = "drafter-B"
+    assert layout_namespace(config, caches) != first
+    spec.model = "drafter-A"
+    spec.revision = "revision-2"
+    assert layout_namespace(config, caches) != first
+    spec.revision = "revision-1"
+    spec.draft_model_config = NS(
+        model="resolved-A", revision="rev", dtype=torch.float16
+    )
+    second = layout_namespace(config, caches)
+    spec.draft_model_config.revision = "another-rev"
+    assert layout_namespace(config, caches) != second
+
+
+@pytest.mark.parametrize("mode", ["pre_submit", "completed_copy"])
+def test_validation_fault_wraps_native_inner_one_rank_only(monkeypatch, mode):
+    from vllm.v1.kv_offload.cpu.parking_transfer import ValidationFaultHandler
+
+    drain = MagicMock()
+    monkeypatch.setattr(torch.cuda, "synchronize", drain)
+    native = [FakeHandler() for _ in range(4)]
+    handlers = [
+        RecoveringHandler(ValidationFaultHandler(n, mode) if r == 0 else n)
+        for r, n in enumerate(native)
+    ]
+    for handler in handlers:
+        assert handler.transfer_async(1, None)
+    # Native completion has not happened: completed-copy injector cannot fail yet.
+    if mode == "completed_copy":
+        assert handlers[0].get_finished() == []
+    for rank, n in enumerate(native):
+        if rank or mode == "completed_copy":
+            n.result = [TransferResult(1, True)]
+    results = [h.get_finished() for h in handlers]
+    assert [r[0].success for r in results] == [False, True, True, True]
+    assert drain.call_count == int(mode == "pre_submit")
+    for h, n in zip(handlers, native):
+        assert h.transfer_async(2, None)
+        n.result = [TransferResult(2, True)]
+        assert h.get_finished()[0].success
+
+
+def test_validation_injection_is_explicit_and_known_mode():
+    with pytest.raises(ValueError, match="validation"):
+        ParkingConfig.parse(
+            {"host_parking": True, "parking_test_fail_direction": "CPU_to_GPU"}
+        )
+    for mode in ("pre_submit", "completed_copy"):
+        ParkingConfig.parse(
+            {
+                "host_parking": True,
+                "parking_validation": True,
+                "parking_test_fail_direction": "CPU_to_GPU",
+                "parking_test_fail_mode": mode,
+            }
+        )
+
+
+def test_running_hybrid_copy_failure_quarantines_without_free_or_engine_error():
+    from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    core = object.__new__(Scheduler)
+    core.connector = NS(connector_scheduler=NS(host_parking=True))
+    core.kv_cache_manager = MagicMock()
+    core.kv_cache_manager.get_block_ids.side_effect = lambda rid: (
+        ([2, 3], [0, 9]) if rid == "bad" else ([12, 13], [0, 19])
+    )
+    bad = NS(
+        request_id="bad",
+        num_computed_tokens=8192,
+        status=RequestStatus.RUNNING,
+        spec_token_ids=[7],
+    )
+    good = NS(request_id="good", num_computed_tokens=4096, status=RequestStatus.RUNNING)
+    core.running = [bad, good]
+    core.skipped_waiting = create_request_queue(SchedulingPolicy.FCFS)
+    core.failed_recving_kv_req_ids = set()
+    core.finished_recving_kv_req_ids = set()
+    core.recompute_kv_load_failures = True
+    assert core._handle_invalid_blocks({9}, {"bad": 8}) == {"bad"}
+    assert core.running == [good]
+    assert list(core.skipped_waiting) == [bad]
+    assert bad.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert bad.num_computed_tokens == 0 and bad.spec_token_ids == []
+    assert core.failed_recving_kv_req_ids == {"bad"}
+    assert core._parking_quarantined == 1
+    core.kv_cache_manager.evict_blocks.assert_called_once_with({2, 3, 9})
+    core.kv_cache_manager.free.assert_not_called()
+    assert not core._try_promote_blocked_waiting_request(bad)
+    # Only the all-rank receive completion lets pages be freed for recompute.
+    core.finished_recving_kv_req_ids.add("bad")
+    bad.num_preemptions = 1
+    assert core._try_promote_blocked_waiting_request(bad)
+    core.kv_cache_manager.free.assert_called_once_with(bad)
+    assert bad.status == RequestStatus.PREEMPTED
+
+
+def test_load_timing_only_emits_after_all_rank_events(monkeypatch):
+    import json
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
+        scheduler as module,
+    )
+
+    scheduler, state = parking_scheduler()
+    scheduler.manager = MagicMock(spec=ParkingManager)
+    scheduler._jobs[7] = TransferJobStatus(
+        "req",
+        4,
+        {key(0, 1)},
+        False,
+        parking_arrival_ns=1_000_000_000,
+        parking_submit_ns=1_100_000_000,
+        parking_external_tokens=8192,
+    )
+    state.transfer_jobs.add(7)
+    log = MagicMock()
+    monkeypatch.setattr(module.logger, "info", log)
+    monkeypatch.setattr(module.time, "time_ns", lambda: 1_500_000_000)
+    scheduler.update_connector_output(completion(7, 3))
+    log.assert_not_called()
+    scheduler.update_connector_output(completion(7, 1))
+    payload = json.loads(log.call_args.args[1])
+    assert payload["arrival_ns"] == 1_000_000_000
+    assert payload["all_rank_events_observed_ns"] == 1_500_000_000
+    assert payload["external_tokens"] == 8192 and payload["success"]

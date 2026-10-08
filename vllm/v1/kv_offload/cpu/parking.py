@@ -37,6 +37,16 @@ class ParkingConfig:
             raise ValueError("parking must not filter one-time boundary handoffs")
         if extra.get("eviction_policy", "lru") != "lru":
             raise ValueError("parking v1 requires LRU")
+        fault = extra.get("parking_test_fail_direction")
+        if fault is not None and (
+            extra.get("parking_validation") is not True
+            or fault not in ("GPU_to_CPU", "CPU_to_GPU")
+            or extra.get("parking_test_fail_mode")
+            not in ("pre_submit", "completed_copy")
+        ):
+            raise ValueError(
+                "copy fault injection requires explicit parking_validation"
+            )
         return cls(size, node)
 
 
@@ -48,13 +58,29 @@ def layout_namespace(config, cache_config) -> bytes:
     host memory. In-row NVFP4 scales are copied as part of the raw page.
     """
     model = config.model_config
+    spec = getattr(config, "speculative_config", None)
+    draft = getattr(spec, "draft_model_config", None)
+    draft_hf = getattr(draft, "hf_config", None)
     identity = {
-        "version": 1,
+        "version": 2,
         "model": model.model,
         "revision": getattr(model, "revision", None),
         "dtype": str(model.dtype),
         "quantization": getattr(model, "quantization", None),
         "hf_config": model.hf_config.to_dict(),
+        "draft": {
+            "method": getattr(spec, "method", None),
+            "model": getattr(spec, "model", None),
+            "revision": getattr(spec, "revision", None),
+            "code_revision": getattr(spec, "code_revision", None),
+            "num_speculative_tokens": getattr(spec, "num_speculative_tokens", None),
+            "kv_cache_dtype": getattr(spec, "kv_cache_dtype", None),
+            "resolved_model": getattr(draft, "model", None),
+            "resolved_revision": getattr(draft, "revision", None),
+            "dtype": str(getattr(draft, "dtype", None)),
+            "quantization": getattr(draft, "quantization", None),
+            "hf_config": draft_hf.to_dict() if draft_hf is not None else None,
+        },
         "tp": config.parallel_config.tensor_parallel_size,
         "groups": [
             {"layers": g.layer_names, "spec": asdict(g.kv_cache_spec)}

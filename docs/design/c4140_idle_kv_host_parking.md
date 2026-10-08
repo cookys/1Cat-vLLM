@@ -58,16 +58,22 @@ Do not mix recorder denominators or claim a lower concurrency arm won.
 1. **Raw bytes: zero mismatches.** All TP ranks and all cache groups (target
    NVFP4 data+scales, committed GDN, draft SW) round-trip through native
    handlers to distinct destination IDs. Compare valid physical group payload,
-   including state and scales; report allocator padding separately. Test full,
-   short-tail and shuffled IDs, slot reuse, cache reset generation, and abort
-   during D2H/H2D. Any valid-byte mismatch is FAIL, not an E2 candidate.
-2. **Serving parity:** OFF/OFF floor and OFF/ON paired loader instances,
-   existing 12 fixed-seed cases plus repeated long-prefix/append chains.
-   Token-ID mismatch or logprob drift above OFF/OFF floor rejects E1. Preserve
+   including state and scales; report allocator padding separately. GPU raw-copy scope: one block and three shuffled blocks per group, three
+   slot-reuse cycles. It does NOT prove scheduler reset/abort. Short token
+   tails are not committed full-block snapshots and must not be restored;
+   serving boundary±1, reset generation and abort are separate gate-7 cases. Any valid-byte mismatch is FAIL, not an E2 candidate.
+2. **Serving parity:** OFF/OFF floor and OFF/ON instances with the same production compile policy
+   (do not enable a disabled AOT cache just to obtain loaders), 12 fixed-seed
+   cases plus 3 chains × 4 turns per instance, 128 output tokens/call. All token
+   IDs must match. For common-prefix raw API logprobs, require ON/OFF maximum
+   absolute difference ≤ max(1e-6, OFF/OFF maximum); mean ≤
+   max(1e-7, OFF/OFF mean). Any token mismatch rejects E1 regardless of floor. Preserve
    raw differences and do not change the rule after seeing data. Byte equality
    alone does not prove identical serving arithmetic/chunk boundaries.
 3. **Restore latency:** at least 100 returns at c1 and 100 returns in c10
-   bursts; report p50/p99 from arrival through all-rank H2D completion, TTFT,
+   bursts; both sets require arrival→all-rank event-observation **p50 ≤ 2.0 s
+   and p99 ≤ 4.0 s** (engineering acceptance targets, not measured promises).
+   Also report TTFT,
    actual payload, H2D and D2H separately. A 16 GiB pool cannot hold ten full
    262K images simultaneously: c10 transport uses quota-fitting images (e.g.
    32K), with full-262K c1 separate. Ten full images is a quota-rejection test,
@@ -218,3 +224,30 @@ intervals per rank/direction from the short nsys window and divide by the
 same wall window. Never sum four rank-time counters as wall time. Keep the
 unprofiled S cells as the speed denominator. Failure counters are the explicit
 `HOST_PARKING copy_failure`, `snapshot_discard`, `fatal_copy_context` log totals.
+
+## Review revision (2026-10-09; GPU has not run)
+
+- Namespace v2 includes configured and resolved draft model/revision, dtype,
+  quantization, HF config, method, speculative width and KV format.
+- A non-WAITING hybrid reader is quarantined, invalid hashes evicted, pages
+  retained until all-rank receive events, then recomputed. It does not kill
+  the engine. `reader_quarantined` and `snapshot_discard` count the fallbacks.
+- Validation only: `parking_validation=true`,
+  `parking_test_fail_direction=CPU_to_GPU|GPU_to_CPU`,
+  `parking_test_fail_mode=pre_submit|completed_copy`. Only TP rank 0 wraps
+  `RecoveringHandler.inner`. The latter reports failure after the real event;
+  it does not poison CUDA or pretend to test device loss. Never enable in prod.
+- `HOST_PARKING load_timing` records request arrival, submit and all-rank
+  event-observation epoch nanoseconds, actual external tokens, generation and
+  success. Observation includes scheduler polling delay, so latency is an
+  upper bound. Actual event durations remain native transfer metrics.
+- Avoided prefill seconds are measured with identical OFF cold-return inputs:
+  report OFF TTFT minus ON arrival→event-observation as an **upper-bound proxy**
+  (OFF TTFT also includes first decode/sampling); acceptance additionally needs
+  positive paired end-to-end TTFT savings. Do not call this isolated GPU prefill
+  time. Save raw per-request records so the proxy can be audited.
+- Tombstone sweep CPU ns/keys/count are accumulated only when nonempty, logged
+  at shutdown. A normal empty sweep does not read a clock or scan the pool.
+- Raw probe now covers shuffled multi-block transfers; generation and abort
+  CPU tests are separate evidence. Gate 7 still needs real serving reset/abort
+  cases in the window; CPU success alone is not a GPU PASS.

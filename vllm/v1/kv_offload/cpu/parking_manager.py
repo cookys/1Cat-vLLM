@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
+
+from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import OffloadingManager
+
+logger = init_logger(__name__)
 
 
 class ParkingManager(OffloadingManager):
@@ -14,6 +19,7 @@ class ParkingManager(OffloadingManager):
     def __init__(self, inner):
         self.inner = inner
         self.invalid_keys = set()
+        self.sweep_count = self.sweep_keys = self.sweep_ns = 0
 
     def invalidate(self, keys):
         self.invalid_keys.update(keys)
@@ -42,11 +48,16 @@ class ParkingManager(OffloadingManager):
         # A grouped reservation can evict from one group, then roll back when
         # another group is full and return None (no evicted_keys available).
         # Sweep rare failure tombstones against the authoritative native pool.
-        self.invalid_keys = {
-            k
-            for k in self.invalid_keys
-            if self.inner.lookup(k, req_context) is not False
-        }
+        if self.invalid_keys:
+            started = time.perf_counter_ns()
+            self.sweep_count += 1
+            self.sweep_keys += len(self.invalid_keys)
+            self.invalid_keys = {
+                k
+                for k in self.invalid_keys
+                if self.inner.lookup(k, req_context) is not False
+            }
+            self.sweep_ns += time.perf_counter_ns() - started
         return output
 
     def complete_store(self, keys, req_context, success=True):
@@ -65,5 +76,12 @@ class ParkingManager(OffloadingManager):
         self.invalid_keys.clear()
 
     def shutdown(self):
+        logger.info(
+            "HOST_PARKING tombstone_sweep count=%d keys=%d cpu_ns=%d remaining=%d",
+            self.sweep_count,
+            self.sweep_keys,
+            self.sweep_ns,
+            len(self.invalid_keys),
+        )
         self.inner.shutdown()
         self.invalid_keys.clear()

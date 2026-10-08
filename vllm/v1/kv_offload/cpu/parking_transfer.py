@@ -92,3 +92,43 @@ class RecoveringHandler(OffloadingHandler):
         if self.pool is not None:
             self.pool.release_direction()
             self.pool = None
+
+
+class ValidationFaultHandler:
+    """Opt-in test wrapper *inside* RecoveringHandler, rank zero only.
+
+    completed_copy changes a result only after the native event has completed.
+    It simulates a reported copy failure without corrupting a CUDA context.
+    All native queues/events remain authoritative and are delegated unchanged.
+    """
+
+    def __init__(self, inner, mode):
+        if mode not in ("pre_submit", "completed_copy"):
+            raise ValueError("unknown parking validation fault mode")
+        self.inner = inner
+        self.mode = mode
+        self.armed = True
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    def transfer_async(self, job_id, spec):
+        if self.armed and self.mode == "pre_submit":
+            self.armed = False
+            logger.warning(
+                "HOST_PARKING injected_failure mode=pre_submit job=%d", job_id
+            )
+            return False
+        return self.inner.transfer_async(job_id, spec)
+
+    def get_finished(self):
+        results = self.inner.get_finished()
+        if self.armed and self.mode == "completed_copy" and results:
+            self.armed = False
+            first = results[0]
+            results[0] = TransferResult(job_id=first.job_id, success=False)
+            logger.warning(
+                "HOST_PARKING injected_failure mode=completed_copy job=%d",
+                first.job_id,
+            )
+        return results

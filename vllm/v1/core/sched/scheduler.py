@@ -2779,7 +2779,7 @@ class Scheduler(SchedulerInterface):
         # these requests must be rescheduled, but only the first will recompute
         # it. This set tracks blocks already marked for recomputation.
         marked_invalid_block_ids: set[int] = set()
-        for request in requests:
+        for request in tuple(requests):
             is_affected = False
             marked_invalid_block = False
             req_id = request.request_id
@@ -2803,7 +2803,23 @@ class Scheduler(SchedulerInterface):
                 if all_ids.isdisjoint(invalid_block_ids):
                     continue
                 if request.status != RequestStatus.WAITING_FOR_REMOTE_KVS:
-                    raise RuntimeError("parking load failure outside async wait")
+                    # Quarantine an unexpectedly admitted reader as well. A
+                    # rank-local error can precede the other ranks' receive
+                    # events, so neither free nor reuse its pages here.
+                    self.running.remove(request)
+                    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    request.spec_token_ids = []
+                    self.skipped_waiting.prepend_request(request)
+                    self.failed_recving_kv_req_ids.add(req_id)
+                    self.kv_cache_manager.evict_blocks(all_ids - {0})
+                    self._parking_quarantined = (
+                        getattr(self, "_parking_quarantined", 0) + 1
+                    )
+                    logger.warning(
+                        "HOST_PARKING reader_quarantined total=%d; discard "
+                        "snapshot, wait for TP receive events, then recompute",
+                        self._parking_quarantined,
+                    )
                 total_affected_tokens += request.num_computed_tokens
                 request.num_computed_tokens = 0
                 affected_req_ids.add(req_id)
