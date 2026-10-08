@@ -6387,7 +6387,16 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         batched_request_shape = bool(
             self.use_dflash2_batched_grouped_verify
             and self.dflash2_grouped_verify_request_major_abi_version >= 1
-            and num_reqs in (2, 4, 8)
+            # The native request-major ABI supports arbitrary B > 1 for q8.
+            # Keep the old admission set unless explicitly enabled, including
+            # at graph capture (where B includes zero-seqlen padding slots).
+            and (
+                num_reqs in (2, 4, 8)
+                or (
+                    envs.VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY_ANY_BATCH
+                    and num_reqs >= 2
+                )
+            )
             and max_query_len == 8
             and num_query_tokens == num_reqs * 8
         )

@@ -486,6 +486,7 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_DECODE_USE_XQA: bool = True
     VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY: bool = True
     VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY: bool = False
+    VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY_ANY_BATCH: bool = False
     VLLM_FLASH_V100_GROUPED_VERIFY_PER_REQUEST_FALLBACK: bool = True
     VLLM_FLASH_V100_NVFP4_FIRST_CHUNK_FP16: bool = True
     VLLM_FLASH_V100_NVFP4_PREFIX_DECODE_ROWS: bool = True
@@ -3260,6 +3261,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY", "0"))
+    ),
+    # Opt in to the existing request-major q8 ABI for all batch sizes >= 2,
+    # including padded FULL-graph buckets. Requires BATCHED_GROUPED_VERIFY;
+    # 0 preserves the original {2, 4, 8} admission and fallback paths.
+    "VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY_ANY_BATCH": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY_ANY_BATCH", "0"))
     ),
     "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN": lambda: int(
         os.getenv("VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN", "32768")
