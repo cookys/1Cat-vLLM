@@ -378,3 +378,35 @@ M37_GO=1 M37_OUT=/data/bench/m37b bash /data/bench/ab/m37-parking.sh --execute
 No preregistered numerical thresholds, GPU blocks, test cases, copy behavior,
 or production flags change. The prior 90–150-minute estimate remains unmeasured;
 CPU preflight adds up to nine short imports, each capped at 120 seconds.
+
+## Fourth-review preflight requirements (2026-10-09)
+
+Changes are isolated in `/data/src/1cat-wt-astra-host-parking-review`, branch
+`p072-astra-host-parking-preflight-review`, based on `addf06bb4`. The running
+m37b worktree and `/data/bench/ab/m37-parking.sh` remain unchanged. Do not
+cherry-pick into that worktree or replace its scripts until the window ends.
+
+- `host_parking_import_check.py:checked_staging` checks the actual directory
+  entries equal **exactly `{vllm}`** before any package import, including hidden
+  entries. The only entry must be a symlink to this worktree's `vllm` directory.
+- The top-level package list now includes `flash_attn_v100`. Its `__init__.py`
+  must reside in the venv; separately, the loaded
+  `flash_attn_v100.flash_attn_v100_cuda` must be a native extension from that
+  same venv. Both spec origin and actual `__file__` are checked, as for the
+  existing FlashQLA native extension. A Python wrapper alone cannot pass the
+  native-binary gate.
+- `host_parking_window.py:import_preflight` runs a real negative-control
+  subprocess **once per window, before the raw GPU probe**. It restores the
+  old whole-worktree `PYTHONPATH` and requires exit 1, `status=FAIL`, and a
+  `RuntimeError` for FlashQLA's out-of-venv origin before any package import.
+  Success, unrelated errors, or imports before rejection fail the gate.
+  `<out>/old-path-rejected.{json,log}` and argv JSON retain the evidence.
+
+CPU evidence: `/data/bench/astra-host-parking/review4/tests-final.log` records
+the exact serving-venv command and **204 passed**. The tests include a genuine
+old-path subprocess regression, not just mocked origins. Live CPU preflight
+artifacts are under `review4/live-preflight/`: `cpu-smoke.imports.json` PASS
+with seven top-level packages, both venv native binaries and
+`cuda_initialized=false`; `old-path-rejected.json` has the expected
+`RuntimeError`. Ruff and `git diff --check` pass. No GPU execution was performed
+for these changes; no parking runtime or numerical code changed.

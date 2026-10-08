@@ -85,7 +85,7 @@ def engine_env(args, fault=False):
     return env
 
 
-def import_preflight(args, label):
+def import_preflight(args, label, *, negative_control=False):
     env = engine_env(args)
     env["CUDA_VISIBLE_DEVICES"] = ""
     cmd = [
@@ -96,10 +96,35 @@ def import_preflight(args, label):
         str(args.worktree),
         "--venv",
         str(args.python.parent.parent),
+        "--staging",
+        str(args.staging),
         "--out",
         str(args.out / (label + ".imports.json")),
     ]
     timed_command(cmd, env, args.out / (label + ".imports.log"), 120, cwd=args.staging)
+    if negative_control:
+        # Run once per window, before the raw GPU probe. Reproduce the old
+        # whole-worktree launch and require a provenance failure, not any error.
+        negative_out = args.out / "old-path-rejected.json"
+        negative_cmd = cmd[:-1] + [str(negative_out)]
+        negative_env = dict(env, PYTHONPATH=str(args.worktree))
+        timed_command(
+            negative_cmd,
+            negative_env,
+            args.out / "old-path-rejected.log",
+            120,
+            cwd=args.staging,
+            expected_rc=1,
+        )
+        report = json.loads(negative_out.read_text())
+        if (
+            report.get("status") != "FAIL"
+            or report.get("error_type") != "RuntimeError"
+            or "flash_qla origin" not in report.get("error", "")
+            or "outside" not in report.get("error", "")
+            or any("__file__" in p for p in report.get("packages", {}).values())
+        ):
+            raise RuntimeError("old PYTHONPATH did not reject FlashQLA before import")
 
 
 def percentile(xs, q):
@@ -587,12 +612,13 @@ def server(args, arm, fault=None):
                     child.wait(timeout=30)
 
 
-def timed_command(cmd, env, path, seconds, cwd=None):
+def timed_command(cmd, env, path, seconds, cwd=None, expected_rc=0):
     write(
         str(path) + ".argv.json",
         {
             "argv": cmd,
             "timeout_seconds": seconds,
+            "expected_returncode": expected_rc,
             "cwd": None if cwd is None else str(cwd),
             "pythonpath": env.get("PYTHONPATH"),
         },
@@ -616,8 +642,8 @@ def timed_command(cmd, env, path, seconds, cwd=None):
                 except subprocess.TimeoutExpired:
                     os.killpg(process.pid, signal.SIGKILL)
                     process.wait(timeout=15)
-    if rc:
-        raise RuntimeError(f"command failed rc={rc}; {path}")
+    if rc != expected_rc:
+        raise RuntimeError(f"command rc={rc}, expected {expected_rc}; {path}")
 
 
 def traffic(args, arm):
@@ -691,7 +717,7 @@ def run(args):
             ).strip(),
         },
     )
-    import_preflight(args, "raw")
+    import_preflight(args, "raw", negative_control=True)
     env = engine_env(args)
     with Monitor(args.out / "memory.jsonl") as monitor:
         raw = [

@@ -146,13 +146,14 @@ def test_staging_exposes_only_vllm_and_environment_isolated(tmp_path, monkeypatc
 
 def fake_imports(tmp_path, monkeypatch):
     wt, venv = tmp_path / "wt", tmp_path / "venv"
+    (wt / "vllm").mkdir(parents=True)
+    W.make_staging(NS(out=tmp_path, worktree=wt))
     origins = {
         n: str((wt if n == "vllm" else venv / "site-packages") / n / "__init__.py")
         for n in I.PACKAGES
     }
-    origins[I.PREBUILT] = str(
-        venv / ("prebuilt" + importlib.machinery.EXTENSION_SUFFIXES[0])
-    )
+    for name in I.PREBUILTS:
+        origins[name] = str(venv / (name + importlib.machinery.EXTENSION_SUFFIXES[0]))
     imported = []
 
     def load(name):
@@ -173,29 +174,101 @@ def test_import_check_accepts_only_worktree_vllm_and_venv_dependencies(
     tmp_path, monkeypatch
 ):
     wt, venv, origins, imported = fake_imports(tmp_path, monkeypatch)
-    result = I.check(wt, venv)
+    result = I.check(wt, venv, tmp_path / "python-staging")
     assert result["status"] == "PASS" and not result["cuda_initialized"]
-    assert imported == list(I.PACKAGES) + [I.PREBUILT]
+    assert imported == list(I.PACKAGES) + list(I.PREBUILTS)
+    assert result["staging_contents"] == ["vllm"]
     assert all(result["packages"][n]["__file__"] == p for n, p in origins.items())
 
 
-@pytest.mark.parametrize("package", ["vllm", "flash_qla", "flashinfer", "torch"])
+@pytest.mark.parametrize(
+    "package", ["vllm", "flash_qla", "flashinfer", "torch", "flash_attn_v100"]
+)
 def test_shadowing_rejected_before_any_import(tmp_path, monkeypatch, package):
     wt, venv, origins, imported = fake_imports(tmp_path, monkeypatch)
     origins[package] = str(tmp_path / "wrong" / package / "__init__.py")
-    result = I.check(wt, venv)
+    result = I.check(wt, venv, tmp_path / "python-staging")
     assert result["status"] == "FAIL" and package in result["error"]
     assert imported == []  # Especially: no FlashQLA JIT fallback.
 
 
 @pytest.mark.parametrize("origin", [None, "/outside/prebuilt.so", "not_native.py"])
+@pytest.mark.parametrize("package", I.PREBUILTS)
 def test_missing_or_wrong_prebuilt_refuses_without_loading_it(
-    tmp_path, monkeypatch, origin
+    tmp_path, monkeypatch, origin, package
 ):
     wt, venv, origins, imported = fake_imports(tmp_path, monkeypatch)
-    origins[I.PREBUILT] = str(venv / origin) if origin is not None else None
-    result = I.check(wt, venv)
-    assert result["status"] == "FAIL" and I.PREBUILT not in imported
+    origins[package] = str(venv / origin) if origin is not None else None
+    result = I.check(wt, venv, tmp_path / "python-staging")
+    assert result["status"] == "FAIL" and package not in imported
+
+
+@pytest.mark.parametrize("extra", ["flash_qla", ".hidden", "__pycache__"])
+def test_extra_staging_entry_refused_before_import(tmp_path, monkeypatch, extra):
+    wt, venv, _, imported = fake_imports(tmp_path, monkeypatch)
+    stage = tmp_path / "python-staging"
+    (stage / extra).mkdir()
+    result = I.check(wt, venv, stage)
+    assert result["status"] == "FAIL" and "staging contents" in result["error"]
+    assert imported == []
+
+
+@pytest.mark.parametrize("replacement", ["missing", "directory", "wrong-target"])
+def test_staging_vllm_must_point_to_worktree(tmp_path, monkeypatch, replacement):
+    wt, venv, _, imported = fake_imports(tmp_path, monkeypatch)
+    stage = tmp_path / "python-staging"
+    link = stage / "vllm"
+    link.unlink()
+    if replacement == "directory":
+        link.mkdir()
+    elif replacement == "wrong-target":
+        link.symlink_to(venv, target_is_directory=True)
+    result = I.check(wt, venv, stage)
+    assert result["status"] == "FAIL" and "staging" in result["error"]
+    assert imported == []
+
+
+def test_whole_worktree_pythonpath_rejected_in_real_child(tmp_path):
+    # Run the actual checker with the OLD launch environment; do not mock
+    # find_spec/import_module. Rejection must happen before any package import.
+    wt = BENCH.parent
+    stage = W.make_staging(NS(out=tmp_path, worktree=wt))
+    report = tmp_path / "old-path.json"
+    env = dict(
+        os.environ,
+        CUDA_VISIBLE_DEVICES="",
+        PYTHONPATH=str(wt),
+        PYTHONNOUSERSITE="1",
+        PYTHONSAFEPATH="1",
+    )
+    env.pop("PYTHONHOME", None)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-P",
+            str(BENCH / "host_parking_import_check.py"),
+            "--worktree",
+            str(wt),
+            "--venv",
+            sys.prefix,
+            "--staging",
+            str(stage),
+            "--out",
+            str(report),
+        ],
+        cwd=stage,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    data = json.loads(report.read_text())
+    assert data["status"] == "FAIL" and data["error"].startswith("RuntimeError(")
+    assert "flash_qla" in data["error"] and "outside" in data["error"]
+    assert data["staging_contents"] == ["vllm"]
+    assert Path(data["packages"]["flash_qla"]["spec_origin"]).is_relative_to(wt)
+    assert not any("__file__" in p for p in data["packages"].values())
 
 
 def test_symlink_escape_is_rejected(tmp_path):
@@ -224,9 +297,54 @@ def test_preflight_uses_cpu_staging_and_serving_interpreter(tmp_path, monkeypatc
     (cmd, env, logfile, seconds), kwargs = calls[0]
     assert cmd[:2] == [str(a.python), "-P"]
     assert cmd[cmd.index("--venv") + 1] == "/venv"
+    assert cmd[cmd.index("--staging") + 1] == str(a.staging)
     assert env["CUDA_VISIBLE_DEVICES"] == "" and env["PYTHONPATH"] == str(a.staging)
     assert kwargs["cwd"] == a.staging and seconds == 120
     assert logfile == tmp_path / "off1.imports.log"
+
+
+@pytest.mark.parametrize(
+    "failure", ["correct", "unexpected-pass", "wrong-error", "already-imported"]
+)
+def test_preflight_negative_control_requires_precise_failure(
+    tmp_path, monkeypatch, failure
+):
+    a = NS(
+        out=tmp_path,
+        worktree=tmp_path / "wt",
+        python=Path("/venv/bin/python"),
+        staging=tmp_path / "stage",
+    )
+    calls = []
+    report = {
+        "status": "FAIL",
+        "error_type": "RuntimeError",
+        "error": "RuntimeError('flash_qla origin is outside venv')",
+        "packages": {},
+    }
+    if failure == "unexpected-pass":
+        report["status"] = "PASS"
+    elif failure == "wrong-error":
+        report["error"] = "RuntimeError('staging contents wrong')"
+    elif failure == "already-imported":
+        report["packages"] = {"flash_qla": {"__file__": "bad.py"}}
+
+    def command(cmd, env, path, seconds, **kw):
+        calls.append((env, kw))
+        if kw.get("expected_rc") == 1:
+            Path(cmd[-1]).write_text(json.dumps(report))
+
+    monkeypatch.setattr(W, "timed_command", command)
+    if failure == "correct":
+        W.import_preflight(a, "raw", negative_control=True)
+    else:
+        with pytest.raises(RuntimeError, match="old PYTHONPATH"):
+            W.import_preflight(a, "raw", negative_control=True)
+    assert len(calls) == 2
+    assert calls[0][0]["PYTHONPATH"] == str(a.staging)
+    assert calls[1][0]["PYTHONPATH"] == str(a.worktree)
+    assert calls[1][0]["CUDA_VISIBLE_DEVICES"] == ""
+    assert calls[1][1] == {"cwd": a.staging, "expected_rc": 1}
 
 
 def test_server_never_starts_after_failed_preflight(tmp_path, monkeypatch):
@@ -251,8 +369,9 @@ def test_raw_probe_never_starts_after_failed_preflight(tmp_path, monkeypatch):
     (a.worktree / "vllm").mkdir(parents=True)
     monkeypatch.setattr(W.subprocess, "check_output", lambda *a, **kw: "tip")
 
-    def refuse(args, label):
+    def refuse(args, label, *, negative_control):
         assert label == "raw"
+        assert negative_control is True
         assert list(args.staging.iterdir()) == [args.staging / "vllm"]
         raise RuntimeError("bad package origin")
 
