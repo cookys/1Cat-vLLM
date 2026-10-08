@@ -170,6 +170,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             < self.scheduler_config.mixed_prefill_max_tokens
             else None
         )
+        from vllm.v1.worker.cadence_step_timer import CadenceStepTimer
+
+        self.cadence_step_timer = (
+            CadenceStepTimer(self.parallel_config.rank)
+            if device.type == "cuda" and self.scheduler_config.prefill_cadence_step_log
+            else None
+        )
         self.dtype = self.model_config.dtype
         self.kv_cache_dtype = self.dtype
         if self.cache_config.cache_dtype != "auto":
@@ -1487,6 +1494,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
+            if getattr(self, "cadence_step_timer", None) is not None:
+                self.cadence_step_timer.begin(scheduler_output)
             if self.mixed_prefill_timer is not None:
                 self.mixed_prefill_timer.begin(scheduler_output)
             # Update the request states.
@@ -1531,6 +1540,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # All DP ranks have zero tokens to run.
             empty_output = self.kv_connector.no_forward(scheduler_output)
             return empty_output
+
+        if not dummy_run and getattr(self, "cadence_step_timer", None) is not None:
+            self.cadence_step_timer.route(str(batch_desc.cg_mode), batch_desc.num_tokens)
 
         cudagraph_stats = None
         if (
@@ -1986,6 +1998,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         model_runner_output.kv_connector_output = kv_connector_output
         if self.mixed_prefill_timer is not None:
             model_runner_output.mixed_prefill_timing = self.mixed_prefill_timer.finish()
+        if getattr(self, "cadence_step_timer", None) is not None:
+            self.cadence_step_timer.finish()
 
         self._sm70_v2_mtp_profile_finish(
             mtp_profile_ctx,

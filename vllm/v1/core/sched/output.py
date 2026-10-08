@@ -222,6 +222,10 @@ class SchedulerOutput:
     mixed_decode_tokens: int = 0
     mixed_prefill_budget: int = 0
 
+    # Diagnostic only; absent on the default path. Request IDs stay on the
+    # scheduler for completion accounting and are never printed by the timer.
+    cadence_step: dict | None = None
+
     # Request IDs that are preempted in this step.
     # Only used for v2 model runner.
     preempted_req_ids: set[str] | None = None

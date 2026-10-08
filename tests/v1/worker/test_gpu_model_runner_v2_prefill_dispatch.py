@@ -28,6 +28,8 @@ def test_prefill_cannot_replay_decode_graph(query_len, phase):
     elif phase in ("tail", "mixed"):
         computed[1] = 800
     runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.mixed_prefill_timer = None
+    runner.cadence_step_timer = None
     runner.req_states = SimpleNamespace(
         req_id_to_index={"unused": 0, "a": 1, "b": 2},
         num_computed_prefill_tokens=np.array(computed),
@@ -54,6 +56,8 @@ def test_prefill_cannot_replay_decode_graph(query_len, phase):
 
 def test_dummy_and_nonuniform_batches_do_not_read_live_state():
     runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.mixed_prefill_timer = None
+    runner.cadence_step_timer = None
     schedule = SimpleNamespace(
         num_scheduled_tokens={"dummy": 4}, total_num_scheduled_tokens=4
     )
@@ -74,6 +78,8 @@ def test_draft_phase_aware_predicate(has_prefill):
 
 def test_execute_rejects_prefill_before_dp_graph_dispatch(monkeypatch):
     runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.mixed_prefill_timer = None
+    runner.cadence_step_timer = None
     runner.req_states = SimpleNamespace(
         req_id_to_index={"tail": 0},
         num_computed_prefill_tokens=np.array([800]),

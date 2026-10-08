@@ -99,6 +99,18 @@ class SchedulerConfig:
     fewer rows. With latency target > 0, min=max selects a static cap without
     GPU timing events; latency target 0 always disables the entire controller."""
 
+    prefill_cadence_decode_steps: int = Field(default=0, ge=0, le=64)
+    """Insert this many nonempty decode-only scheduler batches after a prefill
+    batch while eligible resident decoders exist. Zero preserves scheduling.
+    This delays all prefill (including short tails) without changing chunk
+    size or Mamba alignment. Mutually exclusive with mixed-prefill control."""
+
+    prefill_cadence_step_log: bool = False
+    """Opt-in V2 per-step CUDA-event timing and scheduler completion counts.
+    Independent of cadence, so OFF and ON can use the same measurement path.
+    Events are queried later, never synchronized; final pending samples require
+    drain requests. Emits no prompt text or request IDs."""
+
     enable_chunked_prefill: bool = True
     """If True, prefill requests can be chunked based
     on the remaining `max_num_batched_tokens`.
@@ -244,6 +256,15 @@ class SchedulerConfig:
         return None if value is None else handler(value)
 
     def __post_init__(self, max_model_len: int, is_encoder_decoder: bool) -> None:
+        if self.prefill_cadence_decode_steps:
+            if self.mixed_prefill_step_latency_ms > 0:
+                raise ValueError(
+                    "prefill cadence and mixed-prefill control are mutually exclusive"
+                )
+            if not self.enable_chunked_prefill or is_encoder_decoder:
+                raise ValueError(
+                    "prefill cadence requires chunked decoder-only prefill"
+                )
         if (
             self.mixed_prefill_step_latency_ms > 0
             and self.mixed_prefill_min_tokens

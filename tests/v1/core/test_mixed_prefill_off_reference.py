@@ -55,6 +55,7 @@ def replay(make_scheduler, async_scheduling, spec, blocks, target=0):
             "mixed_prefill_tokens",
             "mixed_decode_tokens",
             "mixed_prefill_budget",
+            "cadence_step",  # New diagnostic field is None by default.
         ):
             output.pop(name, None)
         for new in output["scheduled_new_reqs"]:

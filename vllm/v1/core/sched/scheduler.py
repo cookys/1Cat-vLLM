@@ -45,6 +45,7 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
+from vllm.v1.core.sched.prefill_cadence import PrefillCadence
 from vllm.v1.core.sched.request_queue import (
     RequestQueue,
     SchedulingPolicy,
@@ -129,6 +130,17 @@ class Scheduler(SchedulerInterface):
             self.scheduler_config.mixed_prefill_min_tokens,
         )
         self.mixed_prefill_enabled = current_platform.device_type == "cuda"
+        self.prefill_cadence = PrefillCadence(
+            self.scheduler_config.prefill_cadence_decode_steps
+        )
+        if self.prefill_cadence.enabled and (
+            self.parallel_config.pipeline_parallel_size != 1
+            or self.parallel_config.data_parallel_size != 1
+            or self.scheduler_config.disable_chunked_mm_input
+        ):
+            raise ValueError(
+                "prefill cadence prototype requires PP=DP=1 and text chunks"
+            )
         self._mixed_prefill_logged = False
         self._mixed_prefill_steps_since_stats = 0
         self._mixed_prefill_tokens_since_stats = 0
@@ -290,6 +302,15 @@ class Scheduler(SchedulerInterface):
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
+        if (
+            self.scheduler_config.prefill_cadence_step_log
+            and not self.use_v2_model_runner
+        ):
+            raise ValueError("prefill cadence step timing requires the V2 model runner")
+        if self.prefill_cadence.enabled and self.dflash_ddtree_tree_verify:
+            raise ValueError(
+                "prefill cadence prototype does not support tree verification"
+            )
         self.current_step = 0
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
@@ -575,6 +596,23 @@ class Scheduler(SchedulerInterface):
             prefill_remaining, resident_tokens = self._mixed_prefill_residents()
             control_mixed_prefill = bool(resident_tokens)
 
+        cadence_remaining: dict[str, int] = {}
+        cadence_residents: dict[str, int] = {}
+        cadence_observe = (
+            self.prefill_cadence.enabled
+            or self.scheduler_config.prefill_cadence_step_log
+        )
+        if cadence_observe:
+            cadence_remaining, cadence_residents = self._mixed_prefill_residents()
+        hold_prefill = self.prefill_cadence.hold(bool(cadence_residents))
+        pending_prefills = (
+            sum(n > 0 for n in cadence_remaining.values())
+            + len(self.waiting)
+            + len(self.skipped_waiting)
+            if cadence_observe
+            else 0
+        )
+
         def limit_prefill(req_id: str, tokens: int) -> int:
             if (
                 not control_mixed_prefill
@@ -616,6 +654,9 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+            if hold_prefill and cadence_remaining.get(request.request_id, 0) > 0:
+                req_index += 1
+                continue
 
             if self.current_step < request.next_decode_eligible_step:
                 req_index += 1
@@ -926,7 +967,11 @@ class Scheduler(SchedulerInterface):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         # Next, schedule the WAITING requests.
-        if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
+        if (
+            not preempted_reqs
+            and self._pause_state == PauseState.UNPAUSED
+            and not hold_prefill
+        ):
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
@@ -1021,6 +1066,13 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
+
+                if cadence_observe:
+                    cadence_remaining[request_id] = max(
+                        0,
+                        max(request.num_prompt_tokens, request.num_tokens - 1)
+                        - num_computed_tokens,
+                    )
 
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
@@ -1340,6 +1392,31 @@ class Scheduler(SchedulerInterface):
                 scheduler_output.mixed_decode_tokens,
             )
             self._mixed_prefill_logged = True
+
+        if cadence_observe:
+            prefill_rows = sum(
+                min(n, cadence_remaining.get(rid, 0))
+                for rid, n in num_scheduled_tokens.items()
+            )
+            decode_ids = tuple(
+                rid
+                for rid in num_scheduled_tokens
+                if cadence_remaining.get(rid, 0) == 0
+            )
+            decode_rows = sum(num_scheduled_tokens[rid] for rid in decode_ids)
+            self.prefill_cadence.scheduled(prefill_rows, decode_rows)
+            if self.scheduler_config.prefill_cadence_step_log:
+                scheduler_output.cadence_step = dict(
+                    step_id=self.current_step,
+                    prefill_rows=prefill_rows,
+                    decode_rows=decode_rows,
+                    decode_reqs=len(decode_ids),
+                    prefill_reqs=len(num_scheduled_tokens) - len(decode_ids),
+                    hold_prefill=hold_prefill,
+                    pending_prefill_reqs=pending_prefills,
+                    remaining=self.prefill_cadence.remaining,
+                    decode_req_ids=decode_ids,
+                )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -1986,6 +2063,30 @@ class Scheduler(SchedulerInterface):
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
+
+        if (
+            scheduler_output.cadence_step is not None
+            and scheduler_output.total_num_scheduled_tokens > 0
+        ):
+            meta = scheduler_output.cadence_step
+            decode_ids = set(meta["decode_req_ids"])
+            # Count actual committed outputs after stop/abort/rejection handling,
+            # not raw sampled rows that may have been discarded.
+            accepted = sum(
+                len(out.new_token_ids)
+                for batch in outputs.values()
+                for out in batch
+                if out.request_id in decode_ids
+            )
+            logger.info(
+                "PREFILL_CADENCE_COMPLETE step_id=%d decode_accepted_tokens=%d "
+                "decode_reqs=%d prefill_rows=%d decode_rows=%d",
+                meta["step_id"],
+                accepted,
+                meta["decode_reqs"],
+                meta["prefill_rows"],
+                meta["decode_rows"],
+            )
 
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:

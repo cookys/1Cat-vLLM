@@ -559,6 +559,8 @@ class EngineArgs:
     mixed_prefill_step_latency_ms: float = SchedulerConfig.mixed_prefill_step_latency_ms
     mixed_prefill_max_tokens: int = SchedulerConfig.mixed_prefill_max_tokens
     mixed_prefill_min_tokens: int = SchedulerConfig.mixed_prefill_min_tokens
+    prefill_cadence_decode_steps: int = SchedulerConfig.prefill_cadence_decode_steps
+    prefill_cadence_step_log: bool = SchedulerConfig.prefill_cadence_step_log
     max_num_seqs: int | None = None
     max_logprobs: int = ModelConfig.max_logprobs
     logprobs_mode: LogprobsMode = ModelConfig.logprobs_mode
@@ -1442,6 +1444,13 @@ class EngineArgs:
             "--mixed-prefill-min-tokens",
             **scheduler_kwargs["mixed_prefill_min_tokens"],
         )
+        scheduler_group.add_argument(
+            "--prefill-cadence-decode-steps",
+            **scheduler_kwargs["prefill_cadence_decode_steps"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-cadence-step-log", **scheduler_kwargs["prefill_cadence_step_log"]
+        )
         # multi-step scheduling has been removed; corresponding arguments
         # are no longer supported.
         scheduler_group.add_argument(
@@ -2303,6 +2312,8 @@ class EngineArgs:
             mixed_prefill_step_latency_ms=self.mixed_prefill_step_latency_ms,
             mixed_prefill_max_tokens=self.mixed_prefill_max_tokens,
             mixed_prefill_min_tokens=self.mixed_prefill_min_tokens,
+            prefill_cadence_decode_steps=self.prefill_cadence_decode_steps,
+            prefill_cadence_step_log=self.prefill_cadence_step_log,
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
