@@ -59,6 +59,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+from vllm.v1.attention.backends import sm70_grouped_diagnostics as _grouped_diag
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
@@ -1721,10 +1722,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             batch_desc = self.cudagraph_manager.select_attention_graph(
                 batch_desc, input_batch.seq_lens_cpu_upper_bound
             )
+            _grouped_diag.dispatch(
+                logger,
+                batch_desc,
+                input_batch,
+                dummy_run=dummy_run,
+                is_profile=is_profile,
+            )
             self.kv_connector.pre_forward(scheduler_output)
             model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
             # For piecewise and eager mode, just call model().
+            _grouped_diag.dispatch(
+                logger,
+                batch_desc,
+                input_batch,
+                dummy_run=dummy_run,
+                is_profile=is_profile,
+            )
             batch_descriptor = BatchDescriptor(
                 num_tokens=input_batch.num_tokens_after_padding,
                 has_lora=self.lora_config is not None,

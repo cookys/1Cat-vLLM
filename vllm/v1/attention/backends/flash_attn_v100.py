@@ -24,6 +24,7 @@ from typing import cast
 import torch
 
 import vllm.envs as envs
+import vllm.v1.attention.backends.sm70_grouped_diagnostics as _grouped_diag
 import vllm.v1.attention.backends.sm70_kv_dump as _kv_dump
 from vllm.config.speculative import get_dflash_model_draft_tokens
 from vllm.forward_context import CUDAGRAPH_VARIANT_LONG_CONTEXT
@@ -5958,6 +5959,20 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         # The persistent smallq path already consumes the GPU metadata; the
         # eager fallback must use it as well when constructing per-row lengths.
         seq_lens = attn_metadata.seq_lens
+        if _grouped_diag.enabled():
+            _grouped_diag.backend(
+                logger,
+                "nvfp4_entry",
+                attn_metadata,
+                query,
+                capture=_is_cuda_graph_capturing(query),
+                kv_dtype=self.kv_cache_dtype,
+                reasons=(
+                    ["max_query_len_gt_16_skip_whole_gate"]
+                    if attn_metadata.max_query_len > 16
+                    else []
+                ),
+            )
         if attn_metadata.max_query_len <= 16 and self.use_dflash2_grouped_verify:
             num_query_tokens = min(
                 int(attn_metadata.num_actual_tokens),
@@ -6476,6 +6491,23 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and seq_lens.dtype == torch.int32
             and seq_lens.is_contiguous()
         )
+        if _grouped_diag.enabled():
+            _grouped_diag.gate(
+                logger,
+                self,
+                attn_metadata,
+                query,
+                key_cache,
+                value_cache,
+                num_query_tokens=num_query_tokens,
+                allowed=allowed,
+                single_request_shape=single_request_shape,
+                batched_request_shape=batched_request_shape,
+                num_reqs=num_reqs,
+                any_batch=envs.VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY_ANY_BATCH,
+                nvfp4_available=(is_nvfp4_kv and _grouped_verify_nvfp4_available()),
+                capture=_is_cuda_graph_capturing(query),
+            )
         if (
             self.use_dflash2_grouped_verify
             and not allowed
@@ -6613,6 +6645,20 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         ]
         if not grouped:
             return rows
+        if _grouped_diag.enabled():
+            _grouped_diag.backend(
+                logger,
+                "per_request_mixed",
+                attn_metadata,
+                query,
+                capture=_is_cuda_graph_capturing(query),
+                kv_dtype=self.kv_cache_dtype,
+                reasons=["mixed_q8_rows"],
+                selected_requests=len(grouped),
+                parent_query_lens=tuple(
+                    qsl[i + 1] - qsl[i] for i in range(len(qsl) - 1)
+                ),
+            )
         self._log_grouped_per_request_fallback(len(grouped), query)
         _record_route("dflash2_mixed_grouped_per_request")
         for i in grouped:
@@ -6680,6 +6726,17 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 i,
             ):
                 return False
+        if _grouped_diag.enabled():
+            _grouped_diag.backend(
+                logger,
+                "per_request_uniform",
+                attn_metadata,
+                query,
+                capture=_is_cuda_graph_capturing(query),
+                kv_dtype=self.kv_cache_dtype,
+                reasons=["whole_batch_gate_rejected"],
+                selected_requests=num_reqs,
+            )
         self._log_grouped_per_request_fallback(num_reqs, query, padded)
         _record_route("dflash2_verify_grouped_per_request")
         for i in range(num_reqs):
@@ -6704,6 +6761,16 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         *,
         out: torch.Tensor,
     ) -> None:
+        if _grouped_diag.enabled():
+            _grouped_diag.backend(
+                logger,
+                "native_grouped_call",
+                attn_metadata,
+                query,
+                capture=_is_cuda_graph_capturing(query),
+                kv_dtype=self.kv_cache_dtype,
+                reasons=["admitted"],
+            )
         global _logged_prefill_smallq_grouped_verify
         num_reqs = int(attn_metadata.block_table.shape[0])
         if (
@@ -8630,6 +8697,16 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         ):
             return output
 
+        if _grouped_diag.enabled():
+            _grouped_diag.backend(
+                logger,
+                "smallq_per_row",
+                attn_metadata,
+                query,
+                capture=_is_cuda_graph_capturing(query),
+                kv_dtype=self.kv_cache_dtype,
+                reasons=["whole_and_per_request_grouped_not_taken"],
+            )
         persistent_decode_block_table = getattr(
             attn_metadata,
             "smallq_decode_block_table",
