@@ -1,8 +1,10 @@
-# Prefill FA negative-screen prototypes (2026-10-08)
+# Prefill FA prototypes and five-arm GPU study (2026-10-08)
 
-**Stopped at the CPU resource gate. Neither candidate is approved for a GPU
-window or serving use.** These are isolated translation units, not a production
-dispatch change. No installed library or serving Python file is modified.
+**Owner reopened the experiment for direct GPU measurements, including spilled
+and free-register arms** (`01M4D7EEXZRCF7VF98FKBTT0BB`). The initial resource veto
+below is preserved as history, and is no longer an admission gate. GPU execution
+is only by lead in an allocated window. There is no serving adoption.
+These are isolated translation units, not a production dispatch change.
 
 The experiment started from `de01359b8033144458ac7a495d73b592a1c5f6a0`.
 `generate.py` pins the complete SHA256 of
@@ -12,7 +14,7 @@ body apart from the namespace and kernel symbol. A standalone P0 still needs
 GPU byte comparisons against the installed entry point before any future use
 as a numerical reference.
 
-## Decision and evidence
+## Original resource decision and evidence (superseded for GPU admission)
 
 Fixed resource gate: sm_70, 512 threads, at most 64 registers, at most 48 KiB
 shared storage, **zero spill stores/loads and zero SASS LDL/STL**. The gate also
@@ -45,9 +47,8 @@ existing initial block barrier. P1-r2 instead contains a spill at SASS PC 0x1c10
 and reload at 0x50c0 (`build-r2/proto1.sass:919,2605`): the spill remains 4 bytes.
 This is a compiler resource observation, not measured latency or spill traffic.
 
-The current generator emits P1-r2. The rejected first-pass source and hashes
-remain in the first artifact directory. No third allocation attempt, altered
-launch bound, GPU script, GPU timing, or serving overlay is part of this result.
+The generator retains P1-r2. The first-pass source and hashes remain in the
+first artifact directory. That initial result had no GPU timing or overlay.
 
 ## Intended changes, not established GPU correctness
 
@@ -69,7 +70,44 @@ and LSE, and two resident CTAs/SM. Neither speedup nor E1 has been demonstrated.
 The rejection applies to these candidates under these resource constraints,
 not every possible FA rewrite.
 
-## CPU reproduction
+## Five-arm GPU study
+
+The current generator also emits P1-free and P2-free. These differ only by
+kernel symbols and removal of `minBlocksPerSM=2` from `__launch_bounds__(512,2)`;
+the free arms retain `__launch_bounds__(512)`. No maxrregcount flag is used.
+Actual CPU results in `/data/bench/astra-fa-proto/gpu-study-build/manifest.json`:
+
+| Arm | Registers | Shared bytes | Spill store/load bytes | Resource CTA/SM bound |
+|---|---:|---:|---:|---:|
+| P0 | 64 | 41,936 | 0 / 0 | 2 |
+| P1-r2 | 64 | 44,000 | 4 / 4 | 2 |
+| P2 | 64 | 41,936 | 8 / 8 | 2 |
+| P1-free | 68 | 44,000 | 0 / 0 | 1 |
+| P2-free | 64 | 41,936 | 8 / 8 | 2 |
+
+The compiler is free to retain spilling: P2-free did so. Runtime resource
+attributes and occupancy API results will be recorded separately. Neither
+spill count nor CTA count blocks this GPU study.
+
+`probe.py` uses a pointer-only ctypes ABI, without JIT or venv changes. It checks
+all source/library/report hashes before loading, compares P0 against the pinned
+installed fixed entry, then compares every arm's output and LSE bytes with P0.
+Differences retain max absolute/relative errors and relative L2; they do not
+stop timing. Nonfinite results are invalid. CUDA API errors terminate execution
+and save partial results, without continuing through a damaged context.
+
+For each candidate and M96/M4032, N200704, one process performs six ABBA blocks,
+eight CUDA-event samples per phase, after five warmups per arm. Full samples,
+paired ratios, A/A drift and fixed-seed bootstrap bounds are saved. Candidates
+need X126 ratio <=0.90 and M96 <=1.00, including one-sided 95% bootstrap upper
+bounds; bit differences are E2_PENDING (quality review, not distribution
+equivalence). Additional shuffled-page and M/N tail cases check output/LSE.
+The GPU preregistration is assessment section 9 in llm-playground.
+CPU verification: 28 tests passed, real five-arm describe/hash checks passed,
+and the installed baseline SHA was checked read-only. Log:
+`/data/bench/astra-fa-proto/gpu-study-cpu-tests.log`.
+
+## CPU reproduction / preflight
 
 Use a fresh artifact directory so previous reports are not overwritten. Run on
 the build host through its CPU/memory fence; these commands hide all GPUs:
@@ -85,7 +123,26 @@ CUDA_VISIBLE_DEVICES= TRITON_INTERPRET=1 FA_BUILD=/data/bench/astra-fa-proto/reb
   --name astra-fa-rebuild -- benchmarks/fa_prefill_proto/build.sh
 ```
 
-Compilation success is not gate success: inspect `manifest.json`. The test file
+`probe.py --build <dir> --describe --check-space` verifies all five artifacts
+without importing torch or loading CUDA libraries. The test file
 uses only the Python standard library, imports no torch, and never loads a CUDA
 library. It tests pinned extraction, layout ownership, K order, and fail-closed
-resource screening; it makes no claim about GPU outputs.
+resource screening and report statistics; it makes no claim about GPU outputs.
+
+## Lead-only GPU execution
+
+After reserving GPU 0 and arranging the server window:
+
+```sh
+FA_RUN_GPU=1 FA_GPU=0 \
+FA_BUILD=/data/bench/astra-fa-proto/gpu-study-build \
+FA_OUT=/data/bench/astra-fa-proto-gpu-window1 \
+  benchmarks/fa_prefill_proto/profile.sh
+```
+
+The script applies the 24 GiB/8 CPU fence itself, uses TMPDIR=/data/tmp, requires
+a fresh output directory and at least 4 GiB disk headroom, and touches no server
+or clock settings. No counter permission or sudo is needed. Estimated window:
+5–8 minutes, longer if a candidate is much slower. Outputs are `results.json`,
+`results.md`, `preflight.json`, and `probe.log`. Do not claim GPU validation from
+the CPU results; no GPU work has yet run for these prototypes.

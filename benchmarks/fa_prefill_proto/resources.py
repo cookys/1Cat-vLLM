@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU resource gate; no driver calls. Missing evidence fails closed."""
+"""CPU resources; the old zero-spill gate is informational for the GPU study."""
 
 import argparse
 import hashlib
 import json
 import re
 from pathlib import Path
+
+ARMS = ("0", "1", "2", "1_free", "2_free")
 
 
 def digest(p):
@@ -46,16 +48,19 @@ def main():
     p.add_argument("build_dir", type=Path)
     args = p.parse_args()
     cases = {}
-    for variant in range(3):
+    for variant in ARMS:
         paths = {ext: args.build_dir / f"proto{variant}.{ext}" for ext in
                  ("cu", "so", "resources.txt", "build.log", "sass")}
         item = parse(paths["resources.txt"].read_text(),
                      paths["build.log"].read_text(), paths["sass"].read_text())
         item["files_sha256"] = {ext: digest(path) for ext, path in paths.items()}
         item["library"] = str(paths["so"].resolve())
-        item["status"] = "GPU_GATE_PENDING" if item["gate_pass"] else "RESOURCE_VETO"
+        item["status"] = "GPU_MEASUREMENT_PENDING"
         cases[str(variant)] = item
-    print(json.dumps({"cpu_only": True, "variants": cases}, indent=2))
+    print(json.dumps({"schema_version": 2, "cpu_only": True,
+                      "resource_gate_is_admission": False,
+                      "authorization": "01M4D7EEXZRCF7VF98FKBTT0BB",
+                      "variants": cases}, indent=2))
 
 
 if __name__ == "__main__":

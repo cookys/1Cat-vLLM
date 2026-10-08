@@ -106,7 +106,7 @@ def core(source, variant):
     return body.replace(KERNEL, f"astra_fa_proto{variant}_kernel")
 
 
-def generate(source, variant):
+def generate(source, variant, free_registers=False):
     header = """// Generated from pinned 1Cat source; see generate.py and manifest.json.
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -118,8 +118,19 @@ using namespace nvcuda::wmma;
 #define WMMA_K 16
 """
     body = core(source, variant)
-    wrapper = (HERE / "wrapper.cuh").read_text().replace("PROTO", str(variant))
-    return header + f"namespace astra{variant} {{\n" + body + "\n}\n" + wrapper
+    label = str(variant)
+    if free_registers:
+        if variant not in (1, 2):
+            raise ValueError("only P1/P2 have free-register arms")
+        body = replace_once(
+            body, "__launch_bounds__(D256_BM32_PHASE_THREADS, 2)",
+            "__launch_bounds__(D256_BM32_PHASE_THREADS)"
+        )
+        label += "_free"
+        body = body.replace(f"astra_fa_proto{variant}_kernel",
+                            f"astra_fa_proto{label}_kernel")
+    wrapper = (HERE / "wrapper.cuh").read_text().replace("PROTO", label)
+    return header + f"namespace astra{label} {{\n" + body + "\n}\n" + wrapper
 
 
 def main():
@@ -135,6 +146,10 @@ def main():
     source = args.source.read_text()
     for variant in range(3):
         (args.out / f"proto{variant}.cu").write_text(generate(source, variant))
+    for variant in (1, 2):
+        (args.out / f"proto{variant}_free.cu").write_text(
+            generate(source, variant, free_registers=True)
+        )
 
 
 if __name__ == "__main__":
