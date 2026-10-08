@@ -236,6 +236,24 @@ class StudyTest(unittest.TestCase):
         self.assertEqual(study.classify(stats, True, True, True), "INCONCLUSIVE")
         stats["96"]["paired_ratio_median"] = 1.01
         self.assertEqual(study.classify(stats, True, True, True), "SPEED_FAIL")
+        # Fable amendment: point must not regress, but its upper bound has
+        # 3% tolerance for M96 only. Test inclusive and just-outside boundaries.
+        cases = (
+            (1.0, 1.03, 0.9, 0.9, "E1_MICROBENCH_CANDIDATE"),
+            (1.0, 1.030001, 0.9, 0.9, "INCONCLUSIVE"),
+            (1.000001, 1.02, 0.9, 0.9, "SPEED_FAIL"),
+            (1.0, 1.03, 0.9, 0.900001, "INCONCLUSIVE"),
+            (1.0, 1.03, 0.900001, 0.91, "SPEED_FAIL"),
+        )
+        for p96, u96, p126, u126, expected in cases:
+            with self.subTest(p96=p96, u96=u96, p126=p126, u126=u126):
+                stats = {
+                    "96": {"paired_ratio_median": p96,
+                           "bootstrap_upper95_one_sided": u96},
+                    "4032": {"paired_ratio_median": p126,
+                             "bootstrap_upper95_one_sided": u126},
+                }
+                self.assertEqual(study.classify(stats, True, True, True), expected)
 
     def test_json_and_md_preserve_failed_progress(self):
         data = {"status": "FAILED", "error": "fake failure", "timings": {}}

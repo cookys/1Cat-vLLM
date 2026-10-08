@@ -16,6 +16,8 @@ SAMPLES = 8
 WARMUP = 5
 BOOTSTRAPS = 10000
 BOOTSTRAP_SEED = 8417
+POINT_THRESHOLDS = {"96": 1.0, "4032": 0.9}
+UPPER95_THRESHOLDS = {"96": 1.03, "4032": 0.9}
 
 
 def percentile(values, fraction):
@@ -69,11 +71,11 @@ def classify(stats, bitwise, finite, baseline_match):
         return "INVALID_NONFINITE"
     if not baseline_match:
         return "BASELINE_MISMATCH_NO_PRODUCTION_INFERENCE"
-    thresholds = {"96": 1.0, "4032": 0.9}
-    if any(stats[m]["paired_ratio_median"] > cap for m, cap in thresholds.items()):
+    if any(stats[m]["paired_ratio_median"] > cap
+           for m, cap in POINT_THRESHOLDS.items()):
         return "SPEED_FAIL" if bitwise else "SPEED_FAIL_E2_PENDING"
     if any(stats[m]["bootstrap_upper95_one_sided"] > cap
-           for m, cap in thresholds.items()):
+           for m, cap in UPPER95_THRESHOLDS.items()):
         return "INCONCLUSIVE" if bitwise else "INCONCLUSIVE_E2_PENDING"
     return "E1_MICROBENCH_CANDIDATE" if bitwise else "E2_PENDING"
 
@@ -104,6 +106,11 @@ def markdown(result):
     lines = ["# Prefill FA five-arm GPU study", "",
              f"Status: **{result['status']}**. No profiler; CUDA-event samples.",
              "No serving adoption or distribution-equivalence claim.", "",
+             "Speed gates (point / one-sided 95% upper): "
+             f"M96 <= {POINT_THRESHOLDS['96']:.2f} / "
+             f"{UPPER95_THRESHOLDS['96']:.2f}; "
+             f"X126 <= {POINT_THRESHOLDS['4032']:.2f} / "
+             f"{UPPER95_THRESHOLDS['4032']:.2f}.", "",
              "| M | Arm | kernel median ms | paired P0 Δ% | ABBA ratio min–max "
              "| 95% upper | output/LSE bits | max abs O/LSE | REG | smem B "
              "| spill store/load B | CTA/SM (runtime) |",

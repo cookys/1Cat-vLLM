@@ -77,17 +77,22 @@ kernel symbols and removal of `minBlocksPerSM=2` from `__launch_bounds__(512,2)`
 the free arms retain `__launch_bounds__(512)`. No maxrregcount flag is used.
 Actual CPU results in `/data/bench/astra-fa-proto/gpu-study-build/manifest.json`:
 
-| Arm | Registers | Shared bytes | Spill store/load bytes | Resource CTA/SM bound |
-|---|---:|---:|---:|---:|
-| P0 | 64 | 41,936 | 0 / 0 | 2 |
-| P1-r2 | 64 | 44,000 | 4 / 4 | 2 |
-| P2 | 64 | 41,936 | 8 / 8 | 2 |
-| P1-free | 68 | 44,000 | 0 / 0 | 1 |
-| P2-free | 64 | 41,936 | 8 / 8 | 2 |
+| Arm | Registers | Shared bytes | Spill store/load bytes | CPU CTA/SM bound | Runtime CTA/SM |
+|---|---:|---:|---:|---:|---|
+| P0 | 64 | 41,936 | 0 / 0 | 2 | Pending |
+| P1-r2 | 64 | 44,000 | 4 / 4 | 2 | Pending |
+| P2 | 64 | 41,936 | 8 / 8 | 2 | Pending |
+| P1-free | 68 | 44,000 | 0 / 0 | 1 | Pending |
+| P2-free | 64 | 41,936 | 8 / 8 | 2 | Pending |
 
 The compiler is free to retain spilling: P2-free did so. Runtime resource
 attributes and occupancy API results will be recorded separately. Neither
 spill count nor CTA count blocks this GPU study.
+If CPU estimates differ from runtime occupancy API results, runtime takes
+precedence (still a residency limit, not measured achieved occupancy).
+Preregistered opposing hypothesis: with one resident CTA/SM, P1-free is expected
+to have ratio >1.00; X126 ratio <=0.90 would be an important contrary result.
+This is a hypothesis based on the resource change, not a measured prediction.
 
 `probe.py` uses a pointer-only ctypes ABI, without JIT or venv changes. It checks
 all source/library/report hashes before loading, compares P0 against the pinned
@@ -99,8 +104,10 @@ and save partial results, without continuing through a damaged context.
 For each candidate and M96/M4032, N200704, one process performs six ABBA blocks,
 eight CUDA-event samples per phase, after five warmups per arm. Full samples,
 paired ratios, A/A drift and fixed-seed bootstrap bounds are saved. Candidates
-need X126 ratio <=0.90 and M96 <=1.00, including one-sided 95% bootstrap upper
-bounds; bit differences are E2_PENDING (quality review, not distribution
+need X126 point ratio <=0.90 and one-sided 95% upper <=0.90. M96 requires
+point ratio <=1.00 and one-sided 95% upper <=1.03 (Fable's preregistration
+amendment `01M4D8SQSXXAWZ02QN08YBV6T5`); bit differences are E2_PENDING
+(quality review, not distribution
 equivalence). Additional shuffled-page and M/N tail cases check output/LSE.
 The GPU preregistration is assessment section 9 in llm-playground.
 CPU verification: 28 tests passed, real five-arm describe/hash checks passed,
