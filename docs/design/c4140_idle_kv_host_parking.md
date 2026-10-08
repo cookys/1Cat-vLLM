@@ -1,6 +1,7 @@
 # 27B NVFP4 + DFlash2 bounded host parking PoC
 
-Status: CPU implementation in progress; GPU preregistration, 2026-10-08.
+Status (2026-10-09): CPU PoC; lead reports m37 raw-byte PASS, serving gates
+INCONCLUSIVE after startup import failure. m37b rerun awaits review/window.
 Base: de01359b8 (P7 + prefix retention fix + P8 code, P8 default OFF).
 Owner authorization: fleet 01M4E13FYEVE19811XNEKNSETW;
 completed-boundary/recovery clarification: 01M4E1BXKF98QD6ERVWXP13AQG.
@@ -326,3 +327,54 @@ CPU reproduction log now includes shell-expanded complete command and venv:
 `/data/bench/astra-host-parking/test-review.sh`. Latest suite includes parking,
 window judge, native CPU/grouped managers, native connector scheduler and
 worker metadata. Do not substitute a different venv and compare test counts.
+
+## m37 startup recovery / m37b (2026-10-09)
+
+Lead reports G1 raw-byte PASS for m37; serving gates remain INCONCLUSIVE.
+`/data/bench/m37/off1.serve.log:335–353` shows the source-tree FlashQLA loader
+trying a JIT extension instead of the venv's bundled SM70 binary. The harness
+put the entire engine worktree in `PYTHONPATH`, exposing sibling packages as
+well as the intended `vllm` overlay. This is an import-path failure, not evidence
+about parking parity, throughput, or recovery.
+
+The new `benchmarks/host_parking_window.py` makes `<out>/python-staging/`
+containing **only** `vllm -> <worktree>/vllm`. Server, raw TP4 probe and import
+preflight use this staging path as both `PYTHONPATH` and working directory.
+`PYTHONSAFEPATH=1` and `PYTHONNOUSERSITE=1` exclude incidental cwd/script and
+user-package paths; inherited `PYTHONPATH`/`PYTHONHOME` are replaced/removed.
+The serving venv and engine computation/route code are unchanged.
+
+Before the raw probe and **each server start**, the serving Python runs
+`benchmarks/host_parking_import_check.py` with no visible GPUs. It checks all
+six top-level spec origins before importing anything: `vllm` must resolve to
+the patched package; `torch`, `numpy`, `triton`, `flash_qla`, and `flashinfer`
+must resolve inside the intended venv. Actual module `__file__` values are
+then printed/checked. The bundled FlashQLA SM70 native module is imported
+directly, without calling its JIT-capable `_load_ext`. Missing/wrong origins,
+wrong interpreter prefix, import errors or unexpected CUDA initialization
+refuse the window. Artifacts: `<label>.imports.{json,log}` and argv JSON.
+
+CPU evidence in `/data/bench/astra-host-parking/import-recovery/`:
+`smoke.imports.json` PASS with all six modules and the installed SM70 `.so`,
+`cuda_initialized=false`; `old-path-rejected.json` FAIL with the original
+whole-worktree path **before any package import**. This preflight validates
+import provenance and native loading, not a GPU execution or full startup.
+Full serving-venv CPU suite: **189 passed**, exact command and venv in
+`/data/bench/astra-host-parking/tests-import-recovery-final.log`; Ruff,
+`bash -n` and ShellCheck pass. Added cases reject shadowing, missing/wrong
+prebuilt modules, symlink escapes, server/raw launch after failed preflight,
+and overwriting existing outputs through either shell or direct entrypoint.
+
+The shell wrapper is now versioned as `benchmarks/host_parking_window.sh` and
+copied to `/data/bench/ab/m37-parking.sh`. `M37_OUT` defaults to
+`/data/bench/m37b`; explicit `--out PATH` or `--out=PATH` takes precedence.
+The shell and direct Python entrypoint refuse an existing output directory.
+A dry plan does not create it. Lead's rerun command, **after review/window**:
+
+```bash
+M37_GO=1 M37_OUT=/data/bench/m37b bash /data/bench/ab/m37-parking.sh --execute
+```
+
+No preregistered numerical thresholds, GPU blocks, test cases, copy behavior,
+or production flags change. The prior 90–150-minute estimate remains unmeasured;
+CPU preflight adds up to nine short imports, each capped at 120 seconds.

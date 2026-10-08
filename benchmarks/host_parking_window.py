@@ -57,6 +57,51 @@ def write(path, data):
     Path(path).write_text(json.dumps(data, indent=2, allow_nan=False) + "\n")
 
 
+def make_staging(args):
+    """Expose only the patched engine; leave other packages in the serving venv."""
+    stage = args.out / "python-staging"
+    stage.mkdir(exist_ok=False)
+    source = args.worktree.resolve() / "vllm"
+    if not source.is_dir():
+        raise RuntimeError(f"missing engine package {source}")
+    (stage / "vllm").symlink_to(source, target_is_directory=True)
+    return stage.resolve()
+
+
+def engine_env(args, fault=False):
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("VLLM_", "C4140_"))}
+    env.update(FLAGS)
+    if fault:
+        env["VLLM_HOST_PARKING_FAULT_INJECT"] = "1"
+    env.pop("TRITON_INTERPRET", None)
+    env.pop("PYTHONHOME", None)
+    # Do not inherit a developer's worktree, pytest deps or user site-packages.
+    env.update(
+        CUDA_VISIBLE_DEVICES="0,1,2,3",
+        PYTHONPATH=str(args.staging),
+        PYTHONNOUSERSITE="1",
+        PYTHONSAFEPATH="1",
+    )
+    return env
+
+
+def import_preflight(args, label):
+    env = engine_env(args)
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    cmd = [
+        str(args.python),
+        "-P",
+        str(args.worktree / "benchmarks/host_parking_import_check.py"),
+        "--worktree",
+        str(args.worktree),
+        "--venv",
+        str(args.python.parent.parent),
+        "--out",
+        str(args.out / (label + ".imports.json")),
+    ]
+    timed_command(cmd, env, args.out / (label + ".imports.log"), 120, cwd=args.staging)
+
+
 def percentile(xs, q):
     if not xs:
         return None
@@ -485,13 +530,8 @@ def server(args, arm, fault=None):
     with socket.socket() as sock:
         if sock.connect_ex(("127.0.0.1", args.port)) == 0:
             raise RuntimeError("dedicated test port is already occupied")
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("VLLM_", "C4140_"))}
-    env.update(FLAGS)
-    if fault:
-        env["VLLM_HOST_PARKING_FAULT_INJECT"] = "1"
-    env.pop("TRITON_INTERPRET", None)
-    env["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
-    env["PYTHONPATH"] = str(args.worktree)
+    import_preflight(args, arm)
+    env = engine_env(args, bool(fault))
     args.parking = arm.startswith("on") or bool(fault)
     cmd = command(args, arm, fault)
     write(
@@ -503,14 +543,20 @@ def server(args, arm, fault=None):
                 for k in set(FLAGS)
                 | ({"VLLM_HOST_PARKING_FAULT_INJECT"} if fault else set())
             },
-            "pythonpath": str(args.worktree),
+            "pythonpath": str(args.staging),
+            "cwd": str(args.staging),
             "gpu_blocks": args.gpu_blocks,
         },
     )
     logpath = args.out / (arm + ".serve.log")
     with logpath.open("w") as log:
         child = subprocess.Popen(
-            cmd, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+            cmd,
+            env=env,
+            cwd=args.staging,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
         try:
             end = time.monotonic() + 900
@@ -541,11 +587,24 @@ def server(args, arm, fault=None):
                     child.wait(timeout=30)
 
 
-def timed_command(cmd, env, path, seconds):
-    write(str(path) + ".argv.json", {"argv": cmd, "timeout_seconds": seconds})
+def timed_command(cmd, env, path, seconds, cwd=None):
+    write(
+        str(path) + ".argv.json",
+        {
+            "argv": cmd,
+            "timeout_seconds": seconds,
+            "cwd": None if cwd is None else str(cwd),
+            "pythonpath": env.get("PYTHONPATH"),
+        },
+    )
     with Path(path).open("w") as log:
         process = subprocess.Popen(
-            cmd, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+            cmd,
+            env=env,
+            cwd=cwd,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
         try:
             rc = process.wait(timeout=seconds)
@@ -613,6 +672,7 @@ def join_loads(rows, events):
 
 def run(args):
     args.out.mkdir(parents=True, exist_ok=False)
+    args.staging = make_staging(args)
     write(
         args.out / "prereg.json",
         {
@@ -631,13 +691,8 @@ def run(args):
             ).strip(),
         },
     )
-    env = os.environ.copy()
-    env.update(
-        CUDA_VISIBLE_DEVICES="0,1,2,3",
-        TMPDIR="/data/tmp",
-        PYTHONPATH=str(args.worktree),
-    )
-    env.pop("TRITON_INTERPRET", None)
+    import_preflight(args, "raw")
+    env = engine_env(args)
     with Monitor(args.out / "memory.jsonl") as monitor:
         raw = [
             str(args.python),
@@ -650,7 +705,7 @@ def run(args):
             "--output",
             str(args.out / "raw-rank{rank}.json"),
         ]
-        timed_command(raw, env, args.out / "raw.out", 600)
+        timed_command(raw, env, args.out / "raw.out", 600, cwd=args.staging)
         for arm in ORDER:
             if ram_safe(monitor.samples) is False:
                 raise RuntimeError("RAM/las stop threshold exceeded")
@@ -760,6 +815,10 @@ def main():
     )
     p.add_argument("--plan", type=Path, default=Path("/data/bench/m19/Ap_c10fit.json"))
     a = p.parse_args()
+    # Child processes run from staging, not the caller's (possibly engine) repo.
+    # Keep the venv interpreter path lexical: resolving its symlink loses venv.
+    for name in ("out", "python", "worktree", "repo", "plan"):
+        setattr(a, name, getattr(a, name).absolute())
     if a.port in (8001, 8021) or not 1024 <= a.port <= 65535:
         p.error("dedicated unprivileged test port required; 8001/8021 forbidden")
     if a.analyze:
@@ -783,6 +842,8 @@ def main():
         return
     if os.environ.get("M37_GO") != "1":
         p.error("lead window requires explicit M37_GO=1")
+    if a.out.exists() or a.out.is_symlink():
+        p.error(f"refuse to overwrite existing output {a.out}")
 
     def interrupted(signum, frame):
         raise TimeoutError(f"window interruption {signum}; cleaning owned children")
