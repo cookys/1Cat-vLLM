@@ -546,6 +546,7 @@ _logged_grouped_per_request_fallback_eager = False
 _logged_prefill_smallq_decode_xqa = False
 _logged_prefill_smallq_grouped_verify = False
 _logged_prefill_smallq_grouped_verify_gate = False
+_logged_grouped_verify_any_batches: set[tuple[int, bool]] = set()
 _logged_prefill_fa2_d256 = False
 _logged_prefill_dense_splitkv3 = False
 _logged_prefill_d256_gqa_architecture = False
@@ -5224,6 +5225,25 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             self.use_dflash2_grouped_verify
             and envs.VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY
         )
+        self.dflash2_grouped_verify_any_batch_max_reqs = 0
+        if (
+            self.use_dflash2_batched_grouped_verify
+            and envs.VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY_ANY_BATCH
+        ):
+            from vllm.config import get_current_vllm_config
+
+            config = get_current_vllm_config()
+            capture_sizes = getattr(
+                getattr(config, "compilation_config", None),
+                "cudagraph_capture_sizes",
+                None,
+            ) or []
+            # FULL graph buckets can exceed the live request limit. For this
+            # ABI only complete q8 groups are admissible; eager uses max_seqs.
+            self.dflash2_grouped_verify_any_batch_max_reqs = max(
+                int(config.scheduler_config.max_num_seqs),
+                max(capture_sizes, default=0) // _DFLASH2_VERIFY_WIDTH,
+            )
         self.dflash2_grouped_verify_min_model_len = (
             envs.VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN
         )
@@ -6394,7 +6414,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 num_reqs in (2, 4, 8)
                 or (
                     envs.VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY_ANY_BATCH
-                    and num_reqs >= 2
+                    and (
+                        2 <= num_reqs <= self.dflash2_grouped_verify_any_batch_max_reqs
+                    )
                 )
             )
             and max_query_len == 8
@@ -6684,6 +6706,23 @@ class FlashAttnV100Impl(TritonAttentionImpl):
     ) -> None:
         global _logged_prefill_smallq_grouped_verify
         num_reqs = int(attn_metadata.block_table.shape[0])
+        if (
+            num_reqs not in (1, 2, 4, 8)
+            and envs.VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY_ANY_BATCH
+        ):
+            capturing = _is_cuda_graph_capturing(query)
+            key = (num_reqs, capturing)
+            if key not in _logged_grouped_verify_any_batches:
+                logger.info(
+                    "FLASH_ATTN_V100 any-batch grouped verify: B=%d bucket=%d "
+                    "q=8 capture=%s configured_max=%d; B includes padding "
+                    "at graph capture, not replay live requests.",
+                    int(attn_metadata.num_reqs),
+                    num_reqs,
+                    capturing,
+                    self.dflash2_grouped_verify_any_batch_max_reqs,
+                )
+                _logged_grouped_verify_any_batches.add(key)
         if not _logged_prefill_smallq_grouped_verify:
             logger.info(
                 "FLASH_ATTN_V100 DFlash2 exact grouped verifier active "

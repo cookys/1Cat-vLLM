@@ -79,6 +79,7 @@ def _make_impl(monkeypatch, dtype: str):
         lambda: SimpleNamespace(
             cache_config=SimpleNamespace(block_size=PAGE),
             model_config=SimpleNamespace(max_model_len=MAX_MODEL_LEN),
+            scheduler_config=SimpleNamespace(max_num_seqs=16),
         ),
     )
     impl = f.FlashAttnV100Impl(

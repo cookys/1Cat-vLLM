@@ -32,6 +32,8 @@ def setup_case(monkeypatch, n, knob, *, padded=False):
     impl = _make_self(_impl_cls(), calls)
     impl.use_dflash2_batched_grouped_verify = True
     impl.dflash2_grouped_verify_request_major_abi_version = 1
+    impl.dflash2_grouped_verify_any_batch_max_reqs = 16
+    monkeypatch.setattr(mod, "_logged_grouped_verify_any_batches", set())
     seqs = [40000 + i for i in range(n)]
     if padded:
         seqs[10:] = [0] * (n - 10)
@@ -117,3 +119,30 @@ def test_real_env_registration(monkeypatch):
     assert getattr(envs, ANY) is False
     monkeypatch.setenv(ANY, "1")
     assert getattr(envs, ANY) is True
+
+
+def test_above_configured_capacity_rejected(monkeypatch):
+    impl, _, meta, _, q, cache = setup_case(monkeypatch, 17, "1")
+    assert not impl._dflash2_grouped_verify_allowed(
+        q, cache, cache, meta, num_query_tokens=q.shape[0]
+    )
+
+
+def test_new_route_log_once_per_bucket_and_capture_phase(monkeypatch, caplog):
+    impl, calls, meta, qsl, q, cache = setup_case(monkeypatch, 16, "1", padded=True)
+    layer = types.SimpleNamespace(_k_scale_float=1.0, _v_scale_float=1.0)
+    with caplog.at_level("INFO"):
+        for capturing in (False, False, True, True):
+            monkeypatch.setattr(
+                mod, "_is_cuda_graph_capturing", lambda q, value=capturing: value
+            )
+            impl._flash_v100_small_query_prefill_as_decode(
+                layer, q, cache, cache, meta, torch.empty_like(q), qsl, meta.seq_lens
+            )
+    messages = [
+        r.message for r in caplog.records if "any-batch grouped verify:" in r.message
+    ]
+    assert len(messages) == 2
+    assert all("B=16 bucket=16" in m and "configured_max=16" in m for m in messages)
+    assert "capture=False" in messages[0] and "capture=True" in messages[1]
+    assert all(c["rows"] == 128 for c in calls["grouped"])

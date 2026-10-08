@@ -33,6 +33,7 @@ def test_batched_q8_and_graph_replay_equal_b1(monkeypatch, dtype, bucket):
     _require(dtype)
     monkeypatch.setenv(KNOB, "1")
     monkeypatch.setenv("VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY", "1")
+    monkeypatch.setenv(ANY, "1")  # constructor freezes the configured capacity
     impl, calls = _make_impl(monkeypatch, dtype)
     assert impl.use_dflash2_batched_grouped_verify
     assert impl.dflash2_grouped_verify_request_major_abi_version >= 1
@@ -85,6 +86,7 @@ def test_mixed_p9_append_equal_and_q1_p7g_bound(monkeypatch, dtype):
     _require(dtype)
     monkeypatch.setenv(KNOB, "1")
     monkeypatch.setenv("VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY", "1")
+    monkeypatch.setenv(ANY, "1")
     impl, _ = _make_impl(monkeypatch, dtype)
     seqs = [s for _, s in MIXED_ROWS]
     qlens = [q for q, _ in MIXED_ROWS]
