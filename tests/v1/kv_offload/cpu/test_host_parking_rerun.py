@@ -8,6 +8,9 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import MagicMock
 
+import pytest
+import torch
+
 from tests.v1.kv_offload.cpu.test_host_parking import CTX, key, real_layout
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinator
@@ -17,6 +20,7 @@ from vllm.v1.kv_offload.cpu.manager import (
     GroupedCPUOffloadingManager,
 )
 from vllm.v1.kv_offload.cpu.parking_manager import ParkingManager
+from vllm.v1.kv_offload.cpu.parking_quota import proportional_group_slots
 from vllm.v1.kv_offload.cpu.parking_spec import HostParkingSpec
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "benchmarks"))
@@ -183,3 +187,127 @@ def test_spec_diagnostic_is_opt_in():
         config, caches = real_layout(parking_diagnostics=enabled)
         manager = HostParkingSpec(config, caches).get_manager()
         assert manager.diagnostics is enabled
+
+
+RATIOS = {str(g): 2 if g < 6 else 8 if g < 8 else 16 for g in range(9)}
+
+
+def test_balanced_native_spec_fits_ten_and_defaults_unchanged():
+    c, k = real_layout(mamba_state_slots_reference_tokens=32768)
+    before = HostParkingSpec(c, k)
+    assert list(before.cpu_group_num_blocks.values()) == [36] * 6 + [91] * 3
+    c.kv_transfer_config.kv_connector_extra_config["parking_group_slot_ratios"] = RATIOS
+    after = HostParkingSpec(c, k)
+    assert list(after.cpu_group_num_blocks.values()) == [24] * 6 + [96, 95, 192]
+    assert after.actual_pool_bytes == 17_175_674_880 < 16 << 30
+    assert after.key_namespace == before.key_namespace  # KV format/scales unchanged.
+    report = analyze(after)
+    assert report["current_group_quotas_fit"]
+    manager = after.get_manager()
+
+    def pages(g):
+        return (
+            (6, 7)
+            if g < 6
+            else range(8)
+            if g < 8
+            else [i for i in range(32) if i % 4 >= 2]
+        )
+
+    for req in range(10):
+        keys = [key(g, req * 100 + p) for g in range(9) for p in pages(g)]
+        job = manager.prepare_store(keys, CTX)
+        assert job is not None and not job.evicted_keys
+        manager.complete_store(job.keys_to_store, CTX)
+    assert list(manager.stats()["group_slots"].values()) == [20] * 6 + [80, 80, 160]
+    for req in range(10):
+        keys = [
+            key(g, req * 100 + p)
+            for g in range(9)
+            for p in ((6,) if g < 6 else range(7) if g < 8 else (26, 27))
+        ]
+        assert all(manager.lookup(k, CTX) is True for k in keys)
+        manager.prepare_load(keys, CTX)
+        manager.complete_load(keys, CTX)
+    manager.reset_cache()
+    assert manager.stats()["in_use_slots"] == manager.stats()["read_write_refs"] == 0
+
+
+@pytest.mark.parametrize(
+    "ratios",
+    [
+        {},
+        {"0": 1},
+        {**RATIOS, "9": 1},
+        {**RATIOS, "0": 0},
+        {**RATIOS, "0": -1},
+        {**RATIOS, "0": 2.0},
+        {**RATIOS, "0": True},
+        {**RATIOS, "0": "2"},
+        list(RATIOS.values()),
+    ],
+)
+def test_bad_ratio_configuration_fails_before_pool_allocation(ratios):
+    c, k = real_layout(parking_group_slot_ratios=ratios)
+    with pytest.raises(ValueError, match="parking_group_slot_ratios"):
+        HostParkingSpec(c, k)
+
+
+def test_ratio_rounding_is_deterministic_and_bounded():
+    sizes = {0: 9, 1: 9, 2: 5}
+    ratios = {"0": 2, "1": 8, "2": 16}
+    for budget in range(200, 500):
+        a = proportional_group_slots(sizes, ratios, budget)
+        b = proportional_group_slots(
+            dict(reversed(list(sizes.items()))), ratios, budget
+        )
+        assert a == b and sum(sizes[g] * a[g] for g in sizes) <= budget
+        assert min(a.values()) > 0
+    with pytest.raises(ValueError, match="at least one"):
+        proportional_group_slots(sizes, ratios, 1)
+
+
+def test_worker_tensor_slot_counts_follow_each_group_not_fallback(monkeypatch):
+    from vllm.v1.kv_offload.base import (
+        CanonicalKVCacheRef,
+        CanonicalKVCaches,
+        CanonicalKVCacheTensor,
+    )
+    from vllm.v1.kv_offload.cpu import gpu_worker as worker
+
+    c, k = real_layout(parking_group_slot_ratios=RATIOS)
+    spec = HostParkingSpec(c, k)
+    # Meta storage preserves full native byte geometry without any allocation.
+    tensors = [
+        CanonicalKVCacheTensor(torch.empty((2, p), dtype=torch.int8, device="meta"), p)
+        for p in spec.cpu_group_page_sizes.values()
+    ]
+    canonical = CanonicalKVCaches(
+        tensors,
+        [[CanonicalKVCacheRef(g, p)] for g, p in spec.cpu_group_page_sizes.items()],
+    )
+    allocations = []
+
+    def allocate(slots, size):
+        allocations.append((slots, size))
+        return torch.empty((slots, size), dtype=torch.int8, device="meta")
+
+    monkeypatch.setattr(worker, "is_pin_memory_available", lambda: False)
+    # Only the CUDA directions are mocked; actual partition/factory code runs.
+    monkeypatch.setattr(
+        worker, "SingleDirectionOffloadingHandler", lambda **kw: NS(**kw)
+    )
+    handlers = worker.CpuGpuOffloadingHandlers(
+        canonical,
+        1,
+        spec.num_blocks,
+        group_page_sizes=spec.cpu_group_page_sizes,
+        group_num_blocks=spec.cpu_group_num_blocks,
+        cpu_tensor_factory=allocate,
+    )
+    assert allocations == [
+        (spec.cpu_group_num_blocks[g], p) for g, p in spec.cpu_group_page_sizes.items()
+    ]
+    assert 4 * sum(n * p for n, p in allocations) == spec.actual_pool_bytes
+    assert handlers.cpu_to_gpu_handler.cpu_tensors is not None
+    assert not torch.cuda.is_initialized()

@@ -75,6 +75,23 @@ class HostParkingSpec(CPUOffloadingSpec):
             raise ValueError("parking requires native per-group block granularity")
         if not self.partition_by_group:
             raise ValueError("parking requires native disjoint grouped CPU pools")
+        ratios = self.extra_config.get("parking_group_slot_ratios")
+        if ratios is not None:
+            from vllm.v1.kv_offload.cpu.parking_quota import proportional_group_slots
+
+            self.cpu_group_num_blocks = proportional_group_slots(
+                self.cpu_group_page_sizes,
+                ratios,
+                self.parking.total_bytes // pc.world_size,
+            )
+            # Grouped handlers use the explicit dictionary for every tensor.
+            # Keep the legacy fallback scalar bounded by the smallest pool.
+            self.num_blocks = min(self.cpu_group_num_blocks.values())
+            logger.info(
+                "HOST_PARKING quota_ratios=%s slots=%s",
+                ratios,
+                self.cpu_group_num_blocks,
+            )
         self.key_namespace = layout_namespace(vllm_config, kv_cache_config)
         self.actual_pool_bytes = pc.world_size * sum(
             self.cpu_group_page_sizes[g] * n

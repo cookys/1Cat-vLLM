@@ -579,6 +579,99 @@ def test_invalid_rerun_selection_rejected_before_any_launch(extra):
     assert result.returncode == 2
 
 
+def test_balanced_main_and_fault_keep_native_short_control():
+    a = args()
+    a.parking_quota = "balanced-32k"
+    a.parking_diagnostics = True
+    for arm, fault in (("on1", None), ("fault-pre_submit", "pre_submit")):
+        cfg = json.loads(W.command(a, arm, fault)[-1])["kv_connector_extra_config"]
+        assert cfg["parking_group_slot_ratios"] == {
+            str(g): 2 if g < 6 else 8 if g < 8 else 16 for g in range(9)
+        }
+        assert cfg["cpu_bytes_to_use"] == 16 << 30
+    cfg = json.loads(W.command(a, W.LEGACY_ARM)[-1])["kv_connector_extra_config"]
+    assert "parking_group_slot_ratios" not in cfg
+    assert cfg["parking_diagnostics"] is True
+    assert "--kv-transfer-config" not in W.command(a, "off1")
+    a.arms = [W.LEGACY_ARM]
+    a.skip_raw = True
+    assert W.arm_timeout(a, W.LEGACY_ARM) == 900
+    assert W.window_budget(a) == 240 + 900 + 300
+
+
+@pytest.mark.parametrize("hits,expected", [(94, "FAIL"), (95, "PASS"), (100, "PASS")])
+def test_additional_quota_gate_does_not_relax_original_latency(hits, expected):
+    rows = returns(n=100)
+    for i, row in enumerate(rows):
+        row["request_id"] = str(i)
+    for row in rows[100 + hits :]:
+        row["restored_tokens"] = 0
+    assert J.quota_hit_gate(rows)["status"] == expected
+    assert J.latency_gate(rows)["status"] == ("PASS" if hits == 100 else "FAIL")
+    assert J.quota_hit_gate(rows[1:101])["status"] == "INCONCLUSIVE"
+
+
+def test_legacy_diagnostic_uses_only_return_slice_and_absent_misses(tmp_path):
+    def sample(reason, n, group="8"):
+        return "HOST_PARKING step_stats " + json.dumps(
+            {
+                "group_capacity_slots": {group: 91},
+                "group_slots": {group: 91},
+                "lookup_misses": [dict(reason=reason, group=int(group), count=n)],
+            }
+        )
+
+    log = tmp_path / "log"
+    log.write_text(sample("absent", 30) + "\n" + sample("pending", 3) + "\n")
+    assert not W.diagnostic_misses(log, 1)["sw_miss_observed"]
+    with log.open("a") as f:
+        f.write(sample("absent", 5) + "\n")
+    result = W.diagnostic_misses(log, 1)
+    assert result["absent_lookup_counts"] == {"8": 5}
+    assert result["sw_miss_observed"]
+
+
+@pytest.mark.parametrize("sig", [W.signal.SIGALRM, W.signal.SIGTERM])
+def test_legacy_deadline_continues_but_external_stop_propagates(
+    tmp_path, monkeypatch, sig
+):
+    @W.contextlib.contextmanager
+    def interrupted(*args):
+        raise W.WindowInterrupted("test", sig)
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(W, "server", interrupted)
+    a = NS(out=tmp_path)
+    if sig == W.signal.SIGALRM:
+        W.run_legacy(a)
+        result = json.loads((tmp_path / "legacy-c10.diagnostic.json").read_text())
+        assert result["sw_miss_observed"] is None
+        assert (tmp_path / "legacy-c10.timeout.json").exists()
+    else:
+        with pytest.raises(W.WindowInterrupted):
+            W.run_legacy(a)
+
+
+def test_cross_window_control_cannot_pass_g4(tmp_path, monkeypatch):
+    for arm in J.ORDER:
+        W.write(tmp_path / (arm + ".traffic.json"), {})
+        W.write(tmp_path / (arm + ".copy.json"), {})
+    W.write(tmp_path / "reused-evidence.json", [dict(file="off1.traffic.json")])
+    monkeypatch.setattr(J, "interference_gate", lambda *a: J.gate("PASS", "test"))
+    report = J.judge(tmp_path)["gates"]["4 interference"]
+    assert report["status"] == "INCONCLUSIVE" and "cross-window" in report["reason"]
+
+
+def test_additional_quota_gate_is_in_summary_and_missing_evidence_inconclusive(
+    tmp_path,
+):
+    W.write(tmp_path / "prereg.json", dict(parking_quota="balanced-32k"))
+    report = J.judge(tmp_path)
+    assert len(report["gates"]) == 7
+    assert report["quota_external_hit"]["status"] == "INCONCLUSIVE"
+    assert report["status"] == "INCONCLUSIVE"
+
+
 @pytest.mark.parametrize("cli", [[], ["--out", "cli-out"], ["--out=cli-out"]])
 def test_wrapper_output_plan_and_existing_directory_guard(tmp_path, cli):
     env = dict(

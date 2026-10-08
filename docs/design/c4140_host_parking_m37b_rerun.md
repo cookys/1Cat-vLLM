@@ -5,6 +5,11 @@ Date: 2026-10-09. CPU-only follow-up to
 Base `7b72034ec`; m37b actually ran `addf06bb4`. No GPU/service actions, pool
 resizing, cache policy changes, or numerical changes are part of this delta.
 
+**Superseded execution recipe:** the analysis and first diagnostic-only delta
+below are preserved as `cf043605a` evidence. Lead subsequently authorized the
+bounded quota option in the final section. Use that section's recipe for the
+next window; total pinned budget remains 16 GiB and the default remains native.
+
 ## What stopped m37b
 
 At `addf06bb4:benchmarks/host_parking_window.py:562–579`, startup has its own
@@ -205,3 +210,127 @@ Real CPU import preflight: `astra-m37b-timeout/live-preflight/` contains
 all other packages/native binaries resolve into the serving venv), plus the
 expected `old-path-rejected.json` negative control. `rerun-plan.json` records
 the nonexecuting arm/argv/deadline plan. Ruff, shell syntax and diff checks pass.
+
+## Quota option and amended GPU preregistration (before next window)
+
+Lead instruction: `01M4ENAG8T0YNPJPG2K7A69EB7`. Fable review of `cf043605a`:
+`01M4ENKH02XBW1Q9XNV6G72WKX` (PASS with rerun conditions). This section replaces
+the **execution recipe**, not the seven numerical/performance gate thresholds.
+
+### Implementation and CPU prediction
+
+New optional connector key:
+
+```json
+"parking_group_slot_ratios": {
+  "0": 2, "1": 2, "2": 2, "3": 2, "4": 2, "5": 2,
+  "6": 8, "7": 8, "8": 16
+}
+```
+
+Absent means native allocation, byte-for-byte the previous quota result.
+The driver shorthand is `--parking-quota balanced-32k` (default `native`).
+It applies the ratio to ON and fault arms; the separate `legacy-c10` arm always
+uses native quotas and enables group diagnostics.
+
+`cpu/parking_quota.py:proportional_group_slots` validates all group IDs and
+positive integer weights, then floors a common multiplier
+`budget_per_rank / sum(weight[g] * physical_page_bytes[g])`. It distributes
+remaining whole slots by largest fractional remainder, group-ID tie order,
+skipping pages that do not fit. Integer-only computation is identical on
+scheduler and workers. This spends the original aggregate 16 GiB ceiling;
+no dynamic pool resize, extra registration, changed slot format, load/store
+ordering, generation semantics or eviction policy is introduced.
+
+`parking_spec.py:HostParkingSpec.__init__` installs the resulting dictionary
+before any manager or pinned pool is constructed. Every grouped worker tensor
+uses its dictionary entry (`cpu/gpu_worker.py:479–483,522–529`); the scalar
+fallback is set to the smallest count and is unused for these nine groups.
+The ratio and resulting quotas are logged. Invalid or incomplete ratios fail
+during CPU configuration validation, before pinning.
+
+| Group(s) | Old quota | 10×32K demand | New quota per group |
+|---|---:|---:|---:|
+| GDN 0–5 | 36 | 20 | **24** |
+| Full attention 6 | 91 | 80 | **96** |
+| Full attention 7 | 91 | 80 | **95** |
+| Draft SW 8 | 91 | 160 | **192** |
+
+New physical allocation = **17,175,674,880 bytes / 15.99609375 GiB across TP4**,
+leaving 4 MiB aggregate unused because another whole weighted page does not fit.
+FA groups differ by one slot due to deterministic rounding, not tensor layout.
+This adds headroom proportional to the 13.359375-GiB reference demand; it does
+not promise arbitrary long/short mixtures or ten additional GDN junctions.
+No >25-GiB allocation or revised host-memory allowance is requested.
+
+CPU proof: `test_balanced_native_spec_fits_ten_and_defaults_unchanged` inserts
+all nine groups for ten independent prompts into actual native managers,
+checks no evictions, restores every request, then resets to zero used slots and
+refs. `test_worker_tensor_slot_counts_follow_each_group_not_fallback` exercises
+the real worker partition/factory with meta storage, mocking only the CUDA
+directions. It checks every tensor's slot count and aggregate physical bytes.
+Artifact: `/data/bench/astra-m37b-timeout/capacity-balanced.json`.
+
+### Frozen next-window criteria
+
+1. **Main arm on1, balanced quota, group diagnostics ON.** Same 100 c1 and
+   100 c10 returns as before. Additional capacity threshold: **at least 95 of
+   100 distinct c10 requests** successfully restore **at least 28,672 external
+   tokens** from a 32,768-token prompt, with **zero request errors**. Missing
+   attempts/IDs are INCONCLUSIVE. Judge emits `quota_external_hit` separately.
+2. **G2–G7 thresholds unchanged.** In particular G3 still requires 100 genuine
+   restores in each regime with client-arrival-to-all-rank-observed p50<=2 s,
+   p99<=4 s. Passing 95/100 capacity therefore does not imply G3 PASS. G4 still
+   requires three paired uninstrumented arms and the original noise floor.
+   Diagnostics and cross-window reused controls independently force G4
+   INCONCLUSIVE; values are retained for inspection. No production GO follows
+   from this selected-arm window alone.
+3. **Old quota: short `legacy-c10` only.** Ten producers plus two return bursts,
+   all 32K, no parity suite, long c1 loop, or 12-minute traffic stage. Its
+   900-second envelope starts before import/startup; the post-ready alarm reserves
+   120 s for short HTTP drain and 120 s for owned-server cleanup. HTTP timeout
+   is 120 s; startup may use only the remaining startup portion. Expected
+   wall time is 6–12 min using the observed startup/32K cold-burst times; this
+   remains an estimate. A caught arm SIGALRM records timeout/partial results
+   then permits later arms; external SIGTERM still propagates to stop the window.
+4. **Runtime mechanism check:** `legacy-c10.diagnostic.json` counts only the
+   return-phase `step_stats` slice. `sw_miss_observed=true` requires at least
+   one **absent** group-8 lookup while capacity is 91 (pending copies do not
+   count). Missing return stage reports null; no observed SW miss leaves the
+   CPU mechanism unconfirmed, regardless of new-arm performance. Other group
+   misses and peak slots remain in the same JSON. Two bursts cannot establish
+   latency quantiles or a population hit rate.
+5. **Fault arms use balanced quota**, same rank-1, second-job injections,
+   recovery/abort assertions and original G7. Use `--fault-timeout-s 2400` to
+   leave margin beyond the unmeasured 15–25-min estimate. No correctness gate
+   is relaxed. If normal on1 times out, its checkpoints survive and the window
+   stops; faults may be resumed by selecting only their two names in a fresh
+   output directory. The legacy timeout exception applies only to that control.
+
+Final lead-only recipe; **not executed by Astra**:
+
+```sh
+M37_GO=1 M37_WORKTREE=/data/src/1cat-wt-astra-parking-rerun \
+  M37_OUT=/data/bench/m37c \
+  bash /data/src/1cat-wt-astra-parking-rerun/benchmarks/host_parking_window.sh \
+  --execute --arms on1 legacy-c10 fault-pre_submit fault-completed_copy \
+  --reuse-from /data/bench/m37b --skip-raw --parking-diagnostics \
+  --parking-quota balanced-32k --fault-timeout-s 2400
+```
+
+Planned order prioritizes the new arm. Estimated **85–125 min** total: on1
+45–60 min (depends on whether c10 cold recomputation is actually avoided),
+legacy 6–12 min, two faults 15–25 min each. Hard outer cap **15,060 s / 251 min**
+includes conservative startup/drain reservations, not a prediction. The dry
+plan is `astra-m37b-timeout/rerun-balanced-plan.json`; it does not create m37c.
+The reused-source preregistration/hash are copied into `reused-run.json` and
+explicitly marked noncomparable for G4; no claim of driver/venv equivalence.
+
+Overlay since `cf043605a`: **parking_spec.py + new parking_quota.py** only.
+Full runtime overlay since `7b72034ec` adds parking_manager.py and the offload
+scheduler diagnostic hook. Driver/judge remain standalone. Validation command
+is unchanged from above, with results and exact command recorded in
+`astra-m37b-timeout/tests-balanced-final.log`; real import preflight is in
+`live-preflight-balanced/`: **246 tests passed**, import PASS with
+`cuda_initialized=false`, and the original whole-worktree shadowing negative
+control rejected as expected. Fable must review this separate quota delta before GO.

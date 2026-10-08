@@ -121,6 +121,33 @@ def latency_gate(rows):
     )
 
 
+def quota_hit_gate(rows):
+    """Additional preregistered c10 capacity gate; never replaces G2--G7."""
+    selected = [r for r in rows if r.get("return_concurrency") == 10]
+    if len(selected) != 100 or len({r.get("request_id") for r in selected}) != 100:
+        return gate(
+            "INCONCLUSIVE",
+            "need 100 distinct c10 return attempts",
+            attempts=len(selected),
+        )
+    hits = sum(
+        bool(
+            r.get("ok")
+            and r.get("prompt_tokens") == 32768
+            and r.get("restored_tokens", 0) >= 28672
+        )
+        for r in selected
+    )
+    passed = hits >= 95 and all(r.get("ok") for r in selected)
+    return gate(
+        "PASS" if passed else "FAIL",
+        "at least 95/100 full external hits, no errors; G3 unchanged",
+        attempts=100,
+        full_hits=hits,
+        external_hit_fraction=hits / 100,
+    )
+
+
 def interference_gate(traffic, copies):
     fields = ("steady_tok_s_per_user_median", "interfered_tok_s_per_user_median")
     detail = {}
@@ -347,8 +374,17 @@ def judge(out):
         measured = gates["4 interference"]
         gates["4 interference"] = gate(
             "INCONCLUSIVE",
-            "parking diagnostics enabled; timing requires an OFF run",
+            "parking diagnostics enabled; timing requires an uninstrumented run",
             diagnostic_result=measured,
+        )
+    reused = out / "reused-evidence.json"
+    if reused.exists() and any(
+        row["file"].startswith(tuple(a + "." for a in ORDER)) for row in load(reused)
+    ):
+        gates["4 interference"] = gate(
+            "INCONCLUSIVE",
+            "cross-window control; not a paired G4 measurement",
+            cross_window_result=gates["4 interference"],
         )
     guarded(
         "5 useful work",
@@ -390,17 +426,25 @@ def judge(out):
 
     guarded("6 RAM/las", ram)
     guarded("7 recovery", lambda: failure_gate(out))
+    quota = None
+    if prereg.exists() and load(prereg).get("parking_quota") == "balanced-32k":
+        try:
+            quota = quota_hit_gate(load(out / "on1.returns.json"))
+        except (OSError, KeyError, TypeError, ValueError) as e:
+            quota = gate("INCONCLUSIVE", "missing quota-hit evidence: " + str(e))
+    decisions = [*gates.values(), *([quota] if quota else [])]
     status = (
         "FAIL"
-        if any(g["status"] == "FAIL" for g in gates.values())
+        if any(g["status"] == "FAIL" for g in decisions)
         else "PASS"
-        if all(g["status"] == "PASS" for g in gates.values())
+        if all(g["status"] == "PASS" for g in decisions)
         else "INCONCLUSIVE"
     )
     return dict(
         status=status,
         production_go=False,
         gates=gates,
+        quota_external_hit=quota,
         note=(
             "Technical window only; natural-LRU capacity and "
             "isolated fatal-rank recovery remain separate gates"

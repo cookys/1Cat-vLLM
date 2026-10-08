@@ -28,14 +28,23 @@ from pathlib import Path
 MODEL = "Qwen3.8-27B-QUASAR-NVFP4"
 ORDER = ("off1", "on1", "on2", "off2", "off3", "on3")
 FAULT_ARMS = ("fault-pre_submit", "fault-completed_copy")
-ALL_ARMS = ORDER + FAULT_ARMS
+LEGACY_ARM = "legacy-c10"
+CELL_ARMS = ORDER + (LEGACY_ARM,)
+ALL_ARMS = CELL_ARMS + FAULT_ARMS
+DEFAULT_ARMS = ORDER + FAULT_ARMS
 
 
 class WindowInterrupted(BaseException):
     """Do not let a request's broad Exception handler swallow the deadline."""
 
+    def __init__(self, message, signum=None):
+        super().__init__(message)
+        self.signum = signum
+
 
 def arm_timeout(args, arm):
+    if arm == LEGACY_ARM:
+        return 900  # Total arm envelope, including startup and cleanup reserves.
     if arm in FAULT_ARMS:
         return getattr(args, "fault_timeout_s", 1500)
     if arm == "on1":
@@ -46,11 +55,13 @@ def arm_timeout(args, arm):
 def window_budget(args):
     # Per-server: import 120 + startup 900 + cleanup 120. Raw preflight includes
     # the negative provenance control. Keep the outer cap above the inner sum.
-    arms = getattr(args, "arms", ALL_ARMS)
+    arms = getattr(args, "arms", DEFAULT_ARMS)
     return (
         240
         + (0 if getattr(args, "skip_raw", False) else 600)
-        + sum(1140 + arm_timeout(args, arm) for arm in arms)
+        + sum(
+            (0 if arm == LEGACY_ARM else 1140) + arm_timeout(args, arm) for arm in arms
+        )
         + 300
     )
 
@@ -196,7 +207,7 @@ def percentile(xs, q):
     return a[i] + (a[min(i + 1, len(a) - 1)] - a[i]) * (x - i)
 
 
-def config(diagnostics=False):
+def config(diagnostics=False, quota="native"):
     result = {
         "kv_connector": "OffloadingConnector",
         "kv_role": "kv_both",
@@ -216,6 +227,12 @@ def config(diagnostics=False):
     }
     if diagnostics:
         result["kv_connector_extra_config"]["parking_diagnostics"] = True
+    if quota == "balanced-32k":
+        result["kv_connector_extra_config"]["parking_group_slot_ratios"] = {
+            str(g): 2 if g < 6 else 8 if g < 8 else 16 for g in range(9)
+        }
+    elif quota != "native":
+        raise ValueError("unknown parking quota recipe")
     return result
 
 
@@ -269,8 +286,11 @@ def command(args, arm, fault=None):
         json.dumps(SPEC),
         "--enable-prompt-tokens-details",
     ]
-    if arm.startswith("on") or fault:
-        cfg = config(getattr(args, "parking_diagnostics", False))
+    if arm.startswith("on") or fault or arm == LEGACY_ARM:
+        cfg = config(
+            getattr(args, "parking_diagnostics", False) or arm == LEGACY_ARM,
+            "native" if arm == LEGACY_ARM else getattr(args, "parking_quota", "native"),
+        )
         if fault:
             cfg["kv_connector_extra_config"].update(
                 parking_validation=True,
@@ -401,7 +421,7 @@ def prompt(args, length, salt):
     return (tokens * math.ceil(length / len(tokens)))[:length]
 
 
-def complete(args, tokens, label, count=128, temperature=0.0, seed=0):
+def complete(args, tokens, label, count=128, temperature=0.0, seed=0, timeout_s=300):
     rid = "m37-" + uuid.uuid4().hex
     payload = {
         "model": MODEL,
@@ -432,7 +452,7 @@ def complete(args, tokens, label, count=128, temperature=0.0, seed=0):
         "usage": None,
     }
     try:
-        with urllib.request.urlopen(request, timeout=300) as response:
+        with urllib.request.urlopen(request, timeout=timeout_s) as response:
             for line in response:
                 if not line.startswith(b"data: ") or line.strip() == b"data: [DONE]":
                     continue
@@ -620,13 +640,14 @@ class Monitor:
 
 @contextlib.contextmanager
 def server(args, arm, fault=None):
+    arm_started = time.monotonic()
     # Refuse any pre-existing listener. Never attach to or stop somebody else's.
     with socket.socket() as sock:
         if sock.connect_ex(("127.0.0.1", args.port)) == 0:
             raise RuntimeError("dedicated test port is already occupied")
     import_preflight(args, arm)
     env = engine_env(args, bool(fault))
-    args.parking = arm.startswith("on") or bool(fault)
+    args.parking = arm.startswith("on") or bool(fault) or arm == LEGACY_ARM
     cmd = command(args, arm, fault)
     write(
         args.out / (arm + ".argv.json"),
@@ -654,6 +675,8 @@ def server(args, arm, fault=None):
         )
         try:
             end = time.monotonic() + 900
+            if arm == LEGACY_ARM:
+                end = min(end, arm_started + 660)
             while time.monotonic() < end:
                 if child.poll() is not None:
                     raise RuntimeError(
@@ -665,9 +688,13 @@ def server(args, arm, fault=None):
                 except Exception:
                     time.sleep(1)
             else:
-                raise TimeoutError(f"{arm} startup exceeded 900 s")
+                raise TimeoutError(f"{arm} startup deadline exceeded")
             write(args.out / (arm + ".numa.json"), numa_pools(logpath))
             seconds = arm_timeout(args, arm)
+            if arm == LEGACY_ARM:
+                # Reserve at most 120 s for outstanding short HTTP work and
+                # 120 s for owned-child cleanup within the 15-minute envelope.
+                seconds = max(1, int(900 - (time.monotonic() - arm_started) - 240))
             write(
                 args.out / (arm + ".deadline.json"),
                 dict(seconds=seconds, armed_epoch_ns=time.time_ns()),
@@ -756,6 +783,88 @@ def event_rows(log):
     return rows
 
 
+def diagnostic_misses(log, start_line=0):
+    counts = {}
+    peak_used = {}
+    capacities = {}
+    for line in Path(log).read_text(errors="replace").splitlines()[start_line:]:
+        if "HOST_PARKING step_stats " not in line:
+            continue
+        sample = json.loads(line.split("HOST_PARKING step_stats ", 1)[1])
+        capacities.update(sample["group_capacity_slots"])
+        for g, used in sample["group_slots"].items():
+            peak_used[g] = max(used, peak_used.get(g, 0))
+        for miss in sample["lookup_misses"]:
+            if miss["reason"] == "absent":
+                g = str(miss["group"])
+                counts[g] = counts.get(g, 0) + miss["count"]
+    return dict(
+        absent_lookup_counts=counts,
+        peak_used_slots=peak_used,
+        group_capacity_slots=capacities,
+        sw_miss_observed=counts.get("8", 0) > 0 and capacities.get("8") == 91,
+    )
+
+
+def run_legacy(args):
+    """Short native-quota control. Never substitutes for a full normal arm."""
+    arm = LEGACY_ARM
+    rows = []
+    start_line = None
+    log = args.out / (arm + ".serve.log")
+    try:
+        with server(args, arm), phase(args, arm, "legacy-c10"):
+            reset(args, True)
+            prompts = [prompt(args, 32768, f"restore-32768-{i}") for i in range(10)]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+                producers = list(
+                    pool.map(
+                        lambda tokens: complete(
+                            args, tokens, "legacy-producer", count=1, timeout_s=120
+                        ),
+                        prompts,
+                    )
+                )
+                write(args.out / (arm + ".producers.json"), producers)
+                settle(args)
+                start_line = len(log.read_text(errors="replace").splitlines())
+                for trial in range(2):
+                    reset(args)
+                    batch = list(
+                        pool.map(
+                            lambda item, trial=trial: complete(
+                                args,
+                                item[1],
+                                f"legacy-return-{trial}-{item[0]}",
+                                count=1,
+                                timeout_s=120,
+                            ),
+                            enumerate(prompts),
+                        )
+                    )
+                    for row in batch:
+                        row["return_concurrency"] = 10
+                    rows.extend(batch)
+                    join_loads(rows, event_rows(log))
+                    write(args.out / (arm + ".returns.json"), rows)
+    except WindowInterrupted as e:
+        if e.signum != signal.SIGALRM:
+            raise
+        write(args.out / (arm + ".timeout.json"), dict(error=str(e)))
+    result = (
+        diagnostic_misses(log, start_line)
+        if start_line is not None
+        else {"sw_miss_observed": None, "reason": "no return phase reached"}
+    )
+    result.update(
+        attempts=len(rows),
+        genuine_restores=sum(
+            bool(r.get("ok") and r.get("restored_tokens", 0) >= 28672) for r in rows
+        ),
+    )
+    write(args.out / (arm + ".diagnostic.json"), result)
+
+
 def join_loads(rows, events):
     for row in rows:
         found = [e for e in events if row["request_id"] in e["request_id"]]
@@ -775,7 +884,7 @@ def reuse_evidence(args):
     source = getattr(args, "reuse_from", None)
     if source is None:
         return
-    selected = set(getattr(args, "arms", ALL_ARMS))
+    selected = set(getattr(args, "arms", DEFAULT_ARMS))
     manifest = []
     for path in sorted(source.iterdir()):
         raw = re.fullmatch(r"raw-rank[0-3]\.json", path.name)
@@ -803,6 +912,21 @@ def reuse_evidence(args):
             )
         )
     write(args.out / "reused-evidence.json", manifest)
+    source_prereg = source / "prereg.json"
+    write(
+        args.out / "reused-run.json",
+        dict(
+            source=str(source.resolve()),
+            source_prereg=json.loads(source_prereg.read_text())
+            if source_prereg.exists()
+            else None,
+            source_prereg_sha256=hashlib.sha256(source_prereg.read_bytes()).hexdigest()
+            if source_prereg.exists()
+            else None,
+            timing_comparable=False,
+            note="Cross-window control; driver/venv equivalence and G4 not asserted",
+        ),
+    )
     if getattr(args, "skip_raw", False) and not all(
         (args.out / f"raw-rank{rank}.json").is_file() for rank in range(4)
     ):
@@ -815,13 +939,19 @@ def run(args):
     write(
         args.out / "prereg.json",
         {
-            "order": list(getattr(args, "arms", ALL_ARMS)),
-            "full_gate_order": list(ALL_ARMS),
+            "order": list(getattr(args, "arms", DEFAULT_ARMS)),
+            "full_gate_order": list(DEFAULT_ARMS),
             "arm_timeout_s": {
-                a: arm_timeout(args, a) for a in getattr(args, "arms", ALL_ARMS)
+                a: arm_timeout(args, a) for a in getattr(args, "arms", DEFAULT_ARMS)
             },
             "outer_timeout_s": window_budget(args),
             "parking_diagnostics": getattr(args, "parking_diagnostics", False),
+            "parking_quota": getattr(args, "parking_quota", "native"),
+            "quota_external_hit_gate": {
+                "c10_attempts": 100,
+                "minimum_full_hits": 95,
+                "minimum_external_tokens": 28672,
+            },
             "restore_count_c1": 100,
             "restore_count_c10": 100,
             "latency_limits_s": {"p50": 2.0, "p99": 4.0},
@@ -829,7 +959,10 @@ def run(args):
             "chains": 3,
             "turns_per_chain": 4,
             "max_output_tokens": 128,
-            "host_config": config(getattr(args, "parking_diagnostics", False)),
+            "host_config": config(
+                getattr(args, "parking_diagnostics", False),
+                getattr(args, "parking_quota", "native"),
+            ),
             "gpu_blocks": args.gpu_blocks,
             "git_tip": subprocess.check_output(
                 ["git", "-C", str(args.worktree), "rev-parse", "HEAD"], text=True
@@ -853,9 +986,12 @@ def run(args):
         ]
         if not getattr(args, "skip_raw", False):
             timed_command(raw, env, args.out / "raw.out", 600, cwd=args.staging)
-        for arm in (a for a in getattr(args, "arms", ALL_ARMS) if a in ORDER):
+        for arm in (a for a in getattr(args, "arms", DEFAULT_ARMS) if a in CELL_ARMS):
             if ram_safe(monitor.samples) is False:
                 raise RuntimeError("RAM/las stop threshold exceeded")
+            if arm == LEGACY_ARM:
+                run_legacy(args)
+                continue
             with server(args, arm) as log:
                 started = time.time()
 
@@ -898,7 +1034,7 @@ def run(args):
                     args.out / (arm + ".cell.json"),
                     dict(status="complete", cell_s=time.time() - started),
                 )
-        for arm in (a for a in getattr(args, "arms", ALL_ARMS) if a in FAULT_ARMS):
+        for arm in (a for a in getattr(args, "arms", DEFAULT_ARMS) if a in FAULT_ARMS):
             mode = arm.removeprefix("fault-")
             with server(args, arm, mode) as log, phase(args, arm, "recovery"):
                 cases, aborts = [], []
@@ -963,6 +1099,8 @@ def analyze(out):
     text = "| Gate | Result | Reason |\n|---|---|---|\n"
     for key, value in result["gates"].items():
         text += f"| {key} | {value['status']} | {value['reason']} |\n"
+    if value := result.get("quota_external_hit"):
+        text += f"| Additional quota hit | {value['status']} | {value['reason']} |\n"
     (out / "gates.md").write_text(text)
     return result
 
@@ -972,10 +1110,13 @@ def main():
     p.add_argument("--execute", action="store_true")
     p.add_argument("--analyze", action="store_true")
     p.add_argument("--budget-only", action="store_true")
-    p.add_argument("--arms", nargs="+", choices=ALL_ARMS, default=list(ALL_ARMS))
+    p.add_argument("--arms", nargs="+", choices=ALL_ARMS, default=list(DEFAULT_ARMS))
     p.add_argument("--reuse-from", type=Path)
     p.add_argument("--skip-raw", action="store_true")
     p.add_argument("--parking-diagnostics", action="store_true")
+    p.add_argument(
+        "--parking-quota", choices=("native", "balanced-32k"), default="native"
+    )
     p.add_argument("--on1-timeout-s", type=int, default=5400)
     p.add_argument("--cell-timeout-s", type=int, default=2700)
     p.add_argument("--fault-timeout-s", type=int, default=1500)
@@ -995,7 +1136,7 @@ def main():
     a = p.parse_args()
     if len(set(a.arms)) != len(a.arms):
         p.error("each arm must be unique; repeated evidence is not replication")
-    if a.arms != [x for x in a.arms if x in ORDER] + [
+    if a.arms != [x for x in a.arms if x in CELL_ARMS] + [
         x for x in a.arms if x in FAULT_ARMS
     ]:
         p.error("normal arms must precede fault arms")
@@ -1046,7 +1187,7 @@ def main():
 
     def interrupted(signum, frame):
         raise WindowInterrupted(
-            f"window interruption {signum}; cleaning owned children"
+            f"window interruption {signum}; cleaning owned children", signum
         )
 
     for sig in (signal.SIGALRM, signal.SIGTERM, signal.SIGUSR1):
