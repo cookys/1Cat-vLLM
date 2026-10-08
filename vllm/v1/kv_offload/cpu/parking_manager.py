@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
 import time
 
 from vllm.logger import init_logger
@@ -16,16 +17,22 @@ class ParkingManager(OffloadingManager):
     The tombstones are bounded by the underlying pool, and removed on eviction.
     """
 
-    def __init__(self, inner):
+    def __init__(self, inner, page_sizes=None):
         self.inner = inner
         self.invalid_keys = set()
         self.sweep_count = self.sweep_keys = self.sweep_ns = 0
+        self.page_sizes = page_sizes or {}
+        self.invalid_lookup_count = 0
 
     def invalidate(self, keys):
         self.invalid_keys.update(keys)
 
     def lookup(self, key, req_context):
         if key in self.invalid_keys:
+            self.invalid_lookup_count += 1
+            logger.info(
+                "HOST_PARKING invalid_lookup_miss count=%d", self.invalid_lookup_count
+            )
             return False
         return self.inner.lookup(key, req_context)
 
@@ -74,6 +81,24 @@ class ParkingManager(OffloadingManager):
     def reset_cache(self):
         self.inner.reset_cache()
         self.invalid_keys.clear()
+        logger.info("HOST_PARKING quota %s", json.dumps(self.stats(), sort_keys=True))
+
+    def stats(self):
+        groups = getattr(self.inner, "managers", {0: self.inner})
+        slots = {g: m._num_blocks - m._get_num_free_blocks() for g, m in groups.items()}
+        # LRU is required by ParkingConfig; include in-flight ref counts too.
+        refs = sum(
+            b.ref_cnt for m in groups.values() for b in m._policy.blocks.values()
+        )
+        return {
+            "in_use_slots": sum(slots.values()),
+            "group_slots": slots,
+            "in_use_bytes_per_rank": sum(slots[g] * self.page_sizes[g] for g in slots)
+            if self.page_sizes
+            else None,
+            "read_write_refs": refs,
+            "invalid_keys": len(self.invalid_keys),
+        }
 
     def shutdown(self):
         logger.info(

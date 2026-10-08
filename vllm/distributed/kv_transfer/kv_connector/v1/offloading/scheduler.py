@@ -356,6 +356,9 @@ class OffloadingConnectorScheduler:
         }
         self.manager: OffloadingManager = spec.get_manager()
         self.host_parking = getattr(spec, "host_parking", False) is True
+        self._parking_validation = (
+            self.host_parking and spec.extra_config.get("parking_validation") is True
+        )
         self._parking_generation = 0
         self._parking_held_finished: set[str] = set()
         self._parking_failure_count = 0
@@ -796,6 +799,16 @@ class OffloadingConnectorScheduler:
             job.parking_arrival_ns = int(request.arrival_time * 1e9)
             job.parking_submit_ns = time.time_ns()
             job.parking_external_tokens = num_external_tokens
+            logger.info(
+                "HOST_PARKING load_submitted request_id=%s job=%d generation=%d "
+                "arrival_ns=%d submit_ns=%d external_tokens=%d",
+                request.request_id,
+                load_job_id,
+                self._parking_generation,
+                job.parking_arrival_ns,
+                job.parking_submit_ns,
+                num_external_tokens,
+            )
 
         if self._blocks_being_loaded is not None:
             self._blocks_being_loaded.update(keys_to_load)
@@ -1178,6 +1191,11 @@ class OffloadingConnectorScheduler:
             store_jobs=boundary_store_jobs | normal_store_jobs,
             jobs_to_flush=self._current_batch_jobs_to_flush,
         )
+        if getattr(self, "_parking_validation", False):
+            for jid, job in meta.store_jobs.items():
+                logger.info(
+                    "HOST_PARKING store_submitted request_id=%s job=%d", job.req_id, jid
+                )
         self._current_batch_load_jobs = {}
         self._current_batch_jobs_to_flush = set()
         return meta
@@ -1308,6 +1326,13 @@ class OffloadingConnectorScheduler:
 
         if req_status is None:
             return False, None
+        if self.host_parking and request.status.name == "FINISHED_ABORTED":
+            logger.info(
+                "HOST_PARKING abort request_id=%s pending_loads=%d pending_stores=%d",
+                request.request_id,
+                sum(not self._jobs[j].is_store for j in req_status.transfer_jobs),
+                sum(self._jobs[j].is_store for j in req_status.transfer_jobs),
+            )
         # Blocks are freed right after this call; a store for a still
         # pending boundary offer could not be issued before block reuse.
         self._drop_pending_boundary_offloads(req_status, "request finished")
@@ -1362,6 +1387,7 @@ class OffloadingConnectorScheduler:
         self.manager.reset_cache()
         if self.host_parking:
             self._parking_generation += 1
+            logger.info("HOST_PARKING reset generation=%d", self._parking_generation)
 
         # Reset store progress so active requests re-offload from block 0
         for status in self._req_status.values():

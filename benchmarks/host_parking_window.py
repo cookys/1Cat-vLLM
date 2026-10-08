@@ -1,0 +1,823 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Isolated lead-run window. Default is a CPU-only plan. Never uses port 8001.
+
+No GPU/library imports here. Server and raw-byte probe run only with --execute
+and M37_GO=1. The external lead wrapper owns production stop/restore and fence.
+"""
+
+import argparse
+import concurrent.futures
+import contextlib
+import http.client
+import json
+import math
+import os
+import re
+import signal
+import socket
+import subprocess
+import threading
+import time
+import urllib.request
+import uuid
+from pathlib import Path
+
+MODEL = "Qwen3.8-27B-QUASAR-NVFP4"
+ORDER = ("off1", "on1", "on2", "off2", "off3", "on3")
+SPEC = {
+    "method": "dflash",
+    "model": "incoai/Qwen3.8-27B-DFlash2",
+    "revision": "dedf8df68adfb1afeaf7b7480c0a0243108177b4",
+    "num_speculative_tokens": 7,
+    "kv_cache_dtype": "auto",
+    "attention_backend": "FLASH_ATTN_V100",
+    "draft_sample_method": "probabilistic",
+    "enforce_eager": False,
+}
+FLAGS = {
+    "VLLM_KV_CACHE_LAYOUT": "NHD",
+    "VLLM_SERVER_DEV_MODE": "1",
+    "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY": "1",
+    "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_EXTRA_PAGES": "2048,4096",
+    "VLLM_FLASH_V100_NVFP4_FIRST_CHUNK_FP16": "1",
+    "VLLM_FLASH_V100_NVFP4_PREFIX_DECODE_ROWS": "1",
+    "VLLM_FLASH_V100_GROUPED_VERIFY_PER_REQUEST_FALLBACK": "1",
+    "VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY": "1",
+    "CC": "gcc-14",
+    "CXX": "g++-14",
+    "CUDAHOSTCXX": "g++-14",
+    "NVCC_PREPEND_FLAGS": "-ccbin /usr/bin/g++-14",
+    "TMPDIR": "/data/tmp",
+    "HF_HOME": "/data/hf",
+}
+
+
+def write(path, data):
+    Path(path).write_text(json.dumps(data, indent=2, allow_nan=False) + "\n")
+
+
+def percentile(xs, q):
+    if not xs:
+        return None
+    a = sorted(xs)
+    x = (len(a) - 1) * q
+    i = int(x)
+    return a[i] + (a[min(i + 1, len(a) - 1)] - a[i]) * (x - i)
+
+
+def config():
+    return {
+        "kv_connector": "OffloadingConnector",
+        "kv_role": "kv_both",
+        "kv_load_failure_policy": "recompute",
+        "kv_connector_extra_config": {
+            "spec_name": "HostParkingSpec",
+            "spec_module_path": "vllm.v1.kv_offload.cpu.parking_spec",
+            "host_parking": True,
+            "cpu_bytes_to_use": 16 << 30,
+            "parking_numa_node": 0,
+            "parking_mode": "completed_boundary",
+            "offload_prompt_only": True,
+            "store_threshold": 0,
+            "eviction_policy": "lru",
+            "mamba_state_slots_reference_tokens": 32768,
+        },
+    }
+
+
+def command(args, arm, fault=None):
+    cmd = [
+        "taskset",
+        "-c",
+        "28-54:2,84-110:2",
+        "numactl",
+        "--preferred=0",
+        str(args.python.parent / "vllm"),
+        "serve",
+        "/data/models/" + MODEL,
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(args.port),
+        "--served-model-name",
+        MODEL,
+        "--trust-remote-code",
+        "--dtype",
+        "half",
+        "--tensor-parallel-size",
+        "4",
+        "--attention-backend",
+        "FLASH_ATTN_V100",
+        "--kv-cache-dtype",
+        "nvfp4",
+        "--max-model-len",
+        "262144",
+        "--gpu-memory-utilization",
+        "0.80",
+        "--num-gpu-blocks-override",
+        str(args.gpu_blocks),
+        "--max-num-batched-tokens",
+        "4096",
+        "--max-num-seqs",
+        "16",
+        "--enable-prefix-caching",
+        "--mamba-cache-mode",
+        "align",
+        "--block-size",
+        "4096",
+        "--mamba-block-size",
+        "4096",
+        "--limit-mm-per-prompt",
+        '{"image":0,"video":0}',
+        "--seed",
+        "0",
+        "--speculative-config",
+        json.dumps(SPEC),
+        "--enable-prompt-tokens-details",
+    ]
+    if arm.startswith("on") or fault:
+        cfg = config()
+        if fault:
+            cfg["kv_connector_extra_config"].update(
+                parking_validation=True,
+                parking_test_fail_direction="CPU_to_GPU",
+                parking_test_fail_mode=fault,
+                parking_test_fail_rank=1,
+                parking_test_fail_nth=2,
+            )
+        cmd += ["--kv-transfer-config", json.dumps(cfg)]
+    return cmd
+
+
+def http(args, path, data=None, timeout=120):
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{args.port}{path}",
+        data=None if data is None else json.dumps(data).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read().decode()
+
+
+def cgroup_oom():
+    group = next(
+        line.split(":", 2)[2]
+        for line in Path("/proc/self/cgroup").read_text().splitlines()
+        if line.startswith("0::")
+    )
+    path = Path("/sys/fs/cgroup") / group.lstrip("/") / "memory.events"
+    data = dict(line.split() for line in path.read_text().splitlines())
+    return int(data.get("oom", 0)) + int(data.get("oom_kill", 0))
+
+
+def numa_pools(log):
+    rows = []
+    text = Path(log).read_text(errors="replace")
+    physical = [
+        json.loads(line.split("HOST_PARKING pool_usage ", 1)[1])
+        for line in text.splitlines()
+        if "HOST_PARKING pool_usage " in line
+    ]
+    for pid, base, size in set(
+        re.findall(
+            r"HOST_PARKING registered pid=(\d+) base=([0-9a-f]+) bytes=(\d+)", text
+        )
+    ):
+        address = int(base, 16)
+        target = None
+        maps = Path(f"/proc/{pid}/maps").read_text()
+        for line in maps.splitlines():
+            begin, end = [int(x, 16) for x in line.split()[0].split("-")]
+            if begin <= address and address + int(size) <= end:
+                target = begin
+                break
+        lines = Path(f"/proc/{pid}/numa_maps").read_text().splitlines()
+        line = next((line for line in lines if int(line.split()[0], 16) == target), "")
+        nodes = {int(n): int(p) for n, p in re.findall(r"N(\d+)=(\d+)", line)}
+        bound = re.search(r"bind:(\d+)", line)
+        page = re.search(r"kernelpagesize_kB=(\d+)", line)
+        rows.append(
+            dict(
+                pid=int(pid),
+                base=base,
+                bytes=int(size),
+                physical_pool=next((p for p in physical if p["pid"] == int(pid)), None),
+                numa_map=line,
+                bound_node=int(bound.group(1)) if bound else None,
+                other_node_pages=sum(v for k, v in nodes.items() if k != 0),
+                resident_bytes=sum(nodes.values())
+                * (int(page.group(1)) * 1024 if page else 4096),
+            )
+        )
+    return rows
+
+
+def metrics(args):
+    raw = http(args, "/metrics", timeout=10)
+    counters = {}
+    for line in raw.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        name, value = line.rsplit(" ", 1)
+        if "kv_offload_total_" in name and "_created" not in name:
+            for direction in ("GPU_to_CPU", "CPU_to_GPU"):
+                if direction in name:
+                    unit = "bytes" if "total_bytes" in name else "seconds"
+                    k = direction + "_" + unit
+                    counters[k] = counters.get(k, 0) + float(value)
+        elif "num_requests_running" in name or "num_requests_waiting" in name:
+            k = "running" if "running" in name else "waiting"
+            counters[k] = counters.get(k, 0) + float(value)
+    return raw, counters
+
+
+def settle(args):
+    previous = None
+    stable_since = time.monotonic()
+    limit = time.monotonic() + 120
+    while time.monotonic() < limit:
+        _, now = metrics(args)
+        if now != previous or now.get("running", 0) or now.get("waiting", 0):
+            stable_since = time.monotonic()
+        elif time.monotonic() - stable_since >= 6:
+            return
+        previous = now
+        time.sleep(0.5)
+    raise TimeoutError("parking transfers or requests did not settle")
+
+
+def reset(args, external=False):
+    settle(args)
+    # This API returns 200 even when reset is refused; verify logs/hit telemetry.
+    http(
+        args,
+        "/reset_prefix_cache?reset_running_requests=false&reset_external="
+        + str(external).lower(),
+        {},
+        120,
+    )
+
+
+def prompt(args, length, salt):
+    # Only benign synthetic text is tokenized. Reuse token IDs, never real traffic.
+    text = f"Parking test document {salt}. The garden has green trees and clear water. "
+    tokens = json.loads(http(args, "/tokenize", {"model": MODEL, "prompt": text}))[
+        "tokens"
+    ]
+    return (tokens * math.ceil(length / len(tokens)))[:length]
+
+
+def complete(args, tokens, label, count=128, temperature=0.0, seed=0):
+    rid = "m37-" + uuid.uuid4().hex
+    payload = {
+        "model": MODEL,
+        "prompt": tokens,
+        "max_tokens": count,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "temperature": temperature,
+        "top_k": 20,
+        "top_p": 0.95,
+        "seed": seed,
+        "ignore_eos": True,
+        "logprobs": 1,
+        "return_token_ids": True,
+    }
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{args.port}/v1/completions",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "X-Request-Id": rid},
+    )
+    rec = {
+        "label": label,
+        "request_id": rid,
+        "arrival_ns": time.time_ns(),
+        "prompt_tokens": len(tokens),
+        "ids": [],
+        "logprobs": [],
+        "usage": None,
+    }
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            for line in response:
+                if not line.startswith(b"data: ") or line.strip() == b"data: [DONE]":
+                    continue
+                data = json.loads(line[6:])
+                if data.get("error"):
+                    raise RuntimeError(str(data["error"]))
+                if data.get("usage"):
+                    rec["usage"] = data["usage"]
+                for choice in data.get("choices", []):
+                    ids = choice.get("token_ids") or []
+                    if (ids or choice.get("text")) and "first_ns" not in rec:
+                        rec["first_ns"] = time.time_ns()
+                    rec["ids"].extend(ids)
+                    rec["logprobs"].extend(
+                        (choice.get("logprobs") or {}).get("token_logprobs", [])
+                    )
+        rec["ok"] = len(rec["ids"]) == count and len(rec["logprobs"]) == count
+    except Exception as e:
+        rec.update(ok=False, error=repr(e))
+    rec["end_ns"] = time.time_ns()
+    rec["ttft_s"] = (
+        (rec["first_ns"] - rec["arrival_ns"]) / 1e9 if "first_ns" in rec else None
+    )
+    return rec
+
+
+def suite(args):
+    rows = []
+    for n in (1024, 16384):
+        for temp in (0.0, 1.0):
+            for seed in range(3):
+                reset(args, True)
+                rows.append(
+                    complete(
+                        args,
+                        prompt(args, n, f"parity-{n}-{seed}"),
+                        f"parity-{n}-{temp}-{seed}",
+                        temperature=temp,
+                        seed=seed,
+                    )
+                )
+    for chain in range(3):
+        reset(args, True)
+        base = prompt(args, 32767, f"chain-{chain}")
+        for turn in range(4):
+            reset(args)  # force a host return, not a GPU-local hit
+            tokens = base + prompt(args, turn * 1024 + 1, f"append-{chain}")
+            rows.append(complete(args, tokens, f"chain-{chain}-{turn}", seed=chain))
+    return rows
+
+
+def returns(args, arm, extensive):
+    rows = []
+    for concurrency, n, repetitions in (
+        (1, 262000, 100 if extensive else 1),
+        (10, 32768, 10 if extensive else 1),
+    ):
+        reset(args, True)
+        prompts = [prompt(args, n, f"restore-{n}-{i}") for i in range(concurrency)]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+            list(pool.map(lambda x: complete(args, x, "producer", count=1), prompts))
+            for trial in range(repetitions):
+                reset(args)
+                batch = list(
+                    pool.map(
+                        lambda item, concurrency=concurrency, trial=trial: complete(
+                            args,
+                            item[1],
+                            f"return-c{concurrency}-{trial}-{item[0]}",
+                            count=1,
+                        ),
+                        enumerate(prompts),
+                    )
+                )
+                for row in batch:
+                    row["return_concurrency"] = concurrency
+                rows.extend(batch)
+    return rows
+
+
+def abort_attempt(args, tokens, logpath, direction):
+    # Cancellation is triggered only after log evidence of an in-flight load
+    # (or during a long producer for D2H). Gate judges actual pending_* logs.
+    rid = "m37-abort-" + uuid.uuid4().hex
+    data = json.dumps(
+        {
+            "model": MODEL,
+            "prompt": tokens,
+            "max_tokens": 2048,
+            "stream": True,
+            "temperature": 0,
+            "ignore_eos": True,
+        }
+    ).encode()
+    connection = http.client.HTTPConnection("127.0.0.1", args.port, timeout=120)
+    start = logpath.stat().st_size
+    connection.request(
+        "POST",
+        "/v1/completions",
+        data,
+        {"Content-Type": "application/json", "X-Request-Id": rid},
+    )
+    limit = time.monotonic() + 90
+    observed = False
+    while time.monotonic() < limit:
+        with logpath.open() as f:
+            f.seek(start)
+            text = f.read()
+        tag = "load_submitted" if direction == "H2D" else "store_submitted"
+        if any(rid in line and tag in line for line in text.splitlines()):
+            observed = True
+            break
+        time.sleep(0.002)
+    connection.close()
+    settle(args)
+    return {"request_id": rid, "direction": direction, "submit_observed": observed}
+
+
+def sample_memory():
+    sample = {"epoch_ns": time.time_ns(), "las": {}, "meminfo_kib": {}}
+    for line in Path("/proc/meminfo").read_text().splitlines():
+        if line.split(":")[0] in ("MemAvailable", "MemFree", "Mlocked", "Unevictable"):
+            sample["meminfo_kib"][line.split(":")[0]] = int(line.split()[1])
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit():
+            continue
+        try:
+            if d.joinpath("comm").read_text().strip() != "las":
+                continue
+            status = d.joinpath("status").read_text()
+            swap = int(re.search(r"VmSwap:\s+(\d+)", status).group(1))
+            start = d.joinpath("stat").read_text().rsplit(")", 1)[1].split()[19]
+            sample["las"][d.name + ":" + start] = swap
+        except (OSError, AttributeError, IndexError):
+            pass
+    return sample
+
+
+def ram_safe(samples):
+    if not samples:
+        return None
+    baseline = samples[0]["las"]
+    for s in samples:
+        if sum(s["las"].values()) >= 2 * 1024 * 1024:
+            return False
+        if (
+            sum(max(0, value - baseline.get(k, value)) for k, value in s["las"].items())
+            > 128 * 1024
+        ):
+            return False
+    return True
+
+
+class Monitor:
+    def __init__(self, path):
+        self.path, self.samples, self.stop = path, [], threading.Event()
+        self.thread = threading.Thread(target=self.run, daemon=True)
+
+    def run(self):
+        with self.path.open("w") as f:
+            while not self.stop.is_set():
+                sample = sample_memory()
+                self.samples.append(sample)
+                f.write(json.dumps(sample) + "\n")
+                f.flush()
+                if ram_safe(self.samples) is False:
+                    os.kill(os.getpid(), signal.SIGUSR1)
+                    return
+                self.stop.wait(1)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *args):
+        self.stop.set()
+        self.thread.join()
+
+
+@contextlib.contextmanager
+def server(args, arm, fault=None):
+    # Refuse any pre-existing listener. Never attach to or stop somebody else's.
+    with socket.socket() as sock:
+        if sock.connect_ex(("127.0.0.1", args.port)) == 0:
+            raise RuntimeError("dedicated test port is already occupied")
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("VLLM_", "C4140_"))}
+    env.update(FLAGS)
+    if fault:
+        env["VLLM_HOST_PARKING_FAULT_INJECT"] = "1"
+    env.pop("TRITON_INTERPRET", None)
+    env["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
+    env["PYTHONPATH"] = str(args.worktree)
+    args.parking = arm.startswith("on") or bool(fault)
+    cmd = command(args, arm, fault)
+    write(
+        args.out / (arm + ".argv.json"),
+        {
+            "argv": cmd,
+            "env": {
+                k: env[k]
+                for k in set(FLAGS)
+                | ({"VLLM_HOST_PARKING_FAULT_INJECT"} if fault else set())
+            },
+            "pythonpath": str(args.worktree),
+            "gpu_blocks": args.gpu_blocks,
+        },
+    )
+    logpath = args.out / (arm + ".serve.log")
+    with logpath.open("w") as log:
+        child = subprocess.Popen(
+            cmd, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+        )
+        try:
+            end = time.monotonic() + 900
+            while time.monotonic() < end:
+                if child.poll() is not None:
+                    raise RuntimeError(
+                        f"{arm} exited during startup: {child.returncode}"
+                    )
+                try:
+                    http(args, "/health", timeout=2)
+                    break
+                except Exception:
+                    time.sleep(1)
+            else:
+                raise TimeoutError(f"{arm} startup exceeded 900 s")
+            write(args.out / (arm + ".numa.json"), numa_pools(logpath))
+            signal.alarm(2700)
+            yield logpath
+        finally:
+            signal.alarm(0)
+            # Only the session created above, and only when lead executes GO.
+            if child.poll() is None:
+                os.killpg(child.pid, signal.SIGTERM)
+                try:
+                    child.wait(timeout=90)
+                except subprocess.TimeoutExpired:
+                    os.killpg(child.pid, signal.SIGKILL)
+                    child.wait(timeout=30)
+
+
+def timed_command(cmd, env, path, seconds):
+    write(str(path) + ".argv.json", {"argv": cmd, "timeout_seconds": seconds})
+    with Path(path).open("w") as log:
+        process = subprocess.Popen(
+            cmd, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+        )
+        try:
+            rc = process.wait(timeout=seconds)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=15)
+    if rc:
+        raise RuntimeError(f"command failed rc={rc}; {path}")
+
+
+def traffic(args, arm):
+    path = args.out / (arm + ".traffic.json")
+    cmd = [
+        str(args.python),
+        str(args.repo / "scripts/c4140-ab/team_traffic_workload.py"),
+        "--base-url",
+        f"http://127.0.0.1:{args.port}",
+        "--model",
+        MODEL,
+        "--users",
+        "10",
+        "--plan-file",
+        str(args.plan),
+        "--out",
+        str(path),
+        "--label",
+        "m37-" + arm,
+        "--metrics-interval",
+        "1",
+        "--server-prompt-tokens-details",
+        "--timeout-s",
+        "1200",
+        "--greedy",
+    ]
+    timed_command(cmd, os.environ.copy(), args.out / (arm + ".traffic.out"), 1800)
+    return json.loads(path.read_text())
+
+
+def event_rows(log):
+    rows = []
+    for line in Path(log).read_text(errors="replace").splitlines():
+        if "HOST_PARKING load_timing " in line:
+            rows.append(json.loads(line.split("HOST_PARKING load_timing ", 1)[1]))
+    return rows
+
+
+def join_loads(rows, events):
+    for row in rows:
+        found = [e for e in events if row["request_id"] in e["request_id"]]
+        row["loads"] = found
+        successful = [e for e in found if e["success"]]
+        row["restored_tokens"] = sum(e["external_tokens"] for e in successful)
+        if successful:
+            row["arrival_to_h2d_observed_s"] = (
+                max(e["all_rank_events_observed_ns"] for e in successful)
+                - row["arrival_ns"]
+            ) / 1e9
+    return rows
+
+
+def run(args):
+    args.out.mkdir(parents=True, exist_ok=False)
+    write(
+        args.out / "prereg.json",
+        {
+            "order": ORDER,
+            "restore_count_c1": 100,
+            "restore_count_c10": 100,
+            "latency_limits_s": {"p50": 2.0, "p99": 4.0},
+            "fixed_cases": 12,
+            "chains": 3,
+            "turns_per_chain": 4,
+            "max_output_tokens": 128,
+            "host_config": config(),
+            "gpu_blocks": args.gpu_blocks,
+            "git_tip": subprocess.check_output(
+                ["git", "-C", str(args.worktree), "rev-parse", "HEAD"], text=True
+            ).strip(),
+        },
+    )
+    env = os.environ.copy()
+    env.update(
+        CUDA_VISIBLE_DEVICES="0,1,2,3",
+        TMPDIR="/data/tmp",
+        PYTHONPATH=str(args.worktree),
+    )
+    env.pop("TRITON_INTERPRET", None)
+    with Monitor(args.out / "memory.jsonl") as monitor:
+        raw = [
+            str(args.python),
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc_per_node=4",
+            str(args.worktree / "benchmarks/host_parking_roundtrip.py"),
+            "--execute-gpu",
+            "--output",
+            str(args.out / "raw-rank{rank}.json"),
+        ]
+        timed_command(raw, env, args.out / "raw.out", 600)
+        for arm in ORDER:
+            if ram_safe(monitor.samples) is False:
+                raise RuntimeError("RAM/las stop threshold exceeded")
+            with server(args, arm) as log:
+                started = time.time()
+                cases = suite(args)
+                reset(args, True)
+                before, counters_before = metrics(args)
+                (args.out / (arm + ".metrics-before")).write_text(before)
+                t0 = time.time()
+                traffic(args, arm)
+                settle(args)
+                after, counters_after = metrics(args)
+                (args.out / (arm + ".metrics-after")).write_text(after)
+                duration = time.time() - t0
+                restored = returns(args, arm, arm == "on1")
+                settle(args)
+                join_loads(cases + restored, event_rows(log))
+                write(args.out / (arm + ".cases.json"), cases)
+                write(args.out / (arm + ".returns.json"), restored)
+                write(
+                    args.out / (arm + ".copy.json"),
+                    {
+                        "wall_s": duration,
+                        "delta": {
+                            k: counters_after.get(k, 0) - counters_before.get(k, 0)
+                            for k in set(counters_before) | set(counters_after)
+                        },
+                        "cell_s": time.time() - started,
+                    },
+                )
+        for mode in ("pre_submit", "completed_copy"):
+            arm = "fault-" + mode
+            with server(args, arm, mode) as log:
+                tokens = prompt(args, 32769, arm)
+                producer = complete(args, tokens, "producer", count=1)
+                reset(args)
+                first_return = complete(args, tokens, "first-good-return", count=1)
+                reset(args)
+                failed_return = complete(args, tokens, "injected-return", count=1)
+                reset(args)
+                miss_return = complete(args, tokens, "failed-key-retry", count=1)
+                # Do not assume a 200 is proof: require native snapshot_discard.
+                followup = complete(
+                    args, prompt(args, 4095, arm + "-unrelated"), "unrelated", count=1
+                )
+                reset(args, True)
+                after_reset = complete(args, tokens, "after-reset", count=1)
+                reset(args)
+                aborts = [abort_attempt(args, tokens, log, "H2D")]
+                reset(args, True)
+                aborts.append(
+                    abort_attempt(
+                        args, prompt(args, 131073, arm + "-abort"), log, "D2H"
+                    )
+                )
+                final = complete(
+                    args, prompt(args, 4097, arm + "-final"), "after-aborts", count=1
+                )
+                settle(args)
+                cases = [
+                    producer,
+                    failed_return,
+                    followup,
+                    after_reset,
+                    final,
+                    first_return,
+                    miss_return,
+                ]
+                join_loads(cases, event_rows(log))
+                write(args.out / (arm + ".json"), {"cases": cases, "aborts": aborts})
+    return analyze(args.out)
+
+
+def gate(status, reason, **data):
+    return {"status": status, "reason": reason, **data}
+
+
+def analyze(out):
+    # Imported late so --plan does not need any engine libraries or a GPU.
+    from host_parking_judge import judge
+
+    result = judge(out)
+    write(out / "gates.json", result)
+    text = "| Gate | Result | Reason |\n|---|---|---|\n"
+    for key, value in result["gates"].items():
+        text += f"| {key} | {value['status']} | {value['reason']} |\n"
+    (out / "gates.md").write_text(text)
+    return result
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--execute", action="store_true")
+    p.add_argument("--analyze", action="store_true")
+    p.add_argument("--out", type=Path, default=Path("/data/bench/m37"))
+    p.add_argument("--port", type=int, default=18037)
+    p.add_argument("--gpu-blocks", type=int, default=1800)
+    p.add_argument(
+        "--python",
+        type=Path,
+        default=Path("/data/venvs/1cat-main-integp7pr-p8/bin/python"),
+    )
+    p.add_argument("--worktree", type=Path, default=Path(__file__).resolve().parents[1])
+    p.add_argument(
+        "--repo", type=Path, default=Path("/home/cookys/projects/llm-playground")
+    )
+    p.add_argument("--plan", type=Path, default=Path("/data/bench/m19/Ap_c10fit.json"))
+    a = p.parse_args()
+    if a.port in (8001, 8021) or not 1024 <= a.port <= 65535:
+        p.error("dedicated unprivileged test port required; 8001/8021 forbidden")
+    if a.analyze:
+        print(json.dumps(analyze(a.out), indent=2))
+        return
+    if not a.execute:
+        print(
+            json.dumps(
+                {
+                    "status": "PLAN_ONLY",
+                    "order": ORDER,
+                    "out": str(a.out),
+                    "argv_off": command(a, "off1"),
+                    "argv_on": command(a, "on1"),
+                    "estimate_minutes": [90, 150],
+                    "outer_timeout_s": 10800,
+                },
+                indent=2,
+            )
+        )
+        return
+    if os.environ.get("M37_GO") != "1":
+        p.error("lead window requires explicit M37_GO=1")
+
+    def interrupted(signum, frame):
+        raise TimeoutError(f"window interruption {signum}; cleaning owned children")
+
+    for sig in (signal.SIGALRM, signal.SIGTERM, signal.SIGUSR1):
+        signal.signal(sig, interrupted)
+    baseline_oom = cgroup_oom()
+    try:
+        result = run(a)
+    except BaseException as e:
+        if a.out.is_dir():
+            write(a.out / "window-error.json", {"error": repr(e)})
+            write(
+                a.out / "cgroup-events.json",
+                {
+                    "before": baseline_oom,
+                    "after": cgroup_oom(),
+                    "oom_delta": cgroup_oom() - baseline_oom,
+                },
+            )
+            analyze(a.out)
+        raise
+    write(
+        a.out / "cgroup-events.json",
+        {
+            "before": baseline_oom,
+            "after": cgroup_oom(),
+            "oom_delta": cgroup_oom() - baseline_oom,
+        },
+    )
+    result = analyze(a.out)
+    print(json.dumps(result, indent=2))
+    if result["status"] != "PASS":
+        raise SystemExit(2)
+
+
+if __name__ == "__main__":
+    main()

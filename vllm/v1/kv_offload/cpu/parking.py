@@ -5,6 +5,7 @@
 import ctypes
 import hashlib
 import json
+import os
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 
@@ -40,13 +41,22 @@ class ParkingConfig:
         fault = extra.get("parking_test_fail_direction")
         if fault is not None and (
             extra.get("parking_validation") is not True
+            or os.environ.get("VLLM_HOST_PARKING_FAULT_INJECT") != "1"
             or fault not in ("GPU_to_CPU", "CPU_to_GPU")
             or extra.get("parking_test_fail_mode")
             not in ("pre_submit", "completed_copy")
         ):
             raise ValueError(
-                "copy fault injection requires explicit parking_validation"
+                "copy fault injection requires parking_validation and "
+                "VLLM_HOST_PARKING_FAULT_INJECT=1 with a known mode"
             )
+        if fault is not None:
+            rank = extra.get("parking_test_fail_rank", 0)
+            nth = extra.get("parking_test_fail_nth", 1)
+            if type(rank) is not int or not 0 <= rank < 4:
+                raise ValueError("parking_test_fail_rank must be in [0,4)")
+            if type(nth) is not int or nth < 1:
+                raise ValueError("parking_test_fail_nth must be positive")
         return cls(size, node)
 
 

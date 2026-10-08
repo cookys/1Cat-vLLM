@@ -3,6 +3,8 @@
 """27B NVFP4 + DFlash2 native-connector parking proof of concept."""
 
 import fcntl
+import json
+import os
 from pathlib import Path
 
 from vllm.logger import init_logger
@@ -95,7 +97,7 @@ class HostParkingSpec(CPUOffloadingSpec):
 
         manager = super().get_manager()
         if not isinstance(manager, ParkingManager):
-            self._manager = ParkingManager(manager)
+            self._manager = ParkingManager(manager, self.cpu_group_page_sizes)
         return self._manager
 
     def validate_layers(self):
@@ -148,6 +150,10 @@ class HostParkingSpec(CPUOffloadingSpec):
                     group_num_blocks=self.cpu_group_num_blocks,
                     cpu_tensor_factory=pool.allocate,
                 )
+                logger.info(
+                    "HOST_PARKING pool_usage %s",
+                    json.dumps({"pid": os.getpid(), **pool.stats()}, sort_keys=True),
+                )
             except Exception:
                 pool.close()
                 raise
@@ -160,7 +166,9 @@ class HostParkingSpec(CPUOffloadingSpec):
         if fault:
             from vllm.distributed import get_tensor_model_parallel_rank
 
-            if get_tensor_model_parallel_rank() != 0:
+            if get_tensor_model_parallel_rank() != self.extra_config.get(
+                "parking_test_fail_rank", 0
+            ):
                 fault = None
         for name, direction in (
             ("gpu_to_cpu_handler", "GPU_to_CPU"),
@@ -169,7 +177,9 @@ class HostParkingSpec(CPUOffloadingSpec):
             inner = getattr(handlers, name)
             if fault == direction:
                 inner = ValidationFaultHandler(
-                    inner, self.extra_config["parking_test_fail_mode"]
+                    inner,
+                    self.extra_config["parking_test_fail_mode"],
+                    nth=self.extra_config.get("parking_test_fail_nth", 1),
                 )
             setattr(handlers, name, RecoveringHandler(inner, pool))
         return handlers

@@ -725,11 +725,13 @@ def test_validation_fault_wraps_native_inner_one_rank_only(monkeypatch, mode):
         assert h.get_finished()[0].success
 
 
-def test_validation_injection_is_explicit_and_known_mode():
+def test_validation_injection_is_explicit_and_known_mode(monkeypatch):
+    monkeypatch.delenv("VLLM_HOST_PARKING_FAULT_INJECT", raising=False)
     with pytest.raises(ValueError, match="validation"):
         ParkingConfig.parse(
             {"host_parking": True, "parking_test_fail_direction": "CPU_to_GPU"}
         )
+    monkeypatch.setenv("VLLM_HOST_PARKING_FAULT_INJECT", "1")
     for mode in ("pre_submit", "completed_copy"):
         ParkingConfig.parse(
             {
@@ -810,3 +812,67 @@ def test_load_timing_only_emits_after_all_rank_events(monkeypatch):
     assert payload["arrival_ns"] == 1_000_000_000
     assert payload["all_rank_events_observed_ns"] == 1_500_000_000
     assert payload["external_tokens"] == 8192 and payload["success"]
+
+
+@pytest.mark.parametrize("mode", ["pre_submit", "completed_copy"])
+def test_fault_nth_targets_submission_not_completion_order(monkeypatch, mode):
+    from vllm.v1.kv_offload.cpu.parking_transfer import ValidationFaultHandler
+
+    monkeypatch.setattr(torch.cuda, "synchronize", MagicMock())
+    n = FakeHandler()
+    h = RecoveringHandler(ValidationFaultHandler(n, mode, nth=2))
+    h.transfer_async(17, None)
+    n.result = [TransferResult(17, True)]
+    assert h.get_finished()[0].success
+    h.transfer_async(23, None)
+    if mode == "completed_copy":
+        assert h.get_finished() == []
+        n.result = [TransferResult(23, True)]
+    assert not h.get_finished()[0].success
+    h.transfer_async(29, None)
+    n.result = [TransferResult(29, True)]
+    assert h.get_finished()[0].success
+
+
+def test_logical_occupancy_returns_to_empty_on_reset():
+    native = GroupedCPUOffloadingManager(
+        {0: CPUOffloadingManager(4), 1: CPUOffloadingManager(3)}
+    )
+    m = ParkingManager(native, {0: 1024, 1: 2048})
+    context = ReqContext("quota")
+    keys = [key(0, 1), key(1, 1)]
+    baseline = m.stats()
+    assert baseline["in_use_slots"] == 0 and baseline["in_use_bytes_per_rank"] == 0
+    m.prepare_store(keys, context)
+    assert m.stats()["in_use_slots"] == 2
+    m.complete_store(keys, context)
+    m.prepare_load(keys, context)
+    assert m.stats()["read_write_refs"] == 2
+    m.complete_load(keys, context)
+    m.invalidate(keys)
+    assert all(m.lookup(k, context) is False for k in keys)
+    assert m.invalid_lookup_count == 2
+    m.reset_cache()
+    assert m.stats() == baseline
+
+
+def test_pool_physical_view_counters(monkeypatch):
+    from vllm.v1.kv_offload.cpu.parking_pool import ParkingPool
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "cudart",
+        lambda: NS(
+            cudaHostRegister=lambda *args: NS(value=0),
+            cudaHostUnregister=lambda *args: NS(value=0),
+        ),
+    )
+    p = ParkingPool(8192)
+    assert p.stats()["in_use_bytes"] == 0
+    view = p.allocate(3, 1024)
+    assert p.stats()["in_use_bytes"] == 3072 and p.stats()["in_use_slots"] == 3
+    del view
+    p.release_direction()
+    p.release_direction()
+    assert p.stats()["in_use_bytes"] == p.stats()["in_use_slots"] == 0
+    assert not p.stats()["pinned"]

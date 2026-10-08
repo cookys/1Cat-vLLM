@@ -102,18 +102,24 @@ class ValidationFaultHandler:
     All native queues/events remain authoritative and are delegated unchanged.
     """
 
-    def __init__(self, inner, mode):
+    def __init__(self, inner, mode, nth=1):
         if mode not in ("pre_submit", "completed_copy"):
             raise ValueError("unknown parking validation fault mode")
         self.inner = inner
         self.mode = mode
         self.armed = True
+        self.nth = nth
+        self.submissions = 0
+        self.target_job = None
 
     def __getattr__(self, name):
         return getattr(self.inner, name)
 
     def transfer_async(self, job_id, spec):
-        if self.armed and self.mode == "pre_submit":
+        self.submissions += 1
+        if self.submissions == self.nth:
+            self.target_job = job_id
+        if self.armed and self.mode == "pre_submit" and job_id == self.target_job:
             self.armed = False
             logger.warning(
                 "HOST_PARKING injected_failure mode=pre_submit job=%d", job_id
@@ -123,12 +129,16 @@ class ValidationFaultHandler:
 
     def get_finished(self):
         results = self.inner.get_finished()
-        if self.armed and self.mode == "completed_copy" and results:
-            self.armed = False
-            first = results[0]
-            results[0] = TransferResult(job_id=first.job_id, success=False)
-            logger.warning(
-                "HOST_PARKING injected_failure mode=completed_copy job=%d",
-                first.job_id,
-            )
+        for i, result in enumerate(results):
+            if (
+                self.armed
+                and self.mode == "completed_copy"
+                and result.job_id == self.target_job
+            ):
+                self.armed = False
+                results[i] = TransferResult(job_id=result.job_id, success=False)
+                logger.warning(
+                    "HOST_PARKING injected_failure mode=completed_copy job=%d",
+                    result.job_id,
+                )
         return results

@@ -251,3 +251,78 @@ unprofiled S cells as the speed denominator. Failure counters are the explicit
 - Raw probe now covers shuffled multi-block transfers; generation and abort
   CPU tests are separate evidence. Gate 7 still needs real serving reset/abort
   cases in the window; CPU success alone is not a GPU PASS.
+
+## Third-review handoff: m37 contract (2026-10-09)
+
+Test runner: `benchmarks/host_parking_window.py` and CPU judge
+`benchmarks/host_parking_judge.py`. Entrypoint (scratch, lead executes only):
+`/data/bench/ab/m37-parking.sh`. A bare invocation emits a CPU-only JSON plan;
+`M37_GO=1 bash /data/bench/ab/m37-parking.sh --execute` uses its own localhost
+18037 test server. Production down/restore belongs to lead's wrapper. The
+script uses a 48 GiB / 16-CPU fence (reduced by system reserve), 3-hour outer
+cap, 900-second startup cap and 2700-second per-cell cap. Estimated 90–150
+minutes is unmeasured. It has never been run on GPU by Astra.
+
+The test matrix is OFF/ON/ON/OFF/OFF/ON, fixed 1800 GPU block IDs in both arms,
+P7 grouped+BATCHED, P8 absent/zero. Each arm runs 12 synthetic fixed-seed parity
+cases plus 3×4 append/return chains, the frozen m19 c10fit plan, one 262000-token
+return and a ten-request 32768-token return. ON1 additionally attempts 100 c1
+returns and 10 c10 bursts (100 returns). An attempt counts for latency only if
+external-token telemetry proves restoration of at least prompt length−4096.
+Tiny surviving prefixes, unsuccessful copies and cold recomputations cannot
+inflate the sample count. Missing evidence yields INCONCLUSIVE; a numerical
+threshold violation yields FAIL. No result automatically promotes production.
+
+For these quota-fitting tests only, set the existing
+`mamba_state_slots_reference_tokens=32768`: real CPU allocator yields 36 slots
+per GDN group and 91 each for main attention / draft SW, aggregate **17,170,956,288
+bytes**, below 16 GiB. The default 262K reference still yields 9/152/152. This is
+an explicit experimental pool mix, not an increase in host budget. Independent
+LRUs and intermediate SW suffixes can still prevent full c10 restoration; that
+is a utility FAIL, not permission to silently measure only the hits.
+
+Gate-4 copy occupancy is the **mean TP-rank union of same-direction job-event
+intervals**: native `gpu_worker.py` serializes each direction using the previous
+end event, so sum(D2H durations)/(4×cell wall time) is this mean. It is not the
+cross-rank union, a copy-engine-utilization counter, or joint bidirectional
+occupancy. Both metric endpoints are taken after six seconds with unchanged
+transfer counters and zero running/waiting requests. Native stats aggregate
+all ranks. Save raw `/metrics` endpoints and directional byte deltas.
+
+Fault injection now requires **both** explicit config and
+`VLLM_HOST_PARKING_FAULT_INJECT=1`. `parking_test_fail_rank` is an integer 0–3;
+`parking_test_fail_nth` selects the Nth submission in that direction (not the
+Nth completion). m37 injects the **second H2D job on rank 1**, once per process,
+for each of `pre_submit` and `completed_copy`. It first obtains a successful
+return, then forces the affected return, retries the same key, sends an
+unrelated request, resets both caches and tests aborts. The judge requires
+failed-rank count 1, failed H2D telemetry, matching recomputed output IDs,
+unrelated success, `invalid_lookup_miss`, zero logical quota after reset,
+four pool-release logs at teardown, and actual abort-with-pending-load/store
+logs. Timing-sensitive aborts that never overlap a copy are INCONCLUSIVE.
+Actual device-loss/fatal-rank injection remains a separate isolated test;
+these wrappers deliberately do not poison CUDA or kill a TP worker.
+
+Two types of counters must not be confused:
+
+- `ParkingPool.stats()` reports physical view reservations (`in_use_bytes`,
+  `in_use_slots`), fixed pinned capacity and direction owners. They go to zero
+  only after both directions drain and unregister; raw allocation stays fixed
+  while a server is alive. `registered` logs include exact mapping base/size
+  so m37 can inspect that mapping's `/proc/PID/numa_maps` entry.
+- `ParkingManager.stats()` reports logical resident slots/bytes per rank,
+  live read/write refs and failed-key tombstones. A failed read can retain its
+  tombstoned LRU slot until eviction (no unsafe reuse while another reader
+  holds it). After quiescent external reset, all four values must be zero.
+
+Avoided-prefill evidence in this first window uses a deliberate **GPU-prefix
+reset, host-cache retained** surrogate with identical OFF/ON inputs. This
+isolates transport/restore utility. It does not establish natural-LRU or
+20-user capacity benefit; that needs a later pressure/idle trace. The JSON/MD
+labels this limitation and always records `production_go=false`.
+
+CPU reproduction log now includes shell-expanded complete command and venv:
+`/data/bench/astra-host-parking/tests-review-final.log`, generated by
+`/data/bench/astra-host-parking/test-review.sh`. Latest suite includes parking,
+window judge, native CPU/grouped managers, native connector scheduler and
+worker metadata. Do not substitute a different venv and compare test counts.
