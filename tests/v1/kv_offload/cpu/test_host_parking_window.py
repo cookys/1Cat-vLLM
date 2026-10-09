@@ -451,10 +451,10 @@ def test_arm_budgets_and_outer_cap_cover_selected_inner_deadlines():
     assert W.arm_timeout(a, "on1") == 5400
     assert W.arm_timeout(a, "on2") == 2700
     assert W.arm_timeout(a, W.FAULT_ARMS[0]) == 1500
-    assert W.window_budget(a) == 12360
-    assert W.window_budget(a) > sum(W.arm_timeout(a, x) + 1140 for x in a.arms)
+    assert W.window_budget(a) == 12450
+    assert W.window_budget(a) > sum(W.arm_timeout(a, x) + 1170 for x in a.arms)
     a.on1_timeout_s = 6000
-    assert W.window_budget(a) == 12960
+    assert W.window_budget(a) == 13050
 
 
 def test_window_deadline_is_not_swallowed_as_request_failure(monkeypatch):

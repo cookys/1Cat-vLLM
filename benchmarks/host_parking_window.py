@@ -32,6 +32,9 @@ LEGACY_ARM = "legacy-c10"
 CELL_ARMS = ORDER + (LEGACY_ARM,)
 ALL_ARMS = CELL_ARMS + FAULT_ARMS
 DEFAULT_ARMS = ORDER + FAULT_ARMS
+ENGINE_SHUTDOWN_S = 90
+GRACEFUL_SHUTDOWN_S = 120
+FORCED_SHUTDOWN_S = 30
 
 
 class WindowInterrupted(BaseException):
@@ -53,14 +56,16 @@ def arm_timeout(args, arm):
 
 
 def window_budget(args):
-    # Per-server: import 120 + startup 900 + cleanup 120. Raw preflight includes
+    # Per-server: import 120 + startup 900 + cleanup 120+30. Raw preflight includes
     # the negative provenance control. Keep the outer cap above the inner sum.
     arms = getattr(args, "arms", DEFAULT_ARMS)
     return (
         240
         + (0 if getattr(args, "skip_raw", False) else 600)
         + sum(
-            (0 if arm == LEGACY_ARM else 1140) + arm_timeout(args, arm) for arm in arms
+            (0 if arm == LEGACY_ARM else 1020 + GRACEFUL_SHUTDOWN_S + FORCED_SHUTDOWN_S)
+            + arm_timeout(args, arm)
+            for arm in arms
         )
         + 300
     )
@@ -287,6 +292,9 @@ def command(args, arm, fault=None):
         "--speculative-config",
         json.dumps(SPEC),
         "--enable-prompt-tokens-details",
+        # Zero (the upstream default) kills EngineCore before worker cleanup.
+        "--shutdown-timeout",
+        str(ENGINE_SHUTDOWN_S),
     ]
     if arm.startswith("on") or fault or arm == LEGACY_ARM:
         cfg = config(
@@ -641,6 +649,128 @@ class Monitor:
         self.thread.join()
 
 
+def session_processes(session_id, proc_root=Path("/proc")):
+    """Only live processes in the fresh session created by our Popen.
+
+    Retain start ticks for PID-reuse checks; zombies have already exited and
+    cannot hold a CUDA registration. Descendants may use a separate PGID.
+    """
+    found = {}
+    for path in proc_root.iterdir():
+        if not path.name.isdigit():
+            continue
+        try:
+            stat = path.joinpath("stat").read_text()
+            comm, fields = stat.rsplit(")", 1)
+            fields = fields.split()
+            if int(fields[3]) != session_id or fields[0] in ("Z", "X"):
+                continue
+            pid = int(path.name)
+            found[pid] = dict(
+                pid=pid,
+                start_ticks=int(fields[19]),
+                pgid=int(fields[2]),
+                session_id=int(fields[3]),
+                name=comm.split("(", 1)[1],
+            )
+        except (FileNotFoundError, ProcessLookupError):
+            continue  # A process exited during the scan.
+    return found
+
+
+def graceful_shutdown(child, logpath, report_path, *, parking):
+    """Signal only the API parent; wait for EngineCore/TP workers to clean up.
+
+    --shutdown-timeout gives EngineCore its own graceful budget. Sending TERM
+    to the whole group bypasses this ordering. Force only a still-owned group
+    after the deadline. Missing release logs remain missing evidence, never a
+    synthetic pool_released line or a replacement for the unchanged G7 judge.
+    """
+    started = time.monotonic()
+    report = dict(
+        api_pid=child.pid,
+        started_epoch_ns=time.time_ns(),
+        engine_timeout_s=ENGINE_SHUTDOWN_S,
+        graceful_timeout_s=GRACEFUL_SHUTDOWN_S,
+        forced_timeout_s=FORCED_SHUTDOWN_S,
+        signals=[],
+        observed_processes={},
+    )
+
+    def observe():
+        # Reap the direct child even if its descendants are still cleaning up.
+        child.poll()
+        live = session_processes(child.pid)
+        for pid, entry in live.items():
+            report["observed_processes"][f"{pid}:{entry['start_ticks']}"] = entry
+        return live
+
+    def record():
+        write(report_path, report)
+
+    try:
+        live = observe()
+        parent = live.get(child.pid)
+        if child.poll() is None:
+            if parent is None:
+                raise RuntimeError("refuse shutdown: child is not in its owned session")
+            child.terminate()  # PID only: API -> engine -> worker death pipes.
+            report["signals"].append(dict(pid=child.pid, signal="SIGTERM"))
+        record()
+        deadline = started + GRACEFUL_SHUTDOWN_S
+        while live or child.poll() is None:
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+            live = observe()
+        report["graceful"] = not live and child.poll() is not None
+        if not report["graceful"]:
+            report["deadline_processes"] = list(live.values())
+            record()
+            # Rescan identities immediately before escalation. Never signal
+            # a PID/group found only in a stale snapshot or outside this SID.
+            current = observe()
+            groups = {
+                entry["pgid"]
+                for pid, entry in current.items()
+                if pid in live and live[pid]["start_ticks"] == entry["start_ticks"]
+            }
+            for pgid in sorted(groups):
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    continue
+                report["signals"].append(dict(pgid=pgid, signal="SIGKILL"))
+            force_deadline = time.monotonic() + FORCED_SHUTDOWN_S
+            while current or child.poll() is None:
+                if time.monotonic() >= force_deadline:
+                    raise RuntimeError(
+                        "owned server processes survived forced shutdown"
+                    )
+                time.sleep(0.1)
+                current = observe()
+        report["status"] = "graceful" if report["graceful"] else "forced"
+        child.wait(timeout=1)
+    except BaseException as error:
+        report["error"] = repr(error)
+        raise
+    finally:
+        text = logpath.read_text(errors="replace")
+        released = sorted(
+            {
+                int(pid)
+                for pid in re.findall(r"HOST_PARKING pool_released pid=(\d+)", text)
+            }
+        )
+        report.update(
+            elapsed_s=time.monotonic() - started,
+            returncode=child.poll(),
+            pool_released_pids=released,
+            all_rank_pool_release=(len(released) >= 4) if parking else None,
+        )
+        record()
+
+
 @contextlib.contextmanager
 def server(args, arm, fault=None):
     arm_started = time.monotonic()
@@ -696,8 +826,8 @@ def server(args, arm, fault=None):
             seconds = arm_timeout(args, arm)
             if arm == LEGACY_ARM:
                 # Reserve at most 120 s for outstanding short HTTP work and
-                # 120 s for owned-child cleanup within the 15-minute envelope.
-                seconds = max(1, int(900 - (time.monotonic() - arm_started) - 240))
+                # 150 s for owned-child cleanup within the 15-minute envelope.
+                seconds = max(1, int(900 - (time.monotonic() - arm_started) - 270))
             write(
                 args.out / (arm + ".deadline.json"),
                 dict(seconds=seconds, armed_epoch_ns=time.time_ns()),
@@ -706,14 +836,12 @@ def server(args, arm, fault=None):
             yield logpath
         finally:
             signal.alarm(0)
-            # Only the session created above, and only when lead executes GO.
-            if child.poll() is None:
-                os.killpg(child.pid, signal.SIGTERM)
-                try:
-                    child.wait(timeout=90)
-                except subprocess.TimeoutExpired:
-                    os.killpg(child.pid, signal.SIGKILL)
-                    child.wait(timeout=30)
+            graceful_shutdown(
+                child,
+                logpath,
+                args.out / (arm + ".shutdown.json"),
+                parking=args.parking,
+            )
 
 
 def timed_command(cmd, env, path, seconds, cwd=None, expected_rc=0):
@@ -1181,6 +1309,12 @@ def main():
                     "argv_on": command(a, "on1"),
                     "arm_timeout_s": {arm: arm_timeout(a, arm) for arm in a.arms},
                     "outer_timeout_s": window_budget(a),
+                    "parking_diagnostics": a.parking_diagnostics,
+                    "shutdown_seconds": dict(
+                        engine=ENGINE_SHUTDOWN_S,
+                        graceful=GRACEFUL_SHUTDOWN_S,
+                        forced=FORCED_SHUTDOWN_S,
+                    ),
                     "note": (
                         "Hard timeout sum, not an expected duration; "
                         "subset cannot close missing full-matrix gates"
