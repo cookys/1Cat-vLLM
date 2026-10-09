@@ -87,6 +87,8 @@ B3：--prefill-cadence-decode-steps 3
 
 ### 4.1 固定到達、時間預算與加格規則
 
+**分組順序（看資料前固定，lead 2026-10-09裁定）**：第一组先跑OFF vs k1 × c10，共8格`A B B A / B A A B`；之後依序k1×c10fit、k3×c10、k3×c10fit。各組独立交結果；未執行組保持INCONCLUSIVE，不由第一组外推。第一组runner由Fable主筆、Astra核cold/readout契約。
+
 cold cohort：每格保持同樣c10 resident decode負載，t=0起每60秒送一筆salted cold，128K與200K交替，共20筆(各10)。兩臂用同一到達表，原始arrival不隨前一筆完成時間延後；若容量不支持既定cohort，記前置NO-GO，不臨場改admission。每筆deadline=arrival+900s，最後到達t=1140s，最晚t=2040s結束。每秒由原始arrival/first-token事件重建Q；對t=300,360,…,1140的每個時間點，用其前10秒的Q均值作OLS樣本，避免與瞬間arrival排序相撞。此有限窗口的queue不增長不等於長期穩定性的證明。正式step分析區間涵蓋team及cold流量，排除warmup/drain。
 
 **時長是工程預算，尚未實測cadence**：m34 `off{1,2,3}.json` 原始requests的max(t_end_rel)−min(t_send_rel)=1483.7–1500.6s，即team約25分鐘。預留每格team 25–35min + cold 20–34min +啟動/loader/reset 5–15min，約50–84min/格；一個k×plan的8格約6.7–11.2h，完整32格約27–45h，另加初次編譯/parity與logOFF方向檢查。這不是一個短GPU窗：lead可先排一組，未跑的組仍INCONCLUSIVE。每格hard cap=90min，外層依格數另加還原餘裕，不共用單一短alarm。
