@@ -10,7 +10,7 @@ shrink, allocate nothing, and never lose or reorder blocks.
 """
 import pytest, torch
 from tests.v1.core import utils
-from tests.v1.core.test_mixed_prefill_budget import factory, complete  # noqa
+from tests.v1.core.test_mixed_prefill_budget import factory  # noqa  (pytest fixture)
 from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.outputs import ModelRunnerOutput
 
@@ -23,7 +23,7 @@ def out(s, step, n_acc=1):
     return ModelRunnerOutput(req_ids=ids, req_id_to_index={r: i for i, r in enumerate(ids)}, sampled_token_ids=toks)
 
 @pytest.mark.parametrize("skip_at", [None, 0, 1, 2, 3, 4, 5, 6])
-def test_skipped_decoder_required_blocks_must_not_shrink(factory, skip_at):
+def test_skipped_decoder_required_blocks_must_not_shrink(factory, skip_at, monkeypatch):
     s = factory(target=0, async_scheduling=True, num_speculative_tokens=7,
                 block_size=B, max_num_batched_tokens=B, max_model_len=262144,
                 num_blocks=400,
@@ -47,16 +47,15 @@ def test_skipped_decoder_required_blocks_must_not_shrink(factory, skip_at):
         after = list(self.req_to_blocks[rid])
         log.append((rid, ntm, len(before), req, ret, before == after))
         return ret
-    MambaManager.allocate_new_blocks = spy
+    monkeypatch.setattr(MambaManager, "allocate_new_blocks", spy)
     for i in range(40):
         if skip_at is not None and i == skip_at:
             d.next_decode_eligible_step = s.current_step + 2   # one skipped step
         st = s.schedule()
-        nb = len(mgr.req_to_blocks["d"]) if "d" in mgr.req_to_blocks else 0
         if inflight is not None:
             s.update_from_output(*inflight)
         inflight = (st, out(s, st)) if st.num_scheduled_tokens else None
-    MambaManager.allocate_new_blocks = orig
+    monkeypatch.setattr(MambaManager, "allocate_new_blocks", orig)
     assert log, "allocate_new_blocks was never exercised"
     # (rid, ntm, len_before, required, returned, blocks_unchanged)
     shrinks = [l for l in log if l[3] < l[2]]
@@ -69,7 +68,7 @@ def test_skipped_decoder_required_blocks_must_not_shrink(factory, skip_at):
 
 
 @pytest.mark.parametrize("skip_at", [2, 3, 4])
-def test_starved_by_cold_prefill_budget(factory, skip_at):
+def test_starved_by_cold_prefill_budget(factory, skip_at, monkeypatch):
     s = factory(target=0, async_scheduling=True, num_speculative_tokens=7,
                 block_size=B, max_num_batched_tokens=B, max_model_len=262144,
                 num_blocks=400,
@@ -93,7 +92,7 @@ def test_starved_by_cold_prefill_budget(factory, skip_at):
         after = list(self.req_to_blocks[rid])
         log.append((rid, ntm, len(before), req, ret, before == after))
         return ret
-    MambaManager.allocate_new_blocks = spy
+    monkeypatch.setattr(MambaManager, "allocate_new_blocks", spy)
     for i in range(40):
         if skip_at is not None and i == skip_at:
             c = utils.create_requests(1, num_tokens=8 * B + 5, req_ids=["cold"], max_tokens=4, block_size=B)[0]
@@ -104,11 +103,10 @@ def test_starved_by_cold_prefill_budget(factory, skip_at):
             inflight = (st0, out(s, st0))
             s.running.sort(key=lambda r: r.request_id != "cold")   # cold ahead of d, like live order
         st = s.schedule()
-        nb = len(mgr.req_to_blocks["d"]) if "d" in mgr.req_to_blocks else 0
         if inflight is not None:
             s.update_from_output(*inflight)
         inflight = (st, out(s, st)) if st.num_scheduled_tokens else None
-    MambaManager.allocate_new_blocks = orig
+    monkeypatch.setattr(MambaManager, "allocate_new_blocks", orig)
     assert log, "allocate_new_blocks was never exercised"
     # (rid, ntm, len_before, required, returned, blocks_unchanged)
     shrinks = [l for l in log if l[3] < l[2]]
@@ -118,3 +116,45 @@ def test_starved_by_cold_prefill_budget(factory, skip_at):
     assert mgr.num_align_shrink_events == len(shrinks), (mgr.num_align_shrink_events, shrinks)
     if skip_at == 2:  # known to reproduce the shrink (verified pre-fix)
         assert shrinks, "scenario did not reproduce a shrink; test is vacuous"
+
+
+def _warm(factory):
+    s = factory(target=0, async_scheduling=True, num_speculative_tokens=7,
+                block_size=B, max_num_batched_tokens=B, max_model_len=262144,
+                num_blocks=400,
+                kv_cache_spec=MambaSpec(block_size=B, shapes=((1,),), dtypes=(torch.float16,),
+                                        mamba_cache_mode="align", num_speculative_blocks=7))
+    s.need_mamba_block_aligned_split = True
+    s.mamba_state_block_size = B
+    mgr = s.kv_cache_manager.coordinator.single_type_managers[0]
+    pool = mgr.block_pool
+    free0 = pool.get_num_free_blocks()
+    d = utils.create_requests(1, num_tokens=20 * B - 12, req_ids=["d"], max_tokens=512, block_size=B)[0]
+    s.add_request(d)
+    while d.num_output_tokens == 0:
+        s.update_from_output(*(lambda st: (st, out(s, st)))(s.schedule()))
+    return s, mgr, pool, free0
+
+
+def test_shrink_then_grow_allocates_and_frees_cleanly(factory):
+    s, mgr, pool, free0 = _warm(factory)
+    held = len(mgr.req_to_blocks["d"])
+    shrunk = (held - 7 - 2) * B           # required = held - 2 < held
+    assert mgr.allocate_new_blocks("d", shrunk, shrunk) == []
+    assert len(mgr.req_to_blocks["d"]) == held
+    grow = (held - 7) * B + 1             # required = held + 1
+    free_before = pool.get_num_free_blocks()
+    new = mgr.allocate_new_blocks("d", grow, grow)
+    assert len(new) == 1
+    assert len(mgr.req_to_blocks["d"]) == held + 1
+    assert pool.get_num_free_blocks() == free_before - 1
+    mgr.free("d")
+    assert "d" not in mgr.req_to_blocks
+    assert pool.get_num_free_blocks() == free0
+
+
+def test_get_num_blocks_to_allocate_never_negative_on_shrink(factory):
+    s, mgr, pool, free0 = _warm(factory)
+    held = len(mgr.req_to_blocks["d"])
+    shrunk = (held - 7 - 2) * B
+    assert mgr.get_num_blocks_to_allocate("d", shrunk, [], 0, shrunk) == 0
