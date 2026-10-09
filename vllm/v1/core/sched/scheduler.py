@@ -808,11 +808,33 @@ class Scheduler(SchedulerInterface):
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
-                    new_blocks = self.kv_cache_manager.allocate_slots(
-                        request,
-                        num_new_tokens,
-                        num_lookahead_tokens=self.num_lookahead_tokens,
-                    )
+                    try:
+                        new_blocks = self.kv_cache_manager.allocate_slots(
+                            request,
+                            num_new_tokens,
+                            num_lookahead_tokens=self.num_lookahead_tokens,
+                        )
+                    except AssertionError:
+                        logger.error(
+                            "MAMBA_ALIGN_SHRINK_CTX request_id=%s "
+                            "is_prefill_chunk=%s num_computed_tokens=%d "
+                            "num_output_placeholders=%d num_tokens=%d "
+                            "num_tokens_with_spec=%d num_new_tokens=%d "
+                            "num_lookahead_tokens=%d current_step=%d "
+                            "next_decode_eligible_step=%s hold_prefill=%s",
+                            request.request_id,
+                            getattr(request, "is_prefill_chunk", None),
+                            request.num_computed_tokens,
+                            getattr(request, "num_output_placeholders", -1),
+                            request.num_tokens,
+                            request.num_tokens_with_spec,
+                            num_new_tokens,
+                            self.num_lookahead_tokens,
+                            self.current_step,
+                            getattr(request, "next_decode_eligible_step", None),
+                            hold_prefill,
+                        )
+                        raise
 
                     if new_blocks is not None:
                         # The request can be scheduled.

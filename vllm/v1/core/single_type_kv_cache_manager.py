@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
 
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
@@ -29,6 +30,8 @@ from vllm.v1.kv_cache_interface import (
     TQFullAttentionSpec,
 )
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -1370,6 +1373,20 @@ class MambaManager(SingleTypeKVCacheManager):
             if num_required_blocks == len(req_blocks):
                 return []
             else:
+                if num_required_blocks < len(req_blocks):
+                    logger.error(
+                        "MAMBA_ALIGN_SHRINK request_id=%s num_tokens=%d "
+                        "num_tokens_main_model=%d block_size=%d "
+                        "num_speculative_blocks=%d len_req_blocks=%d "
+                        "num_required_blocks=%d",
+                        request_id,
+                        num_tokens,
+                        num_tokens_main_model,
+                        self.block_size,
+                        self.num_speculative_blocks,
+                        len(req_blocks),
+                        num_required_blocks,
+                    )
                 assert num_required_blocks > len(req_blocks), (
                     "num_required_blocks "
                     f"{num_required_blocks} < len(req_blocks) {len(req_blocks)}"
