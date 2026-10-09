@@ -103,7 +103,24 @@ cold cohort：每格保持同樣c10 resident decode負載，t=0起每60秒送一
 
 team plan在最後一筆cold請求完成前**持續循環重播**，每輪換salt；OFF/ON使用同一個預先生成的輪次→salt/plan表，不能依上一輪速度挑prompt。每輪單獨保存原始JSON、開始/結束時間，並標出正式第一輪與resident續播輪；正式第一輪的whole-turn/goodput仍依相同固定plan比較，續播負載另表，不把某臂因cold較慢而多跑的輪數混進主中位數。step rate則保留整段正式流量的逐步分母。
 
-cold指標的resident機械閘：从第一筆cold的原始arrival至最後一筆cold完成或deadline，每秒記`num_requests_running`；以wall時間加權的 **running<10 占比 >10% → 該格cold指標INCONCLUSIVE**，不是把不足負載的片段刪掉再算。running含prefill，不能把此條寫成「10個decoder全程活躍」；server step的decode_reqs分布仍並列診斷。缺少完整resident取樣資料亦INCONCLUSIVE；保留原始採樣時間與失敗記錄，禁止把missing視為running≥10。每格仍 **90min hard cap**，不因循環負載追加時間。此補遺在GPU量測前固定，runner由Fable落實、Astra複核。
+**裁定與依據（量測前修訂）**：lead訊息 `01M4FB99TXX3656MRV45QP27AC`；Astra於 **2026-10-09 11:28:50 +08:00** 收到並記錄裁定，依lead確認早於任何m47量測資料。本次只使用既有m34 OFF基線，不參照m47結果調閘。原「running<10占比≤10%」自本修訂起作廢，由下列25%及臂間平衡兩道閘取代，其他P2門檻不變。
+
+獨立重算 `/data/bench/m34/off{1,2,3}.json` 的每筆`requests[].t_send_rel/t_end_rel`：對`[最早send, 最晚end)`作精確事件積分，每請求在`[send,end)`算一個在途請求。每格81筆，結果如下。**這是client在途數proxy，不是server running計數**；包括排隊，也不是cold期間專屬取樣。它證明原10%門檻連既有自然流量proxy都可能超過，25%是lead事前選定的工程容忍度，並非從這三格推導出的統計保證。
+
+| m34 OFF格 | 積分wall (s) | client在途數<10占比 | wall平均client在途數 |
+|---|---:|---:|---:|
+| off1 | 1500.5739 | 16.2157% | 9.3357 |
+| off2 | 1491.4082 | 17.6676% | 9.2289 |
+| off3 | 1483.6986 | 16.9638% | 9.2818 |
+
+重算腳本 `/data/bench/astra-cadence/reconstruct_m34_residency.py`；輸出 `/data/bench/astra-cadence/m34-residency-prereg-basis.json`含三份source SHA256，只存彙總，不輸出request/user識別資訊。
+
+**正式resident機械閘**使用server `/metrics` 的`num_requests_running`：從第一筆cold的**原始預定arrival**至最後一筆cold完成或deadline，每秒採樣、保留原始時間戳，以實際wall區間長度加權（不是樣本個數）。對第i格定義`f_i = ∫1[running<10]dt / T_i`及`r_i = ∫running dt / T_i`：
+
+1. **逐格負載：`f_i ≤ 0.25`**；超過25% → 該格cold指標INCONCLUSIVE，等於25%通過。不得刪掉低running片段再算。
+2. **同組臂間平衡：`abs(median(r_i for ON) − median(r_i for OFF)) ≤ 1.0`**；兩臂各取本組各格cold期間wall平均running，再作跨格中位數。這是絕對人數差，不是比例。超過1.0 → **該組兩臂各格cold指標皆INCONCLUSIVE**，等於1.0通過；不以挑格、刪除負載較低格或混用其他plan/k的格救回平衡。完整取樣但第一閘失敗的格，其`r_i`仍納入這項比較；必要格缺resident資料時不得宣稱組級平衡PASS。
+
+running含prefill，不能把任一條寫成「10個decoder全程活躍」；server step的decode_reqs分布仍並列。缺少完整resident取樣資料亦INCONCLUSIVE；禁止把missing視為running≥10，缺口不外推成PASS。cold coverage失敗只否定該cohort的可比性，team/step數字仍可描述，但整組P2不能PASS。每格仍 **90min hard cap**，不因循環負載追加時間。runner與CPU邊界測試須同步更新兩道閘，Fable核後才凍結開窗。
 
 ### 4.3 Runner資料契約補遺（GPU前固定）
 
