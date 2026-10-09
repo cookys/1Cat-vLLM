@@ -24,6 +24,50 @@ def args():
     return NS(python=Path("/venv/bin/python"), port=18037, gpu_blocks=1800)
 
 
+@pytest.mark.parametrize("direction", ["H2D", "D2H"])
+@pytest.mark.parametrize("observed", [False, True])
+def test_abort_attempt_http_client_is_not_shadowed(
+    monkeypatch, tmp_path, direction, observed
+):
+    """Exercise the live cancellation entrypoint with no socket/GPU access."""
+    log = tmp_path / "serve.log"
+    log.write_text("old evidence must not count\n")
+    calls = []
+    monkeypatch.setattr(W.uuid, "uuid4", lambda: NS(hex="cpu-abort"))
+    clock = iter([0.0, 0.1, 91.0])
+    monkeypatch.setattr(W.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(W.time, "sleep", lambda _: None)
+    monkeypatch.setattr(W, "settle", lambda a: calls.append(("settle", a.port)))
+
+    class Connection:
+        def __init__(self, host, port, timeout):
+            calls.append(("connect", host, port, timeout))
+
+        def request(self, method, path, data, headers):
+            calls.append(("request", method, path, json.loads(data), headers))
+            if observed:
+                tag = "load_submitted" if direction == "H2D" else "store_submitted"
+                with log.open("a") as f:
+                    f.write(f"HOST_PARKING {tag} request_id=m37-abort-cpu-abort\n")
+
+        def close(self):
+            calls.append(("close",))
+
+    monkeypatch.setattr(W.http_client, "HTTPConnection", Connection)
+    result = W.abort_attempt(args(), [10, 20], log, direction)
+    assert result == dict(
+        request_id="m37-abort-cpu-abort",
+        direction=direction,
+        submit_observed=observed,
+    )
+    assert calls[0] == ("connect", "127.0.0.1", 18037, 120)
+    assert calls[1][1:3] == ("POST", "/v1/completions")
+    assert calls[1][3]["prompt"] == [10, 20]
+    assert calls[1][3]["stream"] is True
+    assert calls[1][4]["X-Request-Id"] == result["request_id"]
+    assert calls[-2:] == [("close",), ("settle", 18037)]
+
+
 def cases(delta=0.0, token=1):
     return [
         dict(label=str(i), ok=True, ids=[token], logprobs=[-0.4 + delta])

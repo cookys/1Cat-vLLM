@@ -10,7 +10,7 @@ import argparse
 import concurrent.futures
 import contextlib
 import hashlib
-import http.client
+import http.client as http_client
 import json
 import math
 import os
@@ -553,7 +553,7 @@ def abort_attempt(args, tokens, logpath, direction):
             "ignore_eos": True,
         }
     ).encode()
-    connection = http.client.HTTPConnection("127.0.0.1", args.port, timeout=120)
+    connection = http_client.HTTPConnection("127.0.0.1", args.port, timeout=120)
     start = logpath.stat().st_size
     connection.request(
         "POST",
