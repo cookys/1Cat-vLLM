@@ -100,7 +100,7 @@ CUDA_VISIBLE_DEVICES= TRITON_INTERPRET=1 nice -n 19 taskset -c 0-26:2 \
  tests/v1/kv_offload/cpu/test_host_parking_rerun.py -q
 ```
 
-測試log `/data/bench/astra-m37c-review/full-tests.log`。fixture生成以
+結果 **191 passed**；測試log `/data/bench/astra-m37c-review/full-tests.log`（含完整命令、Python/pytest版本）。fixture生成以
 `git show 7982f2cfc:vllm/v1/core/sched/scheduler.py`作class來源，非拿新實作
 自產期望值；來源hash及輸出hash均存fixture。
 
