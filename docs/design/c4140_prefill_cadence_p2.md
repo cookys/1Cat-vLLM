@@ -99,6 +99,12 @@ cold cohort：每格保持同樣c10 resident decode負載，t=0起每60秒送一
 
 **加格只准一次，且成對**：初始8格全部保留。若不足20步/10個cold、時間缺口或有明確infra失敗，不挑好段補入；整組追加一次`A B B A`，上限12格/組(每臂6)。失敗格原樣留檔；所有樣本齊全的格都進統計，不能因速度慢排除。若只有spread令whole-turn門檻未過，也只准同樣一次預定ABBA追加；完整性能或TTFT硬門檻明確失敗則NO-GO，不以持續加格救結果。追加後仍缺樣本 → INCONCLUSIVE，仍未過門檻 → NO-GO。若改workload/到達率，須另立新版本預登記，不能與本組混算。
 
+### 4.2 看資料前補遺：cold期間的resident負載（lead 2026-10-09裁定）
+
+team plan在最後一筆cold請求完成前**持續循環重播**，每輪換salt；OFF/ON使用同一個預先生成的輪次→salt/plan表，不能依上一輪速度挑prompt。每輪單獨保存原始JSON、開始/結束時間，並標出正式第一輪與resident續播輪；正式第一輪的whole-turn/goodput仍依相同固定plan比較，續播負載另表，不把某臂因cold較慢而多跑的輪數混進主中位數。step rate則保留整段正式流量的逐步分母。
+
+cold指標的resident機械閘：从第一筆cold的原始arrival至最後一筆cold完成或deadline，每秒記`num_requests_running`；以wall時間加權的 **running<10 占比 >10% → 該格cold指標INCONCLUSIVE**，不是把不足負載的片段刪掉再算。running含prefill，不能把此條寫成「10個decoder全程活躍」；server step的decode_reqs分布仍並列診斷。缺少完整resident取樣資料亦INCONCLUSIVE；保留原始採樣時間與失敗記錄，禁止把missing視為running≥10。每格仍 **90min hard cap**，不因循環負載追加時間。此補遺在GPU量測前固定，runner由Fable落實、Astra複核。
+
 ## 5. Overlay、CPU驗證與交付
 
 相對base需覆蓋7個runtime Python檔：
