@@ -2,7 +2,9 @@
 
 Status: CPU implementation; GPU unrun. Lead/Fable decision received 2026-10-09
 (`01M4FHF929NB02C243H372HSWR`) supersedes the initial partial/reuse recipe.
-Only the lead runs the GPU window, after m47, before production restoration.
+Only the lead runs the GPU window, after m47. Per the owner's subsequent ruling
+(`01M4FK29NX2HW2PW0TR5751NGG`, 2026-10-09), leave :8001 stopped at window end;
+there is no service restoration step or service restoration time allowance.
 This change does not modify any engine module or the seven-gate judge.
 
 ## Why parent-only TERM also needs a nonzero shutdown timeout
@@ -68,13 +70,17 @@ M37_GO=1 M37_WORKTREE=/data/src/1cat-wt-astra-parking-rerun \
 * Order is the judge's OFF/ON/ON/OFF/OFF/ON, followed by the two fault arms. Same
   c10fit plan `/data/bench/m19/Ap_c10fit.json`, fixed 1800 GPU IDs, TP4, 16 GiB
   aggregate balanced host pool, test port 18037. No P8/cadence flag.
-* Wrapper uses fence 48 GiB / 16 CPUs. It owns only the isolated test processes;
-  the external lead wrapper owns :8001 stop/restore. Restore on every exit code.
+* Wrapper uses fence 48 GiB / 16 CPUs and owns only the isolated test processes.
+  On every exit code, clean up those processes and leave :8001 stopped. The
+  approved driver/wrapper contain no service restart commands and remain
+  byte-identical; their historical header references to external restoration
+  are superseded by this owner ruling.
 * Hard outer cap = **34200 s**: 240 initial + 600 raw + 8×(120 import + 900
   startup + 150 cleanup) + 5400 on1 + 5×2700 other cells + 2×2400 faults + 300
   final margin. On timeout, TERM then kill-after 180 s. Lead's wrapper allowance
-  **34800 s** (inner cap + 600) accommodates escalation; production restoration
-  still belongs to its finalizer. These are hard bounds, not expected runtime.
+  **34800 s** (inner cap + 600) accommodates the 180 s forced-cleanup allowance
+  and wrapper reporting margin only; no part is reserved for restarting :8001.
+  These are hard bounds, not expected runtime.
 * Engineering estimate **3.7–4.5 hours**, not a measurement guarantee. m48p on1
   body measured 2588.44 s (parity 232.22, traffic 736.92, returns 1619.30);
   fault recovery bodies measured 92.68/91.75 s, excluding startup. Sources:
