@@ -1342,6 +1342,9 @@ class MambaManager(SingleTypeKVCacheManager):
                     # First prefill. Allocate 1 block for running state and the
                     # speculative blocks.
                     num_new_blocks = 1 + self.num_speculative_blocks
+            # F1: the requirement may shrink below the blocks already held
+            # (async skipped step); never report a negative allocation need.
+            num_new_blocks = max(num_new_blocks, 0)
 
             num_evictable_computed_blocks = self._get_num_evictable_blocks(
                 new_computed_blocks
