@@ -61,7 +61,7 @@ CUDA_VISIBLE_DEVICES= TRITON_INTERPRET=1 nice -n 19 taskset -c 0-26:2 \
 
 決策對象為27B NVFP4 KV、TP4、DFlash2 K7、P7既有batched生產路線，P8=OFF；不夾帶P9、kernel prototype或parking變更。沿用同model/.so/venv、block/mamba4096、同max-num-seqs/batch budget、同pool IDs、同arrival/plan/seed與cache暖機；兩臂都先完成AOT後重啟成loader。先驗OFF token/logprob ==同基底生產底線；pool若不同先釘相同ID數。每格記完整argv、commit、.so hash、cache命中、preempt、KV peak、FULL比例、RAM/las swap。另必記 **so_mapped**：暖機後、正式流量前，從四個TP worker的`/proc/<pid>/maps`擷取已載入.so的realpath、device/inode與磁碟SHA256，含flash_attn_v100/flash_qla/vllm自訂ops，保存PID→rank。只hash預計安裝檔不算；deleted mapping、無法讀maps、兩臂binary內容不同 → INCONCLUSIVE。不能用「同venv」推定同binary。
 
-**矩陣**：OFF(k0)對k1、OFF(k0)對k3分開判。每組採`A B B A / B A A B`，每臂4格（超過≥3），每個c10與c10fit plan分層；共4組32格，OFF不跨組借用；不得把k1/k3挑最佳單格、或兩個plan混成一個數。每格用同一份team_traffic_workload plan、同到達序；另跑固定arrival cold128K/200K各≥10個請求/**格**，所有預定請求均保留，符合§3機械閘。若窗不夠，只能先交INCONCLUSIVE的smoke，不能改門檻。
+**矩陣**：OFF(k0)對k1、OFF(k0)對k3分開判。每組採`A B B A / B A A B`，每臂4格（超過≥3），每個c10與c10fit plan分層；共4組32格，依§4.1分組排窗，OFF不跨組借用；不得把k1/k3挑最佳單格、或兩個plan混成一個數。每格用同一份team_traffic_workload plan、同到達序；另跑固定arrival cold128K/200K各≥10個請求/**格**，所有預定請求均保留，符合§3機械閘。若窗不夠，只能先交INCONCLUSIVE的smoke，不能改門檻。
 
 每一plan × k的**所有合併門檻**：
 
@@ -95,7 +95,7 @@ B3：--prefill-cadence-decode-steps 3
 
 cold cohort：每格保持同樣c10 resident decode負載，t=0起每60秒送一筆salted cold，128K與200K交替，共20筆(各10)。兩臂用同一到達表，原始arrival不隨前一筆完成時間延後；若容量不支持既定cohort，記前置NO-GO，不臨場改admission。每筆deadline=arrival+900s，最後到達t=1140s，最晚t=2040s結束。每秒由原始arrival/first-token事件重建Q；對t=300,360,…,1140的每個時間點，用其前10秒的Q均值作OLS樣本，避免與瞬間arrival排序相撞。此有限窗口的queue不增長不等於長期穩定性的證明。正式step分析區間涵蓋team及cold流量，排除warmup/drain。
 
-**時長是工程預算，尚未實測cadence**：m34 `off{1,2,3}.json` 原始requests的max(t_end_rel)−min(t_send_rel)=1483.7–1500.6s，即team約25分鐘。預留每格team 25–35min + cold 20–34min +啟動/loader/reset 5–15min，約50–84min/格；一個k×plan的8格約6.7–11.2h，完整32格約27–45h，另加初次編譯/parity與logOFF方向檢查。這不是一個短GPU窗：lead可先排一組，未跑的組仍INCONCLUSIVE。每格hard cap=90min，外層依格數另加還原餘裕，不共用單一短alarm。
+**時長是工程預算，尚未實測cadence**：m34 `off{1,2,3}.json` 原始requests的max(t_end_rel)−min(t_send_rel)=1483.7–1500.6s，即team約25分鐘。預留每格team 25–35min + cold 20–34min +啟動/loader/reset 5–15min，約50–84min/格；一個k×plan的8格約6.7–11.2h，完整32格約27–45h，另加初次編譯/parity與logOFF方向檢查。這不是一個短GPU窗：lead可先排一組，未跑的組仍INCONCLUSIVE。每格hard cap=90min；第一組8格預估6.7–11.2h，hard cap合計12h，加格至12格最壞18h，外層另加還原餘裕，不共用單一短alarm。
 
 **加格只准一次，且成對**：初始8格全部保留。若不足20步/10個cold、時間缺口或有明確infra失敗，不挑好段補入；整組追加一次`A B B A`，上限12格/組(每臂6)。失敗格原樣留檔；所有樣本齊全的格都進統計，不能因速度慢排除。若只有spread令whole-turn門檻未過，也只准同樣一次預定ABBA追加；完整性能或TTFT硬門檻明確失敗則NO-GO，不以持續加格救結果。追加後仍缺樣本 → INCONCLUSIVE，仍未過門檻 → NO-GO。若改workload/到達率，須另立新版本預登記，不能與本組混算。
 
