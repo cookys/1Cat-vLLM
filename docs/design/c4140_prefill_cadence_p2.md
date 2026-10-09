@@ -20,9 +20,11 @@ P0 m44 以每秒 iteration 差分得 M/D ≥9.0，只是下界；超過一秒的
 
 **沒有 oldest-age 覆寫**：早期提案的按年齡強制放行控制器未實作。本版以 **k+1 結構保底**取代，沒有年齡計時器、wall-time上限或額外priority排序；cold queue與TTFT仍須獨立過閘。
 
+最後一個prefill chunk即使把佇列清空，也仍設定剩餘k；若decoder持續可排，新到請求最多再延k個decode步才獲prefill機會。這是本版明確的TTFT成本來源，不由oldest-age覆寫抵消。
+
 ### 數值界線
 
-OFF的排程序列/KV refcounts/queue/request state逐值等於固定P7+retention基底fixture（新的`cadence_step=None`欄位不計入fixture）；不把CPU排程等價說成GPU已驗E1。ON不改token/quant/算子，但批次形狀、接受數與state更新分段可能改變浮點結果，**不得預先宣稱E1或嚴格分布等價**。GPU要求OFF對生產基線token/logprob parity；ON記錄相同seed的token、logprob差異及self-replay底線。若數值變動，保留為需owner核准的候選，不直接採用。
+OFF的排程序列/KV refcounts/queue/request state逐值等於固定P7+retention基底fixture（來源`4a470cc3a`；新的`cadence_step=None`欄位不計入fixture）；不把CPU排程等價說成GPU已驗E1。ON不改token/quant/算子，但批次形狀、接受數與state更新分段可能改變浮點結果，**不得預先宣稱E1或嚴格分布等價**。GPU要求OFF對生產基線token/logprob parity；ON記錄相同seed的token、logprob差異及self-replay底線。若數值變動，保留為需owner核准的候選，不直接採用。
 
 ## 3. 主量測：逐步server時間，不用一秒iteration倒數
 
@@ -74,7 +76,9 @@ CUDA_VISIBLE_DEVICES= TRITON_INTERPRET=1 nice -n 19 taskset -c 0-26:2 \
 | 進度/存活 | 所有已admit prefill最終完成；无engine error/OOM、无新增preemption；以event/log驗證k間隔，資源不足另外標記而非當成功純decode步 |
 | 數值 | OFF serving parity及self-replay通過；ON對OFF IDs/logprob差分＋ON self-replay；非bitwise需owner看數值/任務品質後另決定，速度PASS不自動授權部署 |
 
-whole-turn欄位來源：llm-playground `scripts/c4140-ab/team_traffic_workload.py:804–815,860–863`；不可改成aggregate總tok/s替代。同時列whole p10、TTFT p50/p99、client interfered時間比例、p99 token gap。任一性能/TTFT門檻失敗 → 該k/plan NO-GO；缺證據 → INCONCLUSIVE；兩組都過才可宣稱整體通過。此處沒有「先量再改」的容忍帶。
+whole-turn欄位來源：llm-playground `scripts/c4140-ab/team_traffic_workload.py:804–815,860–863`；不可改成aggregate總tok/s替代。同時列whole p10、TTFT p50/p99、client interfered時間比例、p99 token gap。任一性能/TTFT門檻失敗 → 該k/plan NO-GO；缺證據 → INCONCLUSIVE；兩組都過才可宣稱整體通過。此處沒有「先量再改」的容忍帶。goodput/queue/so_mapped資料不足也判INCONCLUSIVE；queue的斜率≤0與末≤首規則對OFF、ON每格各自套用，OFF亦不穩定則不能宣稱控制器過閘。
+
+本登記**不另設UNDETERMINED**狀態：INCONCLUSIVE只指機械閘/資料不足；資料齊但差值落在兩臂spread內，代表whole-turn合併門檻未過，按§4.1最多追加一次成對ABBA，仍不過則NO-GO，不能換名稱當作PASS。
 
 CLI差異（由lead的GPU wrapper執行，本人未啟動服務）：
 
@@ -126,4 +130,4 @@ CUDA_VISIBLE_DEVICES= TRITON_INTERPRET=1 nice -n 19 taskset -c 0-26:2 \
  tests/v1/worker/test_cadence_step_timer_dispatch.py -q
 ```
 
-結果：原版133項；本次審查修訂 **143 passed**，`/data/bench/astra-cadence/review-tests.log`；含實際CLI/import且`torch.cuda.is_initialized()==False`、k1/3 × sync/async × spec0/7、4096真MambaSpec、pending async、abort/alloc失敗、running/waiting queue、原始OFF fixture、V2真execute/sample entrypoints的CPU mock。修補一個既有V2 dispatch fixture缺少的P8 timer=None欄位，未放寬production判斷。GPU數值、吞吐與每step timer開銷皆未驗。
+結果：原版133項；本次審查修訂 **151 passed**，`/data/bench/astra-cadence/review-tests-v2.log`（含完整命令、Python/pytest版本）；含實際CLI/import且`torch.cuda.is_initialized()==False`、k1/3 × sync/async × spec0/7、4096真MambaSpec、pending async、abort/alloc失敗、running/waiting queue、原始OFF fixture、V2真execute/sample entrypoints的CPU mock。修補一個既有V2 dispatch fixture缺少的P8 timer=None欄位，未放寬production判斷。GPU數值、吞吐與每step timer開銷皆未驗。

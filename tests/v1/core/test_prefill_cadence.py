@@ -428,13 +428,14 @@ def test_readout_twenty_steps_ten_cold_complete_without_pure_prefill():
 @pytest.mark.parametrize(
     "case", ["nine", "missing", "unknown_cache", "warm", "nan", "outcome"]
 )
-def test_readout_cold_evidence_required_in_status(case):
+@pytest.mark.parametrize("cohort", ["128K", "200K"])
+def test_readout_cold_evidence_required_in_status(case, cohort):
     from benchmarks.prefill_cadence_readout import analyze
 
     log, cold = readout_fixture()
-    row = cold["cohorts"]["128K"][0]
+    row = cold["cohorts"][cohort][0]
     if case == "nine":
-        cold["cohorts"]["128K"].pop()
+        cold["cohorts"][cohort].pop()
     elif case == "missing":
         cold = None
     elif case == "unknown_cache":
@@ -447,7 +448,30 @@ def test_readout_cold_evidence_required_in_status(case):
         del row["ok"]
     result = analyze(log, cold_evidence=cold)
     assert result["status"] == "INCONCLUSIVE"
-    assert result["cold"]["cohorts"]["128K"]["ttft_s_p90"] is None
+    assert result["cold"]["cohorts"][cohort]["ttft_s_p90"] is None
+
+
+@pytest.mark.parametrize("missing", ["phase", "regime"])
+def test_readout_phase_and_regime_gates_are_independent(missing):
+    from benchmarks.prefill_cadence_readout import analyze
+
+    log, cold = readout_fixture()
+    lines = []
+    for line in log.splitlines():
+        if "PREFILL_CADENCE_STEP " in line:
+            row = json.loads(line.split(" ", 1)[1])
+            if missing == "phase" and 1 <= row["step_id"] < 20:
+                row["prefill_rows"] = 0
+            if missing == "regime" and row["step_id"] >= 20:
+                row["pending_prefill_reqs"] = 1
+            line = "PREFILL_CADENCE_STEP " + json.dumps(row)
+        lines.append(line)
+    result = analyze("\n".join(lines), cold_evidence=cold)
+    assert result["status"] == "INCONCLUSIVE"
+    expected = "phases" if missing == "phase" else "regimes"
+    other = "regimes" if missing == "phase" else "phases"
+    assert any(p.startswith(f"insufficient_{expected}:") for p in result["problems"])
+    assert not any(p.startswith(f"insufficient_{other}:") for p in result["problems"])
 
 
 def test_readout_failed_cold_request_is_not_removed_from_tail():
