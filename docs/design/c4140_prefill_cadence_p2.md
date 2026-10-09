@@ -18,6 +18,8 @@ P0 m44 以每秒 iteration 差分得 M/D ≥9.0，只是下界；超過一秒的
 - **prefill進度保底**：在已有可配置的prefill、原排程器budget/KV/seq槽可前進的前提下，cadence至多延後k個非空decode批次，隨後必有一次不受cadence限制的prefill機會；固定c/無資源失敗測試中每k+1批次跨一個4096邊界。不能保證過量admission、持續KV不足或原priority策略下的無條件wall-time SLA。這些不能當作cadence成功，也不新增繞過FCFS/priority的餓死風險。
 - `_mamba_block_aligned_split`、align4096的config斷言、KV manager、attention/CUDA kernel均不改。來源：scheduler原函式`449–513`無diff；4096 MambaSpec測試與原始OFF schedule/refcount/queue hash回歸。
 
+**沒有 oldest-age 覆寫**：早期提案的按年齡強制放行控制器未實作。本版以 **k+1 結構保底**取代，沒有年齡計時器、wall-time上限或額外priority排序；cold queue與TTFT仍須獨立過閘。
+
 ### 數值界線
 
 OFF的排程序列/KV refcounts/queue/request state逐值等於固定P7+retention基底fixture（新的`cadence_step=None`欄位不計入fixture）；不把CPU排程等價說成GPU已驗E1。ON不改token/quant/算子，但批次形狀、接受數與state更新分段可能改變浮點結果，**不得預先宣稱E1或嚴格分布等價**。GPU要求OFF對生產基線token/logprob parity；ON記錄相同seed的token、logprob差異及self-replay底線。若數值變動，保留為需owner核准的候選，不直接採用。
@@ -35,7 +37,11 @@ OFF的排程序列/KV refcounts/queue/request state逐值等於固定P7+retentio
 
 **干擾口徑預先固定**：step開始時仍有running prefill或waiting/skipped新請求即`pending_prefill_reqs>0`；有decoder的步歸interfered，包含cadence插入的pure-decode步。這是engine待處理prefill區間代理，不等同client first-token前區間；blocked waiting也計入，需保留計數。pending=0的decoder步歸steady。另按真正mixed/decode/prefill三類列p50/p90/p99，不能把插入的decode誤分類成steady來抬數字。
 
-空批不納入。測試覆蓋4099.065ms仍完整保留、延後event與缺rank/重複step會判INCONCLUSIVE。每格只含一個engine lifetime；記測試前後step_id，結尾發短drain請求直到最後正式step四rank皆寫出，再用`--first-step/--last-step`排除warmup/drain。出現未補齊step、timing gap、rank metadata不一致或任一phase不足20步 → INCONCLUSIVE，補量不能挑好樣本。timer會改变allocator/event footprint，故兩臂同開，另用相同workload各一格logOFF檢查方向，不能把logON快當timer收益。
+空批不納入。測試覆蓋4099.065ms仍完整保留、延後event與缺rank/重複step會判INCONCLUSIVE。每格只含一個engine lifetime；記測試前後step_id，結尾發短drain請求直到最後正式step四rank皆寫出，再用`--first-step/--last-step`排除warmup/drain。出現未補齊step、timing gap、rank metadata不一致 → INCONCLUSIVE。**必需physical phases=mixed/decode，各≥20步；必需regimes=steady/interfered，各≥20步**，四個計數各自檢查；pure-prefill沒有decoder分母，只診斷，不設20步門檻。比較欄固定`regimes.interfered.per_decoder_tok_s_with_gap`、`regimes.steady.per_decoder_tok_s_with_gap`，不得換用phase的rate或無gap欄。
+
+readout還要求每格`128K`與`200K`兩個cold cohort各≥10筆；少一筆、cache未知或缺outcome → `INCONCLUSIVE`，timeout/error → `FAIL`且不刪樣本。輸入`--cold-json`契約為`{"cohorts":{"128K":[{"ok":true,"ttft_s":12.3,"cached_tokens":0}],"200K":[...]}}`，陣列保留該格**所有預定cold請求**，包括失敗列。這是wrapper從原始回應整理的證據檔，不是把team summary當樣本。cache須來自usage明確值或已驗證的server-details省略零契約，不可把null填零。p90欄=`cold.cohorts.{128K,200K}.ttft_s_p90`，兩種長度分開判。`status=COMPLETE`只表示本格樣本齊全，不代表跨臂性能PASS。以上規則皆在`benchmarks/prefill_cadence_readout.py`實作；測試驗19/20步與9/10筆cold邊界。
+
+timer會改變allocator/event footprint，故兩臂同開，另用相同workload各一格logOFF檢查方向，不能把logON快當timer收益。補量規則見§4.1。
 
 離線命令（CPU）：
 
@@ -44,14 +50,16 @@ CUDA_VISIBLE_DEVICES= TRITON_INTERPRET=1 nice -n 19 taskset -c 0-26:2 \
  /data/venvs/1cat-main-integp7pr-p8/bin/python \
  /data/src/1cat-wt-astra-cadence/benchmarks/prefill_cadence_readout.py \
  /data/bench/<window>/<cell>.serve.log --ranks 4 \
- --first-step <first> --last-step <last> --out /data/bench/<window>/<cell>.steps.json
+ --first-step <first> --last-step <last> \
+ --cold-json /data/bench/<window>/<cell>.cold.json \
+ --out /data/bench/<window>/<cell>.steps.json
 ```
 
 ## 4. GPU前凍結的P2門檻
 
-決策對象為27B NVFP4 KV、TP4、DFlash2 K7、P7既有batched生產路線，P8=OFF；不夾帶P9、kernel prototype或parking變更。沿用同model/.so/venv、block/mamba4096、同max-num-seqs/batch budget、同pool IDs、同arrival/plan/seed與cache暖機；兩臂都先完成AOT後重啟成loader。先驗OFF token/logprob ==同基底生產底線；pool若不同先釘相同ID數。每格記完整argv、commit、.so hash、cache命中、preempt、KV peak、FULL比例、RAM/las swap。
+決策對象為27B NVFP4 KV、TP4、DFlash2 K7、P7既有batched生產路線，P8=OFF；不夾帶P9、kernel prototype或parking變更。沿用同model/.so/venv、block/mamba4096、同max-num-seqs/batch budget、同pool IDs、同arrival/plan/seed與cache暖機；兩臂都先完成AOT後重啟成loader。先驗OFF token/logprob ==同基底生產底線；pool若不同先釘相同ID數。每格記完整argv、commit、.so hash、cache命中、preempt、KV peak、FULL比例、RAM/las swap。另必記 **so_mapped**：暖機後、正式流量前，從四個TP worker的`/proc/<pid>/maps`擷取已載入.so的realpath、device/inode與磁碟SHA256，含flash_attn_v100/flash_qla/vllm自訂ops，保存PID→rank。只hash預計安裝檔不算；deleted mapping、無法讀maps、兩臂binary內容不同 → INCONCLUSIVE。不能用「同venv」推定同binary。
 
-**矩陣**：OFF(k0)對k1、OFF(k0)對k3分開判。每組採`A B B A / B A A B`，每臂4格（超過≥3），每個c10與c10fit plan分層；不得把k1/k3挑最佳單格、或兩個plan混成一個數。每格用同一份team_traffic_workload plan、同到達序；另跑P0固定arrival cold128K/200K各≥10個有效TTFT樣本/臂，混合與steady各≥20server steps。若窗不夠，只能先交INCONCLUSIVE的smoke，不能改門檻。
+**矩陣**：OFF(k0)對k1、OFF(k0)對k3分開判。每組採`A B B A / B A A B`，每臂4格（超過≥3），每個c10與c10fit plan分層；共4組32格，OFF不跨組借用；不得把k1/k3挑最佳單格、或兩個plan混成一個數。每格用同一份team_traffic_workload plan、同到達序；另跑固定arrival cold128K/200K各≥10個請求/**格**，所有預定請求均保留，符合§3機械閘。若窗不夠，只能先交INCONCLUSIVE的smoke，不能改門檻。
 
 每一plan × k的**所有合併門檻**：
 
@@ -60,7 +68,9 @@ CUDA_VISIBLE_DEVICES= TRITON_INTERPRET=1 nice -n 19 taskset -c 0-26:2 \
 | interfered | 各格server人秒rate中位數 ON/OFF **≥1.25**（§3主rate）；client windows p50/p10同時附列，不混換分母 |
 | steady | 同口徑server rate中位数 ON/OFF **≥0.95** |
 | whole-turn | 現行workload `summary.aggregate.per_stream_tok_s.p50`的跨格中位数 ON/OFF **≥1.15**；且`ratio−1 > max(spread_OFF, spread_ON)`，spread明定`(max_cell−min_cell)/min_cell`；這是既有whole-turn decode rate，TTFT另量 |
-| cold TTFT | 固定arrival冷請求（cached_tokens≤1 block）的TTFT p90：各格p90跨格中位數 ON/OFF **≤1.50**；所有請求保留，timeout/error不得剔除。樣本不足或cache欄空 → INCONCLUSIVE |
+| cold TTFT | 固定arrival冷請求（cached_tokens≤1 block）的TTFT p90：128K/200K各自的各格p90跨格中位數 ON/OFF **≤1.50**；所有請求保留，timeout/error不得剔除。這是lead本輪裁定，取代早期提案1.25；**1.25僅敏感度註記，不計分**。樣本不足或cache欄空 → INCONCLUSIVE |
+| completed goodput | 每格固定plan的成功完成request數 /（最後一個預定request完成或deadline − 第一個原始arrival），含TTFT/排隊/drain，跨格中位數 ON/OFF **≥0.95**。不以decode-only tok/s替代；timeout/error仍計入wall分母且本格存活閘失敗。team與fixed-arrival cold兩cohort分開都須過 |
+| cold queue | §4.1固定arrivalcohort的`Q(t)=已到達但未見first token的cold請求數`，預定穩定到達區間OLS斜率 **≤0**、末樣本 **≤** 首樣本，最後arrival+900s內Q回0且全部完成；任一不過 → NO-GO。不能只憑closed-loop最終drain宣稱queue不增長 |
 | 進度/存活 | 所有已admit prefill最終完成；无engine error/OOM、无新增preemption；以event/log驗證k間隔，資源不足另外標記而非當成功純decode步 |
 | 數值 | OFF serving parity及self-replay通過；ON對OFF IDs/logprob差分＋ON self-replay；非bitwise需owner看數值/任務品質後另決定，速度PASS不自動授權部署 |
 
@@ -74,6 +84,14 @@ A：--prefill-cadence-decode-steps 0
 B1：--prefill-cadence-decode-steps 1
 B3：--prefill-cadence-decode-steps 3
 ```
+
+### 4.1 固定到達、時間預算與加格規則
+
+cold cohort：每格保持同樣c10 resident decode負載，t=0起每60秒送一筆salted cold，128K與200K交替，共20筆(各10)。兩臂用同一到達表，原始arrival不隨前一筆完成時間延後；若容量不支持既定cohort，記前置NO-GO，不臨場改admission。每筆deadline=arrival+900s，最後到達t=1140s，最晚t=2040s結束。每秒由原始arrival/first-token事件重建Q；對t=300,360,…,1140的每個時間點，用其前10秒的Q均值作OLS樣本，避免與瞬間arrival排序相撞。此有限窗口的queue不增長不等於長期穩定性的證明。正式step分析區間涵蓋team及cold流量，排除warmup/drain。
+
+**時長是工程預算，尚未實測cadence**：m34 `off{1,2,3}.json` 原始requests的max(t_end_rel)−min(t_send_rel)=1483.7–1500.6s，即team約25分鐘。預留每格team 25–35min + cold 20–34min +啟動/loader/reset 5–15min，約50–84min/格；一個k×plan的8格約6.7–11.2h，完整32格約27–45h，另加初次編譯/parity與logOFF方向檢查。這不是一個短GPU窗：lead可先排一組，未跑的組仍INCONCLUSIVE。每格hard cap=90min，外層依格數另加還原餘裕，不共用單一短alarm。
+
+**加格只准一次，且成對**：初始8格全部保留。若不足20步/10個cold、時間缺口或有明確infra失敗，不挑好段補入；整組追加一次`A B B A`，上限12格/組(每臂6)。失敗格原樣留檔；所有樣本齊全的格都進統計，不能因速度慢排除。若只有spread令whole-turn門檻未過，也只准同樣一次預定ABBA追加；完整性能或TTFT硬門檻明確失敗則NO-GO，不以持續加格救結果。追加後仍缺樣本 → INCONCLUSIVE，仍未過門檻 → NO-GO。若改workload/到達率，須另立新版本預登記，不能與本組混算。
 
 ## 5. Overlay、CPU驗證與交付
 
@@ -106,4 +124,4 @@ CUDA_VISIBLE_DEVICES= TRITON_INTERPRET=1 nice -n 19 taskset -c 0-26:2 \
  tests/v1/worker/test_cadence_step_timer_dispatch.py -q
 ```
 
-結果：**133 passed**，`/data/bench/astra-cadence/final-tests.log`；含實際CLI/import且`torch.cuda.is_initialized()==False`、k1/3 × sync/async × spec0/7、4096真MambaSpec、pending async、abort/alloc失敗、running/waiting queue、原始OFF fixture、V2真execute/sample entrypoints的CPU mock。修補一個既有V2 dispatch fixture缺少的P8 timer=None欄位，未放寬production判斷。GPU數值、吞吐與每step timer開銷皆未驗。
+結果：原版133項；本次審查修訂 **143 passed**，`/data/bench/astra-cadence/review-tests.log`；含實際CLI/import且`torch.cuda.is_initialized()==False`、k1/3 × sync/async × spec0/7、4096真MambaSpec、pending async、abort/alloc失敗、running/waiting queue、原始OFF fixture、V2真execute/sample entrypoints的CPU mock。修補一個既有V2 dispatch fixture缺少的P8 timer=None欄位，未放寬production判斷。GPU數值、吞吐與每step timer開銷皆未驗。

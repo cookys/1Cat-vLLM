@@ -356,7 +356,7 @@ def test_readout_long_steps_and_cadence_decode_are_interfered():
             f"PREFILL_CADENCE_COMPLETE step_id={sid} decode_accepted_tokens=40"
         )
     data = analyze("\n".join(lines))
-    assert data["status"] == "COMPLETE"
+    assert data["status"] == "INCONCLUSIVE"  # Three steps cannot pass coverage.
     assert data["regimes"]["interfered"]["steps"] == 2
     assert data["phases"]["mixed"]["stream_ms_p50"] == 2900
     assert data["regimes"]["interfered"]["per_decoder_tok_s"] == pytest.approx(
@@ -364,3 +364,98 @@ def test_readout_long_steps_and_cadence_decode_are_interfered():
     )
     assert analyze("\n".join(lines[:-1]))["status"] == "INCONCLUSIVE"
     assert analyze("\n".join(lines + [lines[0]]))["status"] == "INCONCLUSIVE"
+
+
+def readout_fixture(mixed=20, decode=20, cold_count=10):
+    lines = []
+    for sid in range(mixed + decode):
+        prefill = sid < mixed
+        for rank in range(4):
+            lines.append(
+                "PREFILL_CADENCE_STEP "
+                + json.dumps(
+                    dict(
+                        step_id=sid,
+                        rank=rank,
+                        prefill_rows=4096 if prefill else 0,
+                        decode_rows=80,
+                        decode_reqs=10,
+                        pending_prefill_reqs=int(prefill),
+                        stream_ms=2000 if prefill else 170,
+                        stream_gap_ms=5,
+                        route="NONE" if prefill else "FULL",
+                    )
+                )
+            )
+        lines.append(
+            f"PREFILL_CADENCE_COMPLETE step_id={sid} decode_accepted_tokens=40"
+        )
+    cold = {
+        "cohorts": {
+            name: [
+                dict(ok=True, ttft_s=3 + i, cached_tokens=0) for i in range(cold_count)
+            ]
+            for name in ("128K", "200K")
+        }
+    }
+    return "\n".join(lines), cold
+
+
+@pytest.mark.parametrize("mixed,decode", [(19, 20), (20, 19)])
+def test_readout_nineteen_phase_and_regime_steps_are_inconclusive(mixed, decode):
+    from benchmarks.prefill_cadence_readout import analyze
+
+    log, cold = readout_fixture(mixed, decode)
+    result = analyze(log, cold_evidence=cold)
+    assert result["status"] == "INCONCLUSIVE"
+    assert any(p.startswith("insufficient_phases:") for p in result["problems"])
+    assert any(p.startswith("insufficient_regimes:") for p in result["problems"])
+
+
+def test_readout_twenty_steps_ten_cold_complete_without_pure_prefill():
+    from benchmarks.prefill_cadence_readout import analyze
+
+    log, cold = readout_fixture()
+    result = analyze(log, cold_evidence=cold)
+    assert result["status"] == "COMPLETE"
+    assert result["phases"]["prefill"]["steps"] == 0
+    assert result["comparison_fields"] == {
+        r: f"regimes.{r}.per_decoder_tok_s_with_gap" for r in ("steady", "interfered")
+    }
+    assert result["cold"]["cohorts"]["128K"]["ttft_s_p90"] == pytest.approx(11.1)
+
+
+@pytest.mark.parametrize(
+    "case", ["nine", "missing", "unknown_cache", "warm", "nan", "outcome"]
+)
+def test_readout_cold_evidence_required_in_status(case):
+    from benchmarks.prefill_cadence_readout import analyze
+
+    log, cold = readout_fixture()
+    row = cold["cohorts"]["128K"][0]
+    if case == "nine":
+        cold["cohorts"]["128K"].pop()
+    elif case == "missing":
+        cold = None
+    elif case == "unknown_cache":
+        row["cached_tokens"] = None
+    elif case == "warm":
+        row["cached_tokens"] = 4097
+    elif case == "nan":
+        row["ttft_s"] = float("nan")
+    else:
+        del row["ok"]
+    result = analyze(log, cold_evidence=cold)
+    assert result["status"] == "INCONCLUSIVE"
+    assert result["cold"]["cohorts"]["128K"]["ttft_s_p90"] is None
+
+
+def test_readout_failed_cold_request_is_not_removed_from_tail():
+    from benchmarks.prefill_cadence_readout import analyze
+
+    log, cold = readout_fixture()
+    cold["cohorts"]["128K"][0].update(ok=False, error="timeout", ttft_s=None)
+    result = analyze(log, cold_evidence=cold)
+    assert result["status"] == "FAIL"
+    assert result["cold"]["cohorts"]["128K"]["requests"] == 10
+    assert result["cold"]["cohorts"]["128K"]["ttft_s_p90"] is None

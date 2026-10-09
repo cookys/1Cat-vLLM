@@ -11,6 +11,13 @@ import statistics
 from collections import defaultdict
 from pathlib import Path
 
+MIN_STEPS = 20
+REQUIRED_PHASES = ("mixed", "decode")
+REQUIRED_REGIMES = ("steady", "interfered")
+COMPARISON_FIELD = "per_decoder_tok_s_with_gap"
+MIN_COLD_REQUESTS = 10
+COLD_COHORTS = ("128K", "200K")
+
 
 def percentile(values, fraction):
     if not values:
@@ -21,7 +28,45 @@ def percentile(values, fraction):
     return values[lo] + (values[hi] - values[lo]) * (x - lo)
 
 
-def analyze(text, ranks=4, first_step=0, last_step=None):
+def cold_readout(evidence):
+    """Validate raw fixed-arrival cohorts; never silently drop failed requests."""
+    problems, failures, cohorts = [], [], {}
+    source = evidence.get("cohorts", {}) if isinstance(evidence, dict) else {}
+    for name in COLD_COHORTS:
+        rows = source.get(name, [])
+        if not isinstance(rows, list):
+            rows = []
+            problems.append(f"invalid_cold_cohort:{name}")
+        if len(rows) < MIN_COLD_REQUESTS:
+            problems.append(f"insufficient_cold:{name}:{len(rows)}<{MIN_COLD_REQUESTS}")
+        values = []
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                problems.append(f"invalid_cold_row:{name}:{index}")
+                continue
+            if row.get("ok") is False or row.get("error"):
+                failures.append(f"cold_request_failed:{name}:{index}")
+            elif row.get("ok") is not True:
+                problems.append(f"missing_cold_outcome:{name}:{index}")
+            cached = row.get("cached_tokens")
+            if type(cached) is not int or not 0 <= cached <= 4096:
+                problems.append(f"unverified_cold_cache:{name}:{index}")
+            ttft = row.get("ttft_s")
+            if type(ttft) not in (float, int) or not math.isfinite(ttft) or ttft <= 0:
+                problems.append(f"invalid_cold_ttft:{name}:{index}")
+            else:
+                values.append(ttft)
+        valid = len(values) == len(rows) and not any(
+            f":{name}:" in p for p in problems + failures
+        )
+        cohorts[name] = dict(
+            requests=len(rows),
+            ttft_s_p90=percentile(values, 0.9) if valid else None,
+        )
+    return dict(cohorts=cohorts, min_requests=MIN_COLD_REQUESTS), problems, failures
+
+
+def analyze(text, ranks=4, first_step=0, last_step=None, cold_evidence=None):
     timings, complete = defaultdict(dict), {}
     problems = []
     for line in text.splitlines():
@@ -102,19 +147,51 @@ def analyze(text, ranks=4, first_step=0, last_step=None):
             full_steps=sum("FULL" in r.get("route", "") for r in rows),
         )
 
+    regimes = {
+        regime: summarize(
+            [r for r in steps if r["decode_reqs"] and r["regime"] == regime]
+        )
+        for regime in ("steady", "interfered")
+    }
+    phases = {
+        phase: summarize([r for r in steps if r["phase"] == phase])
+        for phase in ("mixed", "decode", "prefill")
+    }
+    # Cadence may insert pure decode while prefill remains pending. Require
+    # both physical phases AND both exposure regimes; they are not synonyms.
+    # Pure prefill has no decoder denominator and is diagnostic only.
+    for group, required in (("phases", REQUIRED_PHASES), ("regimes", REQUIRED_REGIMES)):
+        table = phases if group == "phases" else regimes
+        for name in required:
+            if table[name]["steps"] < MIN_STEPS:
+                problems.append(
+                    f"insufficient_{group}:{name}:{table[name]['steps']}<{MIN_STEPS}"
+                )
+    cold, cold_problems, failures = cold_readout(cold_evidence)
+    problems.extend(cold_problems)
     return dict(
-        status="INCONCLUSIVE" if problems or not steps else "COMPLETE",
+        status=(
+            "FAIL"
+            if failures
+            else "INCONCLUSIVE"
+            if problems or not steps
+            else "COMPLETE"
+        ),
         problems=sorted(set(problems)),
-        regimes={
-            regime: summarize(
-                [r for r in steps if r["decode_reqs"] and r["regime"] == regime]
-            )
-            for regime in ("steady", "interfered")
+        failures=failures,
+        cold=cold,
+        comparison_fields={
+            regime: f"regimes.{regime}.{COMPARISON_FIELD}"
+            for regime in REQUIRED_REGIMES
         },
-        phases={
-            phase: summarize([r for r in steps if r["phase"] == phase])
-            for phase in ("mixed", "decode", "prefill")
-        },
+        coverage_requirements=dict(
+            min_steps=MIN_STEPS,
+            phases=REQUIRED_PHASES,
+            regimes=REQUIRED_REGIMES,
+            diagnostic_only_phases=["prefill"],
+        ),
+        regimes=regimes,
+        phases=phases,
         steps=steps,
     )
 
@@ -125,9 +202,20 @@ def main():
     parser.add_argument("--ranks", type=int, default=4)
     parser.add_argument("--first-step", type=int, default=0)
     parser.add_argument("--last-step", type=int)
+    parser.add_argument(
+        "--cold-json",
+        type=Path,
+        help="Raw {cohorts: {128K: [rows], 200K: [rows]}}; missing => INCONCLUSIVE",
+    )
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
-    result = analyze(args.log.read_text(), args.ranks, args.first_step, args.last_step)
+    result = analyze(
+        args.log.read_text(),
+        args.ranks,
+        args.first_step,
+        args.last_step,
+        json.loads(args.cold_json.read_text()) if args.cold_json else None,
+    )
     args.out.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
     print(json.dumps({k: v for k, v in result.items() if k != "steps"}, indent=2))
 
