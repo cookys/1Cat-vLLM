@@ -105,6 +105,14 @@ team plan在最後一筆cold請求完成前**持續循環重播**，每輪換sal
 
 cold指標的resident機械閘：从第一筆cold的原始arrival至最後一筆cold完成或deadline，每秒記`num_requests_running`；以wall時間加權的 **running<10 占比 >10% → 該格cold指標INCONCLUSIVE**，不是把不足負載的片段刪掉再算。running含prefill，不能把此條寫成「10個decoder全程活躍」；server step的decode_reqs分布仍並列診斷。缺少完整resident取樣資料亦INCONCLUSIVE；保留原始採樣時間與失敗記錄，禁止把missing視為running≥10。每格仍 **90min hard cap**，不因循環負載追加時間。此補遺在GPU量測前固定，runner由Fable落實、Astra複核。
 
+### 4.3 Runner資料契約補遺（GPU前固定）
+
+每臂serve argv明列`--enable-prompt-tokens-details`，保存啟動回顯及final SSE usage。此基底`vllm/entrypoints/openai/completion/serving.py:440–461`只在cached token非零時寫`prompt_tokens_details`。因此只有**旗標已核實、請求成功且取得合法final usage**時，省略details可依此版本契約記`cached_tokens=0`，另存來源`omitted_zero_under_verified_contract`；否則缺值仍是unknown→cold INCONCLUSIVE。明示cached_tokens優先，非法欄位不可補0。可沿用llmpg `scripts/c4140-ab/team_traffic_workload.py:281`的`request_prefix_hit`邏輯，但不能僅因CLI要求過就當成server已採用。
+
+cold completed goodput的單位是**req/s**：`成功完成數 / (max(所有預定請求t_end或deadline) − min(原始arrival))`，不是`done/20`完成率。所有預定20筆仍進wall分母與存活判定；若因全窗中斷尚未取得終點/失敗資料，不以當前checkpoint外推PASS。queue計算沿用§4.1，不因這個修正換分母。
+
+每筆cold的900秒是自原始arrival起的**總deadline**，非每次socket read都可重新用900秒；排隊、連線和所有SSE讀取都扣同一餘額。即使沒有新SSE行也必須能在deadline取消並留下error。每筆完成/失敗後原子checkpoint（含預定arrival、first token、end、usage來源），避免最後thread join或外層timeout抹掉整個cohort。這些為量測正確性修補，不放寬§4門檻。
+
 ## 5. Overlay、CPU驗證與交付
 
 相對base需覆蓋7個runtime Python檔：
