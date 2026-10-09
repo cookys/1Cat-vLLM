@@ -1180,6 +1180,9 @@ class MambaManager(SingleTypeKVCacheManager):
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
+        # Times align mode saw a required block count below what a request
+        # already holds (tolerated, nothing allocated).
+        self.num_align_shrink_events: int = 0
         if self.mamba_cache_mode == "align":
             # Mapping from request ID to the index of the block
             # allocated in the previous step
@@ -1370,13 +1373,16 @@ class MambaManager(SingleTypeKVCacheManager):
             num_required_blocks = (
                 cdiv(num_tokens, self.block_size) + self.num_speculative_blocks
             )
-            if num_required_blocks == len(req_blocks):
-                return []
-            else:
+            if num_required_blocks <= len(req_blocks):
                 if num_required_blocks < len(req_blocks):
-                    logger.error(
-                        "MAMBA_ALIGN_SHRINK request_id=%s num_tokens=%d "
-                        "num_tokens_main_model=%d block_size=%d "
+                    # Async scheduling can re-present a request (e.g. after a
+                    # skipped step) with fewer placeholder tokens than before,
+                    # so the requirement shrinks below what is already held.
+                    # Keep the extra block and allocate nothing.
+                    self.num_align_shrink_events += 1
+                    logger.warning(
+                        "MAMBA_ALIGN_SHRINK (tolerated) request_id=%s "
+                        "num_tokens=%d num_tokens_main_model=%d block_size=%d "
                         "num_speculative_blocks=%d len_req_blocks=%d "
                         "num_required_blocks=%d",
                         request_id,
@@ -1387,10 +1393,8 @@ class MambaManager(SingleTypeKVCacheManager):
                         len(req_blocks),
                         num_required_blocks,
                     )
-                assert num_required_blocks > len(req_blocks), (
-                    "num_required_blocks "
-                    f"{num_required_blocks} < len(req_blocks) {len(req_blocks)}"
-                )
+                return []
+            else:
                 prev_block_len = len(req_blocks)
                 blocks_allocated = request_id in self._allocated_block_reqs
                 # Record the last state block
