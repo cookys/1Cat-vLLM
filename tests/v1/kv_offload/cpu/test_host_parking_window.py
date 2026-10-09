@@ -88,6 +88,25 @@ def test_plan_arms_only_differ_connector_config():
     assert cfg["mamba_state_slots_reference_tokens"] == 32768
 
 
+def test_async_admission_window_knob_is_opt_in():
+    a = args()
+    old = W.command(a, "on1")
+    cfg = json.loads(old[-1])["kv_connector_extra_config"]
+    assert "host_parking_async_admission" not in cfg
+    a.async_admission = False
+    assert W.command(a, "on1") == old
+    a.async_admission = True
+    enabled = W.command(a, "on1")
+    assert enabled[:-1] == old[:-1]
+    assert (
+        json.loads(enabled[-1])["kv_connector_extra_config"][
+            "host_parking_async_admission"
+        ]
+        is True
+    )
+    assert "--kv-transfer-config" not in W.command(a, "off1")
+
+
 def test_fault_command_rank1_second_job():
     import json
 

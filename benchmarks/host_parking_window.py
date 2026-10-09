@@ -207,7 +207,7 @@ def percentile(xs, q):
     return a[i] + (a[min(i + 1, len(a) - 1)] - a[i]) * (x - i)
 
 
-def config(diagnostics=False, quota="native"):
+def config(diagnostics=False, quota="native", async_admission=False):
     result = {
         "kv_connector": "OffloadingConnector",
         "kv_role": "kv_both",
@@ -227,6 +227,8 @@ def config(diagnostics=False, quota="native"):
     }
     if diagnostics:
         result["kv_connector_extra_config"]["parking_diagnostics"] = True
+    if async_admission:
+        result["kv_connector_extra_config"]["host_parking_async_admission"] = True
     if quota == "balanced-32k":
         result["kv_connector_extra_config"]["parking_group_slot_ratios"] = {
             str(g): 2 if g < 6 else 8 if g < 8 else 16 for g in range(9)
@@ -290,6 +292,7 @@ def command(args, arm, fault=None):
         cfg = config(
             getattr(args, "parking_diagnostics", False) or arm == LEGACY_ARM,
             "native" if arm == LEGACY_ARM else getattr(args, "parking_quota", "native"),
+            getattr(args, "async_admission", False),
         )
         if fault:
             cfg["kv_connector_extra_config"].update(
@@ -947,6 +950,7 @@ def run(args):
             "outer_timeout_s": window_budget(args),
             "parking_diagnostics": getattr(args, "parking_diagnostics", False),
             "parking_quota": getattr(args, "parking_quota", "native"),
+            "async_admission": getattr(args, "async_admission", False),
             "quota_external_hit_gate": {
                 "c10_attempts": 100,
                 "minimum_full_hits": 95,
@@ -962,6 +966,7 @@ def run(args):
             "host_config": config(
                 getattr(args, "parking_diagnostics", False),
                 getattr(args, "parking_quota", "native"),
+                getattr(args, "async_admission", False),
             ),
             "gpu_blocks": args.gpu_blocks,
             "git_tip": subprocess.check_output(
@@ -1114,6 +1119,11 @@ def main():
     p.add_argument("--reuse-from", type=Path)
     p.add_argument("--skip-raw", action="store_true")
     p.add_argument("--parking-diagnostics", action="store_true")
+    p.add_argument(
+        "--async-admission",
+        action="store_true",
+        help="Opt in to zero-token parking loads beyond the compute budget",
+    )
     p.add_argument(
         "--parking-quota", choices=("native", "balanced-32k"), default="native"
     )

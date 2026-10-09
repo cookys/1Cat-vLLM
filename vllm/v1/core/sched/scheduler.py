@@ -159,6 +159,8 @@ class Scheduler(SchedulerInterface):
             )
             self.recompute_kv_load_failures = kv_load_failure_policy == "recompute"
 
+        self._configure_host_parking_admission()
+
         self.kv_event_publisher = EventPublisherFactory.create(
             self.kv_events_config,
             self.parallel_config.data_parallel_index,
@@ -926,10 +928,23 @@ class Scheduler(SchedulerInterface):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         # Next, schedule the WAITING requests.
+        if self.host_parking_diagnostics:
+            logger.info(
+                "HOST_PARKING waiting_scan time_ns=%d token_budget=%d "
+                "running=%d waiting=%d skipped=%d async_admission=%s",
+                time.time_ns(),
+                token_budget,
+                len(self.running),
+                len(self.waiting),
+                len(self.skipped_waiting),
+                self.host_parking_async_admission,
+            )
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
 
-            while (self.waiting or self.skipped_waiting) and token_budget > 0:
+            while (self.waiting or self.skipped_waiting) and (
+                token_budget > 0 or self.host_parking_async_admission
+            ):
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
@@ -938,6 +953,20 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                # A completed receive may spend the entire step on its tail.
+                # Still allow NEW asynchronous receives later in the queue:
+                # allocate only their destination KV, never compute tokens.
+                # Do not promote completed/skipped requests without a budget.
+                # Each request is removed into the per-pass queue at most once,
+                # so misses/pending receives cannot spin in this loop.
+                if token_budget == 0 and (
+                    request.status != RequestStatus.WAITING
+                    or request.num_computed_tokens != 0
+                ):
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -1031,6 +1060,12 @@ class Scheduler(SchedulerInterface):
                     assert num_external_computed_tokens > 0
                     num_new_tokens = 0
                 else:
+                    if token_budget == 0:
+                        # A miss/synchronous hit needs compute budget. Preserve
+                        # it for the next pass; look past it for async loads.
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
                     # Number of tokens to be scheduled.
                     # We use `request.num_tokens` instead of
                     # `request.num_prompt_tokens` to consider the resumed
@@ -2308,7 +2343,39 @@ class Scheduler(SchedulerInterface):
         """Returns (num_running_reqs, num_waiting_reqs)."""
         return len(self.running), len(self.waiting) + len(self.skipped_waiting)
 
+    def _configure_host_parking_admission(self) -> None:
+        transfer = self.vllm_config.kv_transfer_config
+        extra = transfer.kv_connector_extra_config if transfer else {}
+        enabled = extra.get("host_parking_async_admission", False)
+        if type(enabled) is not bool:
+            raise ValueError("host_parking_async_admission must be a JSON boolean")
+        parking = (
+            getattr(
+                getattr(self.connector, "connector_scheduler", None),
+                "host_parking",
+                False,
+            )
+            is True
+        )
+        if enabled and not parking:
+            raise ValueError("host_parking_async_admission requires HostParkingSpec")
+        self.host_parking_async_admission = enabled
+        self.host_parking_diagnostics = (
+            parking and extra.get("parking_diagnostics") is True
+        )
+        if enabled:
+            logger.info(
+                "HOST_PARKING async_admission enabled; compute budget unchanged"
+            )
+
     def add_request(self, request: Request) -> None:
+        if self.host_parking_diagnostics:
+            request._parking_engine_received_ns = time.time_ns()
+            logger.info(
+                "HOST_PARKING engine_received request_id=%s engine_received_ns=%d",
+                request.request_id,
+                request._parking_engine_received_ns,
+            )
         existing = self.requests.get(request.request_id)
         if existing is not None:
             update = StreamingUpdate.from_request(request)

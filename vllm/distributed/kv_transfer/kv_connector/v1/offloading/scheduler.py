@@ -62,6 +62,7 @@ class TransferJobStatus:
     sliding_window_block_ids: list[int] | None = None
     failed_count: int = 0
     parking_arrival_ns: int = 0
+    parking_engine_received_ns: int | None = None
     parking_submit_ns: int = 0
     parking_external_tokens: int = 0
 
@@ -797,17 +798,21 @@ class OffloadingConnectorScheduler:
         if self.host_parking:
             job = self._jobs[load_job_id]
             job.parking_arrival_ns = int(request.arrival_time * 1e9)
+            job.parking_engine_received_ns = getattr(
+                request, "_parking_engine_received_ns", None
+            )
             job.parking_submit_ns = time.time_ns()
             job.parking_external_tokens = num_external_tokens
             logger.info(
                 "HOST_PARKING load_submitted request_id=%s job=%d generation=%d "
-                "arrival_ns=%d submit_ns=%d external_tokens=%d",
+                "arrival_ns=%d submit_ns=%d external_tokens=%d engine_received_ns=%s",
                 request.request_id,
                 load_job_id,
                 self._parking_generation,
                 job.parking_arrival_ns,
                 job.parking_submit_ns,
                 num_external_tokens,
+                job.parking_engine_received_ns,
             )
 
         if self._blocks_being_loaded is not None:
@@ -1270,6 +1275,9 @@ class OffloadingConnectorScheduler:
                                 "job": job_id,
                                 "generation": self._parking_generation,
                                 "arrival_ns": job_status.parking_arrival_ns,
+                                "engine_received_ns": (
+                                    job_status.parking_engine_received_ns
+                                ),
                                 "submit_ns": job_status.parking_submit_ns,
                                 "all_rank_events_observed_ns": observed_ns,
                                 "external_tokens": job_status.parking_external_tokens,

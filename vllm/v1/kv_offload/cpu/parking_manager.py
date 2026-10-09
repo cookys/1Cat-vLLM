@@ -147,6 +147,7 @@ class ParkingManager(OffloadingManager):
             json.dumps(
                 dict(
                     step=self._sample_step,
+                    time_ns=time.time_ns(),
                     **self.stats(),
                     lookup_misses=list(self._lookup_samples.values()),
                     reported_evicted_slots_since_sample=dict(self._evictions),
