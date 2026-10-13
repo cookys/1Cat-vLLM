@@ -938,6 +938,35 @@ class EngineCore:
         """Check if engine is sleeping at any level."""
         return self.is_scheduler_paused() or self.model_executor.is_sleeping
 
+    def set_spec_mode(self, mode: str) -> dict:
+        """plan 075 S1: flip the spec mode for requests added from now on.
+
+        ``mode`` is "dflash2" (draft/verify, the configured behaviour) or
+        "nospec" (new requests run with K=0). Requests already in the system
+        keep the K they were added with. Re-sending the current mode changes
+        nothing and reports ``changed: false``.
+        """
+        if mode not in ("dflash2", "nospec"):
+            raise ValueError(f"mode must be 'dflash2' or 'nospec', got {mode!r}")
+        want = mode == "dflash2"
+        was = self.scheduler.get_spec_mode_info()["spec_enabled"]
+        if want != was:
+            self.scheduler.set_spec_enabled(want)
+        return {
+            "mode": mode,
+            "prev": "dflash2" if was else "nospec",
+            "changed": want != was,
+        }
+
+    def get_spec_mode(self) -> dict:
+        """plan 075 S1: current mode and running requests by K (read-only)."""
+        info = self.scheduler.get_spec_mode_info()
+        return {
+            "mode": "dflash2" if info["spec_enabled"] else "nospec",
+            "running_spec": info["running_spec"],
+            "running_nospec": info["running_nospec"],
+        }
+
     def execute_dummy_batch(self):
         self.model_executor.execute_dummy_batch()
 

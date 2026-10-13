@@ -945,6 +945,12 @@ class AsyncLLM(EngineClient):
     async def is_sleeping(self) -> bool:
         return await self.engine_core.is_sleeping_async()
 
+    async def set_spec_mode(self, mode: str) -> dict:
+        return await self.engine_core.set_spec_mode_async(mode)
+
+    async def get_spec_mode(self) -> dict:
+        return await self.engine_core.get_spec_mode_async()
+
     async def add_lora(self, lora_request: LoRARequest) -> bool:
         """Load a new LoRA adapter into the engine for future requests."""
         return await self.engine_core.add_lora_async(lora_request)

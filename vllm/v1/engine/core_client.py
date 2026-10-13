@@ -242,6 +242,12 @@ class EngineCoreClient(ABC):
     async def is_sleeping_async(self) -> bool:
         raise NotImplementedError
 
+    async def set_spec_mode_async(self, mode: str) -> dict:
+        raise NotImplementedError
+
+    async def get_spec_mode_async(self) -> dict:
+        raise NotImplementedError
+
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         raise NotImplementedError
 
@@ -1133,6 +1139,12 @@ class AsyncMPClient(MPClient):
 
     async def is_sleeping_async(self) -> bool:
         return await self.call_utility_async("is_sleeping")
+
+    async def set_spec_mode_async(self, mode: str) -> dict:
+        return await self.call_utility_async("set_spec_mode", mode)
+
+    async def get_spec_mode_async(self) -> dict:
+        return await self.call_utility_async("get_spec_mode")
 
     async def execute_dummy_batch_async(self) -> None:
         await self.call_utility_async("execute_dummy_batch")
