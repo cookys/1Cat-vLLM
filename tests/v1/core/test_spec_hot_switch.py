@@ -16,12 +16,11 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from tests.v1.core import utils
-from tests.v1.core.test_mixed_prefill_budget import factory  # noqa: F401 (fixture)
+from tests.v1.core import test_mixed_prefill_budget as _mixed_prefill_tests
 from vllm.entrypoints.serve.spec_mode.api_router import router as spec_mode_router
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.single_type_kv_cache_manager import (
-    FullAttentionManager,
     MambaManager,
     SlidingWindowManager,
 )
@@ -37,6 +36,9 @@ from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
+
+# Re-export the scheduler factory fixture (config-only OPT model, no weights).
+factory = _mixed_prefill_tests.factory
 
 B = 16  # one block size for every group keeps the lookup arithmetic obvious
 NSPEC = 7
