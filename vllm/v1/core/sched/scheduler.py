@@ -263,10 +263,12 @@ class Scheduler(SchedulerInterface):
         self.use_eagle = False
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
-        # plan 075 S1: engine-wide spec mode flag. Only ever read when a new
-        # request is added (Request.spec_off is fixed then); flipping it does
-        # not touch requests that are already in the system.
-        self.spec_enabled = self.num_spec_tokens > 0
+        # plan 075 S1: engine-wide spec mode flag (True = draft/verify mode,
+        # the engine's configured behaviour). Only ever read when a new request
+        # is added (Request.spec_off is fixed then); flipping it does not touch
+        # requests that are already in the system. Meaningless (and inert) on
+        # an engine without speculative tokens.
+        self.spec_enabled = True
         if speculative_config and speculative_config.use_eagle_kv_cache():
             self.use_eagle = True
 
@@ -2334,7 +2336,7 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             # plan 075 S1: fix K for the request's whole life from the mode
             # in force right now.
-            request.spec_off = not self.spec_enabled
+            request.spec_off = self.num_spec_tokens > 0 and not self.spec_enabled
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.connector is not None:
@@ -2462,15 +2464,16 @@ class Scheduler(SchedulerInterface):
                 "cannot enable speculative decoding: this engine was started "
                 "without speculative tokens"
             )
-        prev = self.spec_enabled
+        prev = self.num_spec_tokens > 0 and self.spec_enabled
         self.spec_enabled = bool(enabled)
         return prev
 
     def get_spec_mode_info(self) -> dict[str, int | bool]:
         """plan 075 S1: read-only view of the mode and of running requests by K."""
-        running_nospec = sum(1 for r in self.running if r.spec_off)
+        spec_capable = self.num_spec_tokens > 0
+        running_nospec = sum(1 for r in self.running if r.spec_off or not spec_capable)
         return {
-            "spec_enabled": self.spec_enabled,
+            "spec_enabled": spec_capable and self.spec_enabled,
             "running_spec": len(self.running) - running_nospec,
             "running_nospec": running_nospec,
         }

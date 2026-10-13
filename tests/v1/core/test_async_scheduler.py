@@ -87,6 +87,7 @@ def test_spec_decode_stops_scheduling_drafts_at_drafter_context_limit(
         num_output_placeholders=0,
         num_computed_tokens=num_computed_tokens,
         spec_token_ids=[],
+        spec_off=False,
     )
     scheduler.requests = {"r0": request}
     scheduler_output = SchedulerOutput.make_empty()
