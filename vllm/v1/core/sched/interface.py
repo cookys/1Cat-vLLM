@@ -197,6 +197,14 @@ class SchedulerInterface(ABC):
     def set_pause_state(self, pause_state: PauseState) -> None:
         raise NotImplementedError
 
+    def set_spec_enabled(self, enabled: bool) -> bool:
+        """plan 075 S1: flip the spec mode for newly added requests; returns prev."""
+        raise NotImplementedError
+
+    def get_spec_mode_info(self) -> dict[str, int | bool]:
+        """plan 075 S1: ``spec_enabled`` plus running request counts by K."""
+        raise NotImplementedError
+
     @abstractmethod
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False

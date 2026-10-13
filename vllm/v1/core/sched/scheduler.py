@@ -2433,6 +2433,31 @@ class Scheduler(SchedulerInterface):
     def set_pause_state(self, pause_state: PauseState) -> None:
         self._pause_state = pause_state
 
+    def set_spec_enabled(self, enabled: bool) -> bool:
+        """plan 075 S1: flip the engine spec mode for requests added from now on.
+
+        Returns the previous value. Only affects ``Request.spec_off`` of
+        requests added afterwards; requests already in the system keep the K
+        they were added with. Re-sending the current mode is a no-op.
+        """
+        if enabled and self.num_spec_tokens <= 0:
+            raise ValueError(
+                "cannot enable speculative decoding: this engine was started "
+                "without speculative tokens"
+            )
+        prev = self.spec_enabled
+        self.spec_enabled = bool(enabled)
+        return prev
+
+    def get_spec_mode_info(self) -> dict[str, int | bool]:
+        """plan 075 S1: read-only view of the mode and of running requests by K."""
+        running_nospec = sum(1 for r in self.running if r.spec_off)
+        return {
+            "spec_enabled": self.spec_enabled,
+            "running_spec": len(self.running) - running_nospec,
+            "running_nospec": running_nospec,
+        }
+
     def get_num_unfinished_requests(self) -> int:
         if self._pause_state == PauseState.PAUSED_ALL:
             return 0
