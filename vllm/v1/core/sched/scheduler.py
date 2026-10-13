@@ -263,6 +263,10 @@ class Scheduler(SchedulerInterface):
         self.use_eagle = False
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
+        # plan 075 S1: engine-wide spec mode flag. Only ever read when a new
+        # request is added (Request.spec_off is fixed then); flipping it does
+        # not touch requests that are already in the system.
+        self.spec_enabled = self.num_spec_tokens > 0
         if speculative_config and speculative_config.use_eagle_kv_cache():
             self.use_eagle = True
 
@@ -2325,6 +2329,9 @@ class Scheduler(SchedulerInterface):
         else:
             if request.resumable:
                 request.streaming_queue = deque()
+            # plan 075 S1: fix K for the request's whole life from the mode
+            # in force right now.
+            request.spec_off = not self.spec_enabled
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.connector is not None:

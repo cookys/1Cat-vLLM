@@ -151,6 +151,12 @@ class Request:
         self.num_in_flight_tokens = 0
 
         self.spec_token_ids: list[int] = []
+        # plan 075 S1: per-request speculative depth, fixed for the request's
+        # whole life. True means K=0 (no draft tokens, no GDN spec pages, no
+        # draft pages). Set once by Scheduler.add_request from the engine's
+        # current spec mode and never changed afterwards, so a request that
+        # started with K=7 finishes with K=7 across any mode flips.
+        self.spec_off: bool = False
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
 
