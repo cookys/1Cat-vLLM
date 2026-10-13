@@ -75,12 +75,15 @@ def make_cfg(num_blocks=600, draft_is_eagle=True):
 
 @pytest.fixture
 def mgr():
+    """The production shape: DFlash does not flag its draft group, the scheduler
+    asks the manager to treat the sliding-window group as the draft group."""
     return KVCacheManager(
-        make_cfg(),
+        make_cfg(draft_is_eagle=False),
         max_model_len=4096,
         hash_block_size=B,
         enable_caching=True,
-        use_eagle=True,
+        use_eagle=False,
+        draft_sliding_window_groups=True,
     )
 
 
@@ -145,7 +148,19 @@ def test_draft_group_is_found_and_marked(mgr):
     assert isinstance(c.single_type_managers[2], SlidingWindowManager)
 
 
-def test_draft_group_not_marked_without_explicit_flag():
+def test_draft_group_explicit_eagle_flag_also_marks():
+    m = KVCacheManager(
+        make_cfg(draft_is_eagle=True),
+        max_model_len=4096,
+        hash_block_size=B,
+        enable_caching=True,
+        use_eagle=True,
+    )
+    assert m.coordinator.draft_group_ids == frozenset({2})
+    assert m.coordinator.single_type_managers[2].is_draft_group
+
+
+def test_draft_group_not_marked_without_request():
     m = KVCacheManager(
         make_cfg(draft_is_eagle=False),
         max_model_len=4096,
@@ -155,6 +170,42 @@ def test_draft_group_not_marked_without_explicit_flag():
     )
     assert m.coordinator.draft_group_ids == frozenset()
     assert not any(mg.is_draft_group for mg in m.coordinator.single_type_managers)
+
+
+def test_sole_sliding_window_group_is_never_the_draft_group():
+    cfg = KVCacheConfig(
+        num_blocks=100,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["sw"],
+                SlidingWindowSpec(
+                    block_size=B,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float16,
+                    sliding_window=2 * B,
+                ),
+            )
+        ],
+    )
+    m = KVCacheManager(
+        cfg,
+        max_model_len=4096,
+        hash_block_size=B,
+        enable_caching=True,
+        draft_sliding_window_groups=True,
+    )
+    assert m.coordinator.draft_group_ids == frozenset()
+
+
+def test_scheduler_requests_draft_marking_only_for_dflash_family():
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    has = Scheduler._has_draft_sliding_window_group
+    assert has(None) is False
+    assert has(SimpleNamespace(use_dflash_family=lambda: False)) is False
+    assert has(SimpleNamespace(use_dflash_family=lambda: True)) is True
 
 
 def test_k7_k0_coexist_allocator(mgr):
@@ -305,13 +356,10 @@ def test_skip_group_ids_hit_across_modes(mgr, producer_spec_off):
     probe = new_req("probe", total, False)
     hashes, limit = probe.block_hashes, probe.num_tokens - 1
 
-    # draft group taking part: nospec-era prefixes never hit; dflash2-era only
-    # as far as the draft window allows
+    # draft group taking part: a prefix cached in nospec mode has no draft
+    # pages, so the whole lookup collapses to a miss; a dflash2-era prefix hits
     blocks, hit_all = c.find_longest_cache_hit(hashes, limit, skip_group_ids=frozenset())
-    if producer_spec_off:
-        assert hit_all == 0
-    else:
-        assert 0 < hit_all < 8 * B
+    assert hit_all == (0 if producer_spec_off else 8 * B)
 
     # draft group skipped: main layers and the Mamba state hit the full prefix,
     # the draft group contributes nothing and does not shorten the hit

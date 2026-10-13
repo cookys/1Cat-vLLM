@@ -86,10 +86,11 @@ class KVCacheCoordinator(ABC):
     def _mark_draft_groups(self) -> None:
         """plan 075 S1: find the draft sliding-window group(s).
 
-        Only groups explicitly flagged ``is_eagle_group`` and managed by a
-        SlidingWindowManager count (the DFlash drafter's KV). The
-        "flag everything" fallback of ``eagle_group_ids`` is deliberately not
-        used here: a fallback-flagged main group must never be skipped.
+        Groups explicitly flagged ``is_eagle_group`` and managed by a
+        SlidingWindowManager count. The "flag everything" fallback of
+        ``eagle_group_ids`` is deliberately not used here: a fallback-flagged
+        main group must never be skipped. DFlash does not set the flag; see
+        ``mark_draft_sliding_window_groups``.
         """
         groups = self.kv_cache_config.kv_cache_groups
         draft = frozenset(
@@ -101,6 +102,27 @@ class KVCacheCoordinator(ABC):
         if len(draft) >= len(groups):
             draft = frozenset()
         self.draft_group_ids: frozenset[int] = draft
+        for i in draft:
+            self.single_type_managers[i].is_draft_group = True
+
+    def mark_draft_sliding_window_groups(self) -> None:
+        """plan 075 S1: treat every sliding-window group as the draft group.
+
+        The DFlash family's draft attention is the only sliding-window KV in
+        its hybrid layout (target = full attention + Mamba/GDN), and 1Cat's
+        DFlash does not flag its group ``is_eagle_group`` (that flag is only
+        set for DeepSeek-V4), so the scheduler asks for this explicitly when
+        the speculative method is a DFlash variant. Never marks every group.
+        """
+        groups = self.kv_cache_config.kv_cache_groups
+        draft = frozenset(
+            i
+            for i in range(len(groups))
+            if isinstance(self.single_type_managers[i], SlidingWindowManager)
+        )
+        if not draft or len(draft) >= len(groups):
+            return
+        self.draft_group_ids = self.draft_group_ids | draft
         for i in draft:
             self.single_type_managers[i].is_draft_group = True
 

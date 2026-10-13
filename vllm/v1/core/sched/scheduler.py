@@ -288,6 +288,9 @@ class Scheduler(SchedulerInterface):
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
             prefix_cache_retention_interval=self.cache_config.prefix_cache_retention_interval,
+            draft_sliding_window_groups=self._has_draft_sliding_window_group(
+                speculative_config
+            ),
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -2437,6 +2440,11 @@ class Scheduler(SchedulerInterface):
 
     def set_pause_state(self, pause_state: PauseState) -> None:
         self._pause_state = pause_state
+
+    @staticmethod
+    def _has_draft_sliding_window_group(speculative_config) -> bool:
+        """plan 075 S1: DFlash drafters own the (only) sliding-window KV group."""
+        return bool(speculative_config and speculative_config.use_dflash_family())
 
     def _all_scheduled_spec_off(self, num_scheduled_tokens: dict[str, int]) -> bool:
         """plan 075 S1: True iff the step has rows and every one of them is K=0.

@@ -126,6 +126,7 @@ class KVCacheManager:
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
         prefix_cache_retention_interval: int | None = None,
+        draft_sliding_window_groups: bool = False,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -158,6 +159,9 @@ class KVCacheManager:
         self.coordinator.configure_prefix_cache_retention(
             prefix_cache_retention_interval
         )
+        if draft_sliding_window_groups:
+            # plan 075 S1: the sliding-window group is the speculator's draft KV.
+            self.coordinator.mark_draft_sliding_window_groups()
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
