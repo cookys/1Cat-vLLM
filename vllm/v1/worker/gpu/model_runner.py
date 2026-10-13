@@ -1515,6 +1515,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # when encoder inputs are scheduled, because this step updates
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
+        if (  # S0D_B1 (plan 075 S0d candidate A): V1 parity, profile run eager (gpu_model_runner.py skip_compiled_profile)
+            is_profile
+            and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+            and envs.VLLM_SM70_FLASH_V100_0DOT3_EAGER_PROFILE_RUN
+            and current_platform.is_device_capability(70)
+        ):
+            skip_compiled = True
 
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
