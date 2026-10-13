@@ -1211,6 +1211,15 @@ class MambaManager(SingleTypeKVCacheManager):
             # The set of the requests that have been allocated blocks
             self._allocated_block_reqs: set[str] = set()
 
+    def _nspec(self, request_id: str) -> int:
+        """plan 075 S1: speculative blocks this request carries.
+
+        K=0 requests (registered via ``register_request_spec``) carry none; the
+        value is fixed for the request's life, so its block-table layout never
+        shifts under it.
+        """
+        return 0 if request_id in self._spec_off_reqs else self.num_speculative_blocks
+
     @classmethod
     def find_longest_cache_hit(
         cls,
@@ -1312,6 +1321,7 @@ class MambaManager(SingleTypeKVCacheManager):
         apply_admission_cap: bool = False,
     ) -> int:
         assert isinstance(self.kv_cache_spec, MambaSpec)
+        nspec = self._nspec(request_id)
         if (
             len(new_computed_blocks) > 0
             and new_computed_blocks[-1].block_hash in self.cached_blocks_this_step
@@ -1324,9 +1334,9 @@ class MambaManager(SingleTypeKVCacheManager):
         if self.mamba_cache_mode != "align":
             # Allocate extra `num_speculative_blocks` blocks for
             # speculative decoding (MTP/EAGLE) with linear attention.
-            if self.num_speculative_blocks > 0:
+            if nspec > 0:
                 num_tokens += (
-                    self.kv_cache_spec.block_size * self.num_speculative_blocks
+                    self.kv_cache_spec.block_size * nspec
                 )
             return super().get_num_blocks_to_allocate(
                 request_id,
@@ -1347,7 +1357,7 @@ class MambaManager(SingleTypeKVCacheManager):
             # NOTE(tdouble): this is an over-estimate of how many blocks we need because
             # num_tokens can include draft tokens that will later be rejected.
             num_required_blocks = (
-                cdiv(num_tokens, self.block_size) + self.num_speculative_blocks
+                cdiv(num_tokens, self.block_size) + nspec
             )
             num_new_blocks = (
                 num_required_blocks
@@ -1362,7 +1372,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 else:
                     # First prefill. Allocate 1 block for running state and the
                     # speculative blocks.
-                    num_new_blocks = 1 + self.num_speculative_blocks
+                    num_new_blocks = 1 + nspec
             # F1: the requirement may shrink below the blocks already held
             # (async skipped step); never report a negative allocation need.
             num_new_blocks = max(num_new_blocks, 0)
@@ -1376,11 +1386,12 @@ class MambaManager(SingleTypeKVCacheManager):
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
     ) -> list[KVCacheBlock]:
         assert isinstance(self.kv_cache_spec, MambaSpec)
+        nspec = self._nspec(request_id)
         if self.mamba_cache_mode != "align":
             # Allocate extra `num_speculative_blocks` blocks for
             # speculative decoding (MTP/EAGLE) with linear attention.
-            if self.num_speculative_blocks > 0:
-                num_tokens += self.block_size * self.num_speculative_blocks
+            if nspec > 0:
+                num_tokens += self.block_size * nspec
             return super().allocate_new_blocks(
                 request_id, num_tokens, num_tokens_main_model
             )
@@ -1395,7 +1406,7 @@ class MambaManager(SingleTypeKVCacheManager):
             # NOTE(tdouble): this is an over-estimate of how many blocks we need because
             # num_tokens can include draft tokens that will later be rejected.
             num_required_blocks = (
-                cdiv(num_tokens, self.block_size) + self.num_speculative_blocks
+                cdiv(num_tokens, self.block_size) + nspec
             )
             if num_required_blocks <= len(req_blocks):
                 if num_required_blocks < len(req_blocks):
@@ -1413,7 +1424,7 @@ class MambaManager(SingleTypeKVCacheManager):
                         num_tokens,
                         num_tokens_main_model,
                         self.block_size,
-                        self.num_speculative_blocks,
+                        nspec,
                         len(req_blocks),
                         num_required_blocks,
                     )
@@ -1426,7 +1437,7 @@ class MambaManager(SingleTypeKVCacheManager):
                     # We always save the running state at the last
                     # (1 + num_speculative_blocks) block
                     self.last_state_block_idx[request_id] = (
-                        prev_block_len - 1 - self.num_speculative_blocks
+                        prev_block_len - 1 - nspec
                     )
                 elif prev_block_len > 0:
                     # When a new request hits the prefix cache, the last block
@@ -1434,7 +1445,7 @@ class MambaManager(SingleTypeKVCacheManager):
                     self.last_state_block_idx[request_id] = prev_block_len - 1
 
                 num_skipped_blocks = (
-                    num_required_blocks - self.num_speculative_blocks - 1
+                    num_required_blocks - nspec - 1
                 )
                 # null blocks
                 if prev_block_len < num_skipped_blocks:
@@ -1448,7 +1459,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 if blocks_allocated:
                     # reuse previous speculative blocks in this step
                     for block_idx in range(
-                        prev_block_len - self.num_speculative_blocks, prev_block_len
+                        prev_block_len - nspec, prev_block_len
                     ):
                         if block_idx < num_skipped_blocks:
                             req_blocks.append(req_blocks[block_idx])
@@ -1459,7 +1470,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 if blocks_allocated:
                     assert num_new_blocks <= 1
                 else:
-                    assert num_new_blocks <= self.num_speculative_blocks + 1
+                    assert num_new_blocks <= nspec + 1
                 new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
                 req_blocks.extend(new_blocks)
                 self._allocated_block_reqs.add(request_id)
