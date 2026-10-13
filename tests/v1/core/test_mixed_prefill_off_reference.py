@@ -18,9 +18,13 @@ import pytest
 from vllm.v1.request import RequestStatus
 
 from . import utils
-from .test_mixed_prefill_budget import complete, factory  # noqa: F401
+from . import test_mixed_prefill_budget as _budget_tests
+from .test_mixed_prefill_budget import complete
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
+
+# Re-export the scheduler factory fixture.
+factory = _budget_tests.factory
 
 
 def replay(make_scheduler, async_scheduling, spec, blocks, target=0):
