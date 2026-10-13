@@ -366,7 +366,14 @@ class KVCacheCoordinator(ABC):
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
+        skip_group_ids: frozenset[int] = frozenset(),
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+        """Longest common cache hit over the participating groups.
+
+        plan 075 S1: groups in ``skip_group_ids`` (the draft group) do not take
+        part: they neither constrain the hit length nor contribute blocks, and
+        their slot in the returned tuple is an empty list.
+        """
         pass
 
     def new_step_starts(self) -> None:
@@ -416,6 +423,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
+        skip_group_ids: frozenset[int] = frozenset(),
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         blocks: tuple[list[KVCacheBlock], ...] = tuple(
             [] for _ in range(self.num_single_type_manager)
@@ -478,7 +486,10 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
+        skip_group_ids: frozenset[int] = frozenset(),
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+        # A single group is never a skippable draft group (see
+        # ``_mark_draft_groups``), so ``skip_group_ids`` is ignored here.
         hit_blocks = self.single_type_managers[0].find_longest_cache_hit(
             block_hashes=block_hashes,
             max_length=max_cache_hit_length,
@@ -640,6 +651,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
+        skip_group_ids: frozenset[int] = frozenset(),
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         """
         Find the longest cache hit using an iterative fixed-point algorithm.
@@ -652,6 +664,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         Args:
             block_hashes: The block hashes of the request.
             max_cache_hit_length: The maximum length of the cache hit.
+            skip_group_ids: plan 075 S1: groups that do not take part in the
+                lookup (the draft group). They neither shorten the hit nor
+                return blocks; their slot in the result is ``[]``.
 
         Returns:
             A tuple containing:
@@ -686,9 +701,12 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         while True:
             curr_hit_length = hit_length
 
-            for idx, (spec, group_ids, manager_cls, use_eagle) in enumerate(
+            for idx, (spec, all_group_ids, manager_cls, use_eagle) in enumerate(
                 self.attention_groups
             ):
+                group_ids = [g for g in all_group_ids if g not in skip_group_ids]
+                if not group_ids:
+                    continue
                 cached_blocks = hit_blocks_by_group[group_ids[0]]
                 if isinstance(spec, FullAttentionSpec) and cached_blocks is not None:
                     # Full attention is downward-closed: we only need to look

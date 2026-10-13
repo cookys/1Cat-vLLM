@@ -236,7 +236,12 @@ class KVCacheManager:
         max_cache_hit_length = request.num_tokens - 1
         computed_blocks, num_new_computed_tokens = (
             self.coordinator.find_longest_cache_hit(
-                request.block_hashes, max_cache_hit_length
+                request.block_hashes,
+                max_cache_hit_length,
+                # plan 075 S1: the draft group never takes part in the hit
+                # (both modes), so a prefix cached in either mode hits on the
+                # main layers and the Mamba state.
+                skip_group_ids=self.coordinator.draft_group_ids,
             )
         )
 
