@@ -1763,6 +1763,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
+            skip_draft_propose=scheduler_output.skip_draft_propose,
         )
         self._sm70_v2_mtp_profile_pending = mtp_profile_ctx
 
@@ -1786,6 +1787,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
+        skip_draft_propose = self.execute_model_state.skip_draft_propose
         self.execute_model_state = None
         mtp_profile_ctx = self._sm70_v2_mtp_profile_pending
         self._sm70_v2_mtp_profile_pending = None
@@ -1894,7 +1896,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 time.perf_counter() - mtp_profile_ctx["target_wall_start"]
             ) * 1000.0
 
-        if self.speculator is not None:
+        if self.speculator is not None and skip_draft_propose:
+            # plan 075 S1: every row of this step is a K=0 request, so nobody
+            # consumes a draft next step. Skip the drafter (no context KV
+            # write, no draft graph) and report zero-width drafts. Drafts of
+            # other (K>0) requests live in req_states.draft_tokens and are not
+            # touched. The scheduler never sets the flag for a batch that
+            # contains a K>0 row, including a K>0 prefill chunk.
+            no_drafts = torch.empty(
+                (input_batch.num_reqs, 0),
+                dtype=self.req_states.draft_tokens.dtype,
+                device=self.device,
+            )
+            self.draft_tokens_handler.set_draft_tokens(
+                input_batch, no_drafts, num_draft_tokens=0
+            )
+        elif self.speculator is not None:
             assert self.sampler is not None
             requires_host_token_state = bool(
                 getattr(self.speculator, "requires_host_token_state", False)
@@ -2111,3 +2128,5 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     finished_req_ids: set[str]
+    # plan 075 S1: the scheduler marked every row of this step as K=0.
+    skip_draft_propose: bool = False

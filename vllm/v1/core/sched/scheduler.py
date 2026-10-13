@@ -1315,6 +1315,7 @@ class Scheduler(SchedulerInterface):
             scheduled_ddtree_payloads=scheduled_ddtree_payloads or None,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
+            skip_draft_propose=self._all_scheduled_spec_off(num_scheduled_tokens),
             preempted_req_ids={req.request_id for req in preempted_reqs},
             # finished_req_ids is an existing state in the scheduler,
             # instead of being newly scheduled in this step.
@@ -2434,6 +2435,16 @@ class Scheduler(SchedulerInterface):
 
     def set_pause_state(self, pause_state: PauseState) -> None:
         self._pause_state = pause_state
+
+    def _all_scheduled_spec_off(self, num_scheduled_tokens: dict[str, int]) -> bool:
+        """plan 075 S1: True iff the step has rows and every one of them is K=0.
+
+        Only meaningful on a speculative engine (``num_spec_tokens > 0``); on a
+        plain engine there is no drafter to skip.
+        """
+        if self.num_spec_tokens <= 0 or not num_scheduled_tokens:
+            return False
+        return all(self.requests[rid].spec_off for rid in num_scheduled_tokens)
 
     def _lookahead_tokens_for(self, request: Request) -> int:
         """plan 075 S1: per-request lookahead; K=0 requests reserve none."""
