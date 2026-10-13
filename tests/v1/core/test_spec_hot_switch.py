@@ -740,3 +740,143 @@ def test_draft_group_startup_log_literal(monkeypatch):
         _vcfg(), DFLASH
     )
     assert seen == []
+
+
+# D1 wiring: Scheduler.__init__ really hands the flag to KVCacheManager
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("flag", [True, False])
+def test_scheduler_init_passes_draft_sliding_window_groups_to_kv_manager(
+    factory, monkeypatch, flag
+):
+    from vllm.v1.core.sched import scheduler as sched_mod
+
+    seen = []
+    real = sched_mod.KVCacheManager
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(sched_mod, "KVCacheManager", spy)
+    monkeypatch.setattr(
+        sched_mod.Scheduler,
+        "_has_draft_sliding_window_group",
+        staticmethod(lambda speculative_config: flag),
+    )
+    factory()  # runs the real Scheduler.__init__
+    assert len(seen) == 1
+    assert seen[0]["draft_sliding_window_groups"] is flag
+
+
+# F1: K=0 rows must never write draft KV into someone else's page
+# --------------------------------------------------------------------------
+
+DRAFT_BS = 16
+MAX_BLOCKS = 8
+
+
+def _gather(batch_to_req, src_rows, num_blocks, dst, num_reqs_padded):
+    """Run the real _gather_block_tables_kernel on CPU tensors (one group)."""
+    from vllm.v1.worker.gpu.block_table import _gather_block_tables_kernel
+
+    src = torch.zeros(4, MAX_BLOCKS, dtype=torch.int32)
+    for r, ids in src_rows.items():
+        src[r, : len(ids)] = torch.tensor(ids, dtype=torch.int32)
+    nb = torch.zeros(1, 4, dtype=torch.int32)
+    for r, n in num_blocks.items():
+        nb[0, r] = n
+    ptr = lambda t: torch.tensor([t.data_ptr()], dtype=torch.uint64)
+    _gather_block_tables_kernel[(1, num_reqs_padded)](
+        torch.tensor(batch_to_req, dtype=torch.int32),
+        ptr(src),
+        ptr(dst),
+        torch.tensor([src.stride(0)], dtype=torch.int64),
+        nb,
+        nb.stride(0),
+        len(batch_to_req),
+        BLOCK_SIZE=4,
+    )
+
+
+def _dflash_slots(table, positions_per_req):
+    """Run the real _prepare_dflash_inputs_kernel; return (ctx, query) slots."""
+    from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+        _prepare_dflash_inputs_kernel,
+    )
+
+    nq = 3  # query tokens per request
+    n_req = len(positions_per_req)
+    qsl = [0]
+    for p in positions_per_req:
+        qsl.append(qsl[-1] + len(p))
+    total = qsl[-1]
+    pos = torch.tensor([x for p in positions_per_req for x in p], dtype=torch.int64)
+    i32 = lambda n, v=0: torch.full((n,), v, dtype=torch.int32)
+    out_ctx = torch.full((total,), 12345, dtype=torch.int64)
+    out_q = torch.full((64,), 12345, dtype=torch.int64)
+    zeros = lambda n: torch.zeros(n, dtype=torch.int64)
+    max_reqs = 4
+    _prepare_dflash_inputs_kernel[(n_req, 1)](
+        i32(64), zeros(64), i32(max_reqs + 1), i32(max_reqs), out_q,
+        zeros(total), out_ctx,
+        i32(64), zeros(64), i32(64),
+        torch.zeros(8), zeros(8),
+        pos, torch.tensor(qsl, dtype=torch.int32),
+        torch.arange(n_req, dtype=torch.int32),
+        i32(8, 1), i32(8, 1), i32(n_req, 1), i32(n_req, 0),
+        torch.zeros(8), zeros(8),
+        table, table.stride(0),
+        0, DRAFT_BS, nq, nq - 1, max_reqs, 64, 4096, 0,
+        SAMPLE_FROM_ANCHOR=False, PAD_SLOT_ID=PAD_SLOT_ID,
+        CP_SIZE=1, CP_INTERLEAVE=1, BLOCK_SIZE=32,
+    )
+    return out_ctx, out_q
+
+
+def test_k0_row_in_mixed_batch_never_writes_draft_kv():
+    """Previous step: batch slot 1 was a K=7 request owning draft pages 9,10.
+    This step slot 1 is a K=0 request (zero draft blocks) next to two K=7
+    requests. Its stale pages 9,10 must not survive into the draft table."""
+    from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+
+    dst = torch.zeros(4, MAX_BLOCKS, dtype=torch.int32)
+    # step N-1: req0 [5,6], req1 [9,10], req2 [7,8]
+    _gather(
+        [0, 1, 2],
+        {0: [5, 6], 1: [9, 10], 2: [7, 8]},
+        {0: 2, 1: 2, 2: 2},
+        dst,
+        4,
+    )
+    assert dst[1, :2].tolist() == [9, 10]
+    # step N: req1 finished; slot 1 now holds new K=0 request 3 with no pages
+    _gather(
+        [0, 3, 2],
+        {0: [5, 6], 2: [7, 8]},
+        {0: 2, 3: 0, 2: 2},
+        dst,
+        4,
+    )
+    assert dst[1].tolist() == [0] * MAX_BLOCKS  # null-block row
+    assert dst[0, :2].tolist() == [5, 6] and dst[2, :2].tolist() == [7, 8]
+
+    ctx, q = _dflash_slots(dst, [[20, 21], [18, 19], [4, 5]])
+    # K=0 row (tokens 2..3, query idx 3..5): everything is padding
+    assert ctx[2:4].tolist() == [PAD_SLOT_ID] * 2
+    assert q[3:6].tolist() == [PAD_SLOT_ID] * 3
+    # K=7 rows untouched: pos 20 -> block 1 (=6) offset 4; pos 4 -> block 0 (=7)
+    assert ctx[0:2].tolist() == [6 * DRAFT_BS + 4, 6 * DRAFT_BS + 5]
+    assert ctx[4:6].tolist() == [7 * DRAFT_BS + 4, 7 * DRAFT_BS + 5]
+    assert q[0:3].tolist() == [6 * DRAFT_BS + 6 + k for k in range(3)]
+    assert q[6:9].tolist() == [7 * DRAFT_BS + 6 + k for k in range(3)]
+
+
+def test_all_live_rows_with_blocks_are_copied_unchanged():
+    dst = torch.full((4, MAX_BLOCKS), 99, dtype=torch.int32)
+    _gather([1, 0], {0: [3], 1: [4, 5, 6]}, {0: 1, 1: 3}, dst, 3)
+    assert dst[0, :3].tolist() == [4, 5, 6] and dst[0, 3] == 99  # tail untouched
+    assert dst[1, :1].tolist() == [3]
+    assert dst[2].tolist() == [0] * MAX_BLOCKS  # padded row zeroed

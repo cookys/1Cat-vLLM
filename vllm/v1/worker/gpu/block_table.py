@@ -220,6 +220,17 @@ def _gather_block_tables_kernel(
     group_num_blocks_ptr = num_blocks_ptr + group_id * num_blocks_stride
     num_blocks = tl.load(group_num_blocks_ptr + req_idx)
 
+    if num_blocks == 0:
+        # plan 075 S1 F1: a row with no blocks in this group (a K=0 request in
+        # the draft group never gets pages there) must read as all null block,
+        # exactly like a padded row. Otherwise the previous step's entries at
+        # this batch position survive and the DFlash context/query slot
+        # kernels would write draft KV into pages that now belong to others.
+        for i in tl.range(0, max_num_blocks, BLOCK_SIZE):
+            offset = i + tl.arange(0, BLOCK_SIZE)
+            tl.store(dst_row_ptr + offset, 0, mask=offset < max_num_blocks)
+        return
+
     src_block_table_ptr = _load_ptr(src_block_table_ptrs + group_id, tl.int32)
     src_row_ptr = src_block_table_ptr + req_idx * stride
 
