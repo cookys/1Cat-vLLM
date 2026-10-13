@@ -1794,7 +1794,7 @@ class Scheduler(SchedulerInterface):
             self.routed_experts_mgr.store_batch(
                 routed.routing_data, routed.slot_mapping
             )
-            routing_data = re.routing_data.astype(
+            routing_data = routed.routing_data.astype(
                 self.routed_experts_mgr.routed_experts_by_slot.dtype,
                 copy=False,
             )

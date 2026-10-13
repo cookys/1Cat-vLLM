@@ -895,3 +895,32 @@ def test_scheduler_init_calls_draft_group_check(factory, monkeypatch):
     )
     factory()  # real Scheduler.__init__
     assert len(calls) == 1
+
+
+def test_update_from_output_routed_experts_branch_runs(factory):
+    """Walks the real update_from_output through the routed_experts branch
+    (the renamed local lives there; pyflakes cannot see a stale `re.` use)."""
+    import numpy as np
+    from vllm.v1.outputs import RoutedExpertsLists
+
+    scheduler = factory()
+    stored = []
+    scheduler.routed_experts_mgr = SimpleNamespace(
+        store_batch=lambda data, slots: stored.append((data, slots)),
+        routed_experts_by_slot=np.zeros((8, 1, 1), dtype=np.int16),
+    )
+    req = utils.create_requests(1, num_tokens=8, req_ids=["r"], max_tokens=16)[0]
+    scheduler.add_request(req)
+    step = scheduler.schedule()
+    n = step.num_scheduled_tokens["r"]
+    routed = RoutedExpertsLists(
+        np.ones((n, 1, 1), dtype=np.int32), np.arange(n, dtype=np.int64)
+    )
+    out = ModelRunnerOutput(
+        req_ids=["r"],
+        req_id_to_index={"r": 0},
+        sampled_token_ids=[[42]],
+        routed_experts=routed,
+    )
+    scheduler.update_from_output(step, out)
+    assert len(stored) == 1 and stored[0][0] is routed.routing_data
