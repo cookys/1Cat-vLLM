@@ -1790,8 +1790,10 @@ class Scheduler(SchedulerInterface):
         routing_data = None
         routing_offsets: dict[str, int] = {}
         if model_runner_output.routed_experts is not None:
-            re = model_runner_output.routed_experts
-            self.routed_experts_mgr.store_batch(re.routing_data, re.slot_mapping)
+            routed = model_runner_output.routed_experts
+            self.routed_experts_mgr.store_batch(
+                routed.routing_data, routed.slot_mapping
+            )
             routing_data = re.routing_data.astype(
                 self.routed_experts_mgr.routed_experts_by_slot.dtype,
                 copy=False,
@@ -2462,11 +2464,14 @@ class Scheduler(SchedulerInterface):
         for gid in sorted(draft_group_ids):
             for name in kv_cache_config.kv_cache_groups[gid].layer_names:
                 m = cls._LAYER_IDX_RE.search(name)
-                assert m is not None and int(m.group(1)) >= first_draft_layer_idx, (
-                    f"plan075: KV group {gid} is marked as the draft group but "
-                    f"layer {name!r} is not a drafter layer (drafter layers have "
-                    f"layer index >= {first_draft_layer_idx})"
-                )
+                # RuntimeError, not assert: this is the startup gate and must
+                # survive ``python -O``.
+                if m is None or int(m.group(1)) < first_draft_layer_idx:
+                    raise RuntimeError(
+                        f"plan075: KV group {gid} is marked as the draft group but "
+                        f"layer {name!r} is not a drafter layer (drafter layers "
+                        f"have layer index >= {first_draft_layer_idx})"
+                    )
 
     def _log_and_check_draft_groups(self, vllm_config, speculative_config) -> None:
         draft_ids = sorted(self.kv_cache_manager.coordinator.draft_group_ids)

@@ -716,7 +716,7 @@ def test_draft_group_assert_passes_for_all_drafter_layers(monkeypatch):
 def test_draft_group_assert_fails_when_target_layer_mixed_in(bad):
     names = [f"model.layers.{TARGET_LAYERS}.self_attn.attn", bad]
     s = _bare_scheduler(_named_cfg(names), {2})
-    with pytest.raises(AssertionError, match="not a drafter layer"):
+    with pytest.raises(RuntimeError, match="not a drafter layer"):
         s._log_and_check_draft_groups(_vcfg(), DFLASH)
 
 
@@ -880,3 +880,18 @@ def test_all_live_rows_with_blocks_are_copied_unchanged():
     assert dst[0, :3].tolist() == [4, 5, 6] and dst[0, 3] == 99  # tail untouched
     assert dst[1, :1].tolist() == [3]
     assert dst[2].tolist() == [0] * MAX_BLOCKS  # padded row zeroed
+
+
+def test_scheduler_init_calls_draft_group_check(factory, monkeypatch):
+    from vllm.v1.core.sched import scheduler as sched_mod
+
+    calls = []
+    monkeypatch.setattr(
+        sched_mod.Scheduler,
+        "_log_and_check_draft_groups",
+        lambda self, vllm_config, speculative_config: calls.append(
+            (vllm_config, speculative_config)
+        ),
+    )
+    factory()  # real Scheduler.__init__
+    assert len(calls) == 1
