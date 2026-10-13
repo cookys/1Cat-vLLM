@@ -778,6 +778,40 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         super().__init__(kv_cache_spec, **kwargs)
         self.sliding_window = kv_cache_spec.sliding_window
 
+    # plan 075 S1: K=0 requests do not use the draft group, so on the draft
+    # group (``is_draft_group``) the five request-facing entry points below
+    # do nothing for them: no pages reserved, none allocated, nothing cached
+    # or freed. The block table row of such a request is simply empty.
+    def _skip_k0(self, request_id: str) -> bool:
+        return self.is_draft_group and request_id in self._spec_off_reqs
+
+    def get_num_blocks_to_allocate(self, request_id: str, *args, **kwargs) -> int:
+        if self._skip_k0(request_id):
+            return 0
+        return super().get_num_blocks_to_allocate(request_id, *args, **kwargs)
+
+    def allocate_new_computed_blocks(self, request_id: str, *args, **kwargs) -> None:
+        if self._skip_k0(request_id):
+            return None
+        return super().allocate_new_computed_blocks(request_id, *args, **kwargs)
+
+    def allocate_new_blocks(
+        self, request_id: str, *args, **kwargs
+    ) -> list[KVCacheBlock]:
+        if self._skip_k0(request_id):
+            return []
+        return super().allocate_new_blocks(request_id, *args, **kwargs)
+
+    def cache_blocks(self, request: Request, *args, **kwargs) -> None:
+        if self._skip_k0(request.request_id):
+            return None
+        return super().cache_blocks(request, *args, **kwargs)
+
+    def remove_skipped_blocks(self, request_id: str, *args, **kwargs) -> None:
+        if self._skip_k0(request_id):
+            return None
+        return super().remove_skipped_blocks(request_id, *args, **kwargs)
+
     @classmethod
     def _contiguous_blocks_for_hit(
         cls, window_size: int, block_size: int, use_eagle: bool
