@@ -774,7 +774,7 @@ class Scheduler(SchedulerInterface):
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
-                        num_lookahead_tokens=self.num_lookahead_tokens,
+                        num_lookahead_tokens=self._lookahead_tokens_for(request),
                     )
 
                     if new_blocks is not None:
@@ -1102,7 +1102,7 @@ class Scheduler(SchedulerInterface):
                 # of local and remote blocks.
                 limit_lookahead_tokens = load_kv_async and self.use_eagle
                 effective_lookahead_tokens = (
-                    0 if limit_lookahead_tokens else self.num_lookahead_tokens
+                    0 if limit_lookahead_tokens else self._lookahead_tokens_for(request)
                 )
 
                 # Determine if we need to allocate cross-attention blocks.
@@ -2434,6 +2434,10 @@ class Scheduler(SchedulerInterface):
 
     def set_pause_state(self, pause_state: PauseState) -> None:
         self._pause_state = pause_state
+
+    def _lookahead_tokens_for(self, request: Request) -> int:
+        """plan 075 S1: per-request lookahead; K=0 requests reserve none."""
+        return 0 if request.spec_off else self.num_lookahead_tokens
 
     def set_spec_enabled(self, enabled: bool) -> bool:
         """plan 075 S1: flip the engine spec mode for requests added from now on.
