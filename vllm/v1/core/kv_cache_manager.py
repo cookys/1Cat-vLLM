@@ -216,6 +216,7 @@ class KVCacheManager:
         # (which happens when the request requires prompt logprobs
         # or calls a pooling model with all pooling).
         request.shared_prefix_boundary = 0
+        self.coordinator.register_request_spec(request.request_id, request.spec_off)
         if not self.enable_caching or request.skip_reading_prefix_cache:
             return self.empty_kv_cache_blocks, 0
 
@@ -333,6 +334,8 @@ class KVCacheManager:
         Returns:
             A list of new allocated blocks.
         """
+        # plan 075 S1: per-request K, fixed for the request's life.
+        self.coordinator.register_request_spec(request.request_id, request.spec_off)
         # When loading KV data asynchronously, we may have zero new tokens to
         # compute while still allocating slots for externally computed tokens.
         if num_new_tokens == 0 and num_external_computed_tokens == 0:
@@ -595,6 +598,9 @@ class KVCacheManager:
                 that are already cached and tokens to be cached.
         """
         if self.enable_caching:
+            self.coordinator.register_request_spec(
+                request.request_id, request.spec_off
+            )
             self.coordinator.cache_blocks(request, num_computed_tokens)
 
     def create_kv_cache_blocks(

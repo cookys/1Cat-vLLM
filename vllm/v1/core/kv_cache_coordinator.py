@@ -17,6 +17,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
     MambaManager,
     SingleTypeKVCacheManager,
+    SlidingWindowManager,
     get_manager_for_kv_cache_spec,
 )
 from vllm.v1.kv_cache_interface import (
@@ -80,6 +81,37 @@ class KVCacheCoordinator(ABC):
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
+        self._mark_draft_groups()
+
+    def _mark_draft_groups(self) -> None:
+        """plan 075 S1: find the draft sliding-window group(s).
+
+        Only groups explicitly flagged ``is_eagle_group`` and managed by a
+        SlidingWindowManager count (the DFlash drafter's KV). The
+        "flag everything" fallback of ``eagle_group_ids`` is deliberately not
+        used here: a fallback-flagged main group must never be skipped.
+        """
+        groups = self.kv_cache_config.kv_cache_groups
+        draft = frozenset(
+            i
+            for i, g in enumerate(groups)
+            if g.is_eagle_group
+            and isinstance(self.single_type_managers[i], SlidingWindowManager)
+        )
+        if len(draft) >= len(groups):
+            draft = frozenset()
+        self.draft_group_ids: frozenset[int] = draft
+        for i in draft:
+            self.single_type_managers[i].is_draft_group = True
+
+    def register_request_spec(self, request_id: str, spec_off: bool) -> None:
+        """plan 075 S1: tell every group manager whether the request is K=0.
+
+        Idempotent; KVCacheManager calls it before each entry point that
+        reaches the managers, so the manager signatures stay unchanged.
+        """
+        for manager in self.single_type_managers:
+            manager.register_request_spec(request_id, spec_off)
 
     def configure_prefix_cache_retention(self, interval: int | None) -> None:
         """Validate after 1Cat has resolved the heterogeneous cache geometry."""

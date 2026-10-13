@@ -102,6 +102,26 @@ class SingleTypeKVCacheManager(ABC):
         # determining the attention groups.
         self.use_eagle = False
 
+        # plan 075 S1: requests that run with K=0 (no draft tokens). Filled by
+        # ``register_request_spec`` (called by KVCacheManager before it touches
+        # the request), cleared in ``free``. A request's entry never changes
+        # while it is alive.
+        self._spec_off_reqs: set[str] = set()
+        # plan 075 S1: set by the coordinator for the EAGLE/DFlash draft
+        # sliding-window group. Managers that implement the K=0 early-out only
+        # act on it when this is True.
+        self.is_draft_group = False
+
+    def register_request_spec(self, request_id: str, spec_off: bool) -> None:
+        """plan 075 S1: record whether this request runs with K=0."""
+        if spec_off:
+            self._spec_off_reqs.add(request_id)
+        else:
+            self._spec_off_reqs.discard(request_id)
+
+    def is_spec_off(self, request_id: str) -> bool:
+        return request_id in self._spec_off_reqs
+
     def take_pending_boundary_state_offloads(
         self,
     ) -> list[tuple[str, int, KVCacheBlock, int]]:
@@ -398,6 +418,7 @@ class SingleTypeKVCacheManager(ABC):
 
         self.block_pool.free_blocks(ordered_blocks)
         self.num_cached_block.pop(request_id, None)
+        self._spec_off_reqs.discard(request_id)
 
     @abstractmethod
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
