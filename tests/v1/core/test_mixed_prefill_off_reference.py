@@ -55,6 +55,8 @@ def replay(make_scheduler, async_scheduling, spec, blocks, target=0):
             "mixed_prefill_tokens",
             "mixed_decode_tokens",
             "mixed_prefill_budget",
+            # plan 075 S1: new field, absent from the base the hashes came from
+            "skip_draft_propose",
         ):
             output.pop(name, None)
         for new in output["scheduled_new_reqs"]:
