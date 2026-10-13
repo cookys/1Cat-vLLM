@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
 import os
+import re
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -292,6 +293,7 @@ class Scheduler(SchedulerInterface):
                 speculative_config
             ),
         )
+        self._log_and_check_draft_groups(vllm_config, speculative_config)
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None:
@@ -2445,6 +2447,46 @@ class Scheduler(SchedulerInterface):
     def _has_draft_sliding_window_group(speculative_config) -> bool:
         """plan 075 S1: DFlash drafters own the (only) sliding-window KV group."""
         return bool(speculative_config and speculative_config.use_dflash_family())
+
+    # The DFlash drafter is built with start_layer_id = the target's layer count
+    # (qwen3_dflash.py: ``layers.{layer_idx + start_layer_id}``), so every
+    # drafter attention layer is named ``...layers.<i>...`` with i >= that count
+    # and every target layer has i < it.
+    _LAYER_IDX_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+
+    @classmethod
+    def _check_draft_group_layers(
+        cls, kv_cache_config, draft_group_ids, first_draft_layer_idx: int
+    ) -> None:
+        """plan 075 S1 (D1): every layer of a group marked draft is a drafter layer."""
+        for gid in sorted(draft_group_ids):
+            for name in kv_cache_config.kv_cache_groups[gid].layer_names:
+                m = cls._LAYER_IDX_RE.search(name)
+                assert m is not None and int(m.group(1)) >= first_draft_layer_idx, (
+                    f"plan075: KV group {gid} is marked as the draft group but "
+                    f"layer {name!r} is not a drafter layer (drafter layers have "
+                    f"layer index >= {first_draft_layer_idx})"
+                )
+
+    def _log_and_check_draft_groups(self, vllm_config, speculative_config) -> None:
+        draft_ids = sorted(self.kv_cache_manager.coordinator.draft_group_ids)
+        if not draft_ids:
+            return
+        groups = self.kv_cache_config.kv_cache_groups
+        layers = [n for gid in draft_ids for n in groups[gid].layer_names]
+        logger.info_once(
+            "plan075 draft_groups=%s layers=%s", str(draft_ids), str(layers)
+        )
+        if (
+            speculative_config is not None
+            and speculative_config.use_dflash_family()
+            and vllm_config.parallel_config.pipeline_parallel_size == 1
+        ):
+            self._check_draft_group_layers(
+                self.kv_cache_config,
+                draft_ids,
+                vllm_config.model_config.get_num_layers(vllm_config.parallel_config),
+            )
 
     def _all_scheduled_spec_off(self, num_scheduled_tokens: dict[str, int]) -> bool:
         """plan 075 S1: True iff the step has rows and every one of them is K=0.

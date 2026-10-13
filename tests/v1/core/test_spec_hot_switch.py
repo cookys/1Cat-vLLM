@@ -662,3 +662,81 @@ def test_spec_mode_router_mounted_without_dev_mode(monkeypatch):
     assert set(paths["/spec_mode"]) == {"get", "post"}
     # and the dev-only endpoints really are absent in this mode
     assert "/sleep" not in paths
+
+
+# D1 hardening: startup log + "draft group holds only drafter layers" assert
+# --------------------------------------------------------------------------
+
+TARGET_LAYERS = 40  # drafter layers are numbered from here (start_layer_id)
+
+
+def _named_cfg(draft_names, full_names=("model.layers.0.self_attn.attn",)):
+    cfg = make_cfg(draft_is_eagle=False)
+    g = cfg.kv_cache_groups
+    g[0].layer_names[:] = list(full_names)
+    g[2].layer_names[:] = list(draft_names)
+    return cfg
+
+
+def _bare_scheduler(cfg, draft_ids):
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    s = object.__new__(Scheduler)
+    s.kv_cache_config = cfg
+    s.kv_cache_manager = SimpleNamespace(
+        coordinator=SimpleNamespace(draft_group_ids=frozenset(draft_ids))
+    )
+    return s
+
+
+def _vcfg(pp=1):
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(pipeline_parallel_size=pp),
+        model_config=SimpleNamespace(get_num_layers=lambda pc: TARGET_LAYERS),
+    )
+
+
+DFLASH = SimpleNamespace(use_dflash_family=lambda: True)
+
+
+def test_draft_group_assert_passes_for_all_drafter_layers(monkeypatch):
+    names = [f"model.layers.{TARGET_LAYERS + i}.self_attn.attn" for i in range(3)]
+    s = _bare_scheduler(_named_cfg(names), {2})
+    s._log_and_check_draft_groups(_vcfg(), DFLASH)  # must not raise
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "model.layers.7.self_attn.attn",  # a target layer mixed in
+        "model.layers.39.self_attn.attn",  # last target layer
+        "mamba",  # unrecognisable name
+    ],
+)
+def test_draft_group_assert_fails_when_target_layer_mixed_in(bad):
+    names = [f"model.layers.{TARGET_LAYERS}.self_attn.attn", bad]
+    s = _bare_scheduler(_named_cfg(names), {2})
+    with pytest.raises(AssertionError, match="not a drafter layer"):
+        s._log_and_check_draft_groups(_vcfg(), DFLASH)
+
+
+def test_draft_group_startup_log_literal(monkeypatch):
+    from vllm.v1.core.sched import scheduler as sched_mod
+
+    seen = []
+    monkeypatch.setattr(
+        sched_mod.logger, "info_once", lambda fmt, *a: seen.append(fmt % a)
+    )
+    names = [f"model.layers.{TARGET_LAYERS + i}.self_attn.attn" for i in range(2)]
+    s = _bare_scheduler(_named_cfg(names), {2})
+    s._log_and_check_draft_groups(_vcfg(), DFLASH)
+    assert seen == [
+        "plan075 draft_groups=[2] layers="
+        "['model.layers.40.self_attn.attn', 'model.layers.41.self_attn.attn']"
+    ]
+    # no draft group -> no log
+    seen.clear()
+    _bare_scheduler(_named_cfg(names), set())._log_and_check_draft_groups(
+        _vcfg(), DFLASH
+    )
+    assert seen == []
