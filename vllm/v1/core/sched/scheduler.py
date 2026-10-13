@@ -2165,8 +2165,10 @@ class Scheduler(SchedulerInterface):
                 # The request may have been finished. Skip.
                 continue
 
-            if request.is_prefill_chunk:
-                # Ignore draft tokens for prefill chunks.
+            if request.is_prefill_chunk or request.spec_off:
+                # Ignore draft tokens for prefill chunks. plan 075 S1: a K=0
+                # request never carries draft tokens, whatever the worker
+                # returned for its row.
                 if request.spec_token_ids:
                     request.spec_token_ids = []
                 continue
