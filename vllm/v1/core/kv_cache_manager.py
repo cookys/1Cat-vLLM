@@ -610,7 +610,6 @@ class KVCacheManager:
                 that are already cached and tokens to be cached.
         """
         if self.enable_caching:
-            self._register_request_spec(request)
             self.coordinator.cache_blocks(request, num_computed_tokens)
 
     def create_kv_cache_blocks(
