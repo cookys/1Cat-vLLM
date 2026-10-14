@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
 import numpy as np
@@ -153,7 +154,15 @@ class DraftModelSpeculator(BaseSpeculator):
     ) -> nn.Module:
         pass
 
-    def load_model(self, target_model: nn.Module) -> None:
+    # The drafter weights can live in their own cumem tag so they can be
+    # slept/woken independently of the target (plan 075 S2 P2).
+    supports_draft_weights_pool = True
+
+    def load_model(
+        self,
+        target_model: nn.Module,
+        draft_pool_ctx: Callable[[], AbstractContextManager] | None = None,
+    ) -> None:
         target_attn_layer_names = set(
             get_layers_from_vllm_config(
                 self.vllm_config,
@@ -161,7 +170,10 @@ class DraftModelSpeculator(BaseSpeculator):
             ).keys()
         )
 
-        self.model = self.load_draft_model(target_model, target_attn_layer_names)
+        # Only the draft weights go in the draft pool; the dense draft-logits
+        # buffer is not droppable and is allocated outside it.
+        with draft_pool_ctx() if draft_pool_ctx is not None else nullcontext():
+            self.model = self.load_draft_model(target_model, target_attn_layer_names)
         self._allocate_draft_logits()
         self._validate_local_argmax_reduction()
 

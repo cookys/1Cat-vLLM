@@ -21,6 +21,8 @@ import functools
 import gc
 import os
 import time
+from collections.abc import Callable
+from contextlib import AbstractContextManager, ExitStack, nullcontext
 from copy import deepcopy
 from typing import Any, NamedTuple
 
@@ -469,7 +471,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ngram_context_source=ngram_context_source,
         )
 
-    def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
+    def load_model(
+        self,
+        load_dummy_weights: bool = False,
+        *args,
+        memory_pool_ctx: Callable[[str], AbstractContextManager] | None = None,
+        **kwargs,
+    ) -> None:
+        # memory_pool_ctx(tag) opens the cumem pool for that tag. The target
+        # goes in "weights", a DFlash-style drafter in its own "draft_weights"
+        # pool (never nested, plan 075 S2 F4). None = no pools (nullcontext).
+        pool = memory_pool_ctx if memory_pool_ctx is not None else (
+            lambda tag: nullcontext()
+        )
         time_before_load = time.perf_counter()
         if load_dummy_weights:
             self.load_config.load_format = "dummy"
@@ -479,19 +493,37 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             model_loader = get_model_loader(self.vllm_config.load_config)
             logger.info("Loading model from scratch...")
 
-            self.model = model_loader.load_model(
-                vllm_config=self.vllm_config, model_config=self.vllm_config.model_config
+            split_draft_pool = self.speculator is not None and getattr(
+                self.speculator, "supports_draft_weights_pool", False
             )
-            if self.lora_config:
-                self.model = self.load_lora_model(
-                    self.model, self.vllm_config, self.device
+            with ExitStack() as weights_stack:
+                weights_stack.enter_context(pool("weights"))
+                self.model = model_loader.load_model(
+                    vllm_config=self.vllm_config,
+                    model_config=self.vllm_config.model_config,
                 )
+                if self.lora_config:
+                    self.model = self.load_lora_model(
+                        self.model, self.vllm_config, self.device
+                    )
 
-            if self.use_aux_hidden_state_outputs:
-                assert self.speculative_config is not None
-                set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
+                if self.use_aux_hidden_state_outputs:
+                    assert self.speculative_config is not None
+                    set_eagle3_aux_hidden_state_layers(
+                        self.model, self.speculative_config
+                    )
+                if split_draft_pool:
+                    # Close "weights" before opening "draft_weights": pools
+                    # are sequential, never nested, and each tag opens once.
+                    weights_stack.close()
+                    self.speculator.load_model(
+                        self.model, draft_pool_ctx=lambda: pool("draft_weights")
+                    )
+                elif self.speculator is not None:
+                    # Speculators that cannot split their load keep the
+                    # historical behaviour: everything under "weights".
+                    self.speculator.load_model(self.model)
             if self.speculator is not None:
-                self.speculator.load_model(self.model)
                 eplb_models_added = self.eplb.maybe_register_speculator(
                     self.speculator, self.speculative_config, load_dummy_weights
                 )
