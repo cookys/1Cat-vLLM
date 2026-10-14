@@ -1343,7 +1343,7 @@ class EngineCore:
             "drafter_resident": info["drafter_resident"],
             "pool_blocks": pool_blocks,
             "spec_blocks": spec_blocks,
-            "tail_holders": tail_reqs,  # requests (F13); blocks below
+            "tail_holder_reqs": tail_reqs,  # requests (F13)
             "tail_holder_blocks": pool["tail_holder_blocks"],
             "error": self._spec_last_error,
             "blocked": self._spec_blocked,

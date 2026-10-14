@@ -178,7 +178,7 @@ def test_idle_round_trip_runs_the_f10_f11_order():
     g = c.get("/spec_mode").json()
     assert g["state"] == "NOSPEC_GROWN" and g["mode"] == "nospec"
     assert g["drafter_resident"] is False and g["pool_blocks"] == N_SPEC + TAIL
-    assert g["spec_blocks"] == N_SPEC and g["tail_holders"] == 0 and g["error"] is None
+    assert g["spec_blocks"] == N_SPEC and g["tail_holder_reqs"] == 0 and g["error"] is None
     tr = g["last_transition"]
     assert tr["from"] == "DFLASH2" and tr["to"] == "NOSPEC_GROWN"
     assert tr["steps"]["release"]["freed_bytes"] == [DRAFT, DRAFT]
@@ -232,7 +232,7 @@ def test_fencing_waits_for_tail_holders_then_shrinks_wakes_and_finishes():
     code, out = post(c, "dflash2")
     assert out["changed"] and out["state"] == "DFLASH2_FENCING"
     g = c.get("/spec_mode").json()
-    assert g["tail_holders"] > 0 and g["tail_holder_blocks"] >= g["tail_holders"]
+    assert g["tail_holder_reqs"] > 0 and g["tail_holder_blocks"] >= g["tail_holder_reqs"]
     assert "shrink_kv_cache" not in cl.methods()  # scheduler refused: no unmap yet
     assert g["mode"] == "nospec" and s.spec_enabled is False
     assert s.kv_cache_manager.block_pool.max_block_id == N_SPEC - 1  # fence up
@@ -450,3 +450,10 @@ def test_last_transition_follows_the_last_successful_round_with_attempts():
     assert core.get_spec_mode()["state"] == "NOSPEC_GROWN"
     assert tr["to"] == "NOSPEC_GROWN" and tr["attempts"] == 2
     assert tr["duration_s"] >= 0 and set(tr["steps"]) >= {"release", "grow"}
+
+
+def test_get_spec_mode_reports_tail_holder_reqs_and_blocks_side_by_side():
+    core, cl, s = make()
+    g = core.get_spec_mode()
+    assert "tail_holders" not in g
+    assert g["tail_holder_reqs"] == 0 and g["tail_holder_blocks"] == 0

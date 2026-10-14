@@ -585,7 +585,7 @@ def _lit(s, mode, running_spec, running_nospec, state, inflight=None):
         "drafter_resident": True,
         "pool_blocks": s.kv_cache_manager.block_pool.num_gpu_blocks,
         "spec_blocks": s.kv_cache_config.num_blocks,
-        "tail_holders": 0,
+        "tail_holder_reqs": 0,
         "tail_holder_blocks": 0,
         "error": None,
         "blocked": False,
