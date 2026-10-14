@@ -2573,6 +2573,48 @@ class Scheduler(SchedulerInterface):
             "state": state,
         }
 
+    # ---- plan 075 S2: elastic KV pool ----------------------------------
+
+    def kv_pool_spec_blocks(self) -> int:
+        """N_spec: the pool size the scheduler started with (never shrinks
+        below it)."""
+        return self.kv_cache_config.num_blocks
+
+    def kv_pool_blocks(self) -> int:
+        return self.kv_cache_manager.block_pool.num_gpu_blocks
+
+    def grow_kv_pool(self, n_blocks_total: int) -> int:
+        """Grow the block pool to ``n_blocks_total``; the workers must have
+        mapped the memory already (F10). Returns the blocks added."""
+        cap = self.kv_pool_spec_blocks() + self.kv_cache_config.elastic_tail_blocks
+        if n_blocks_total > cap:
+            raise ValueError(f"grow_kv_pool({n_blocks_total}) exceeds N_spec + tail")
+        return self.kv_cache_manager.block_pool.grow(n_blocks_total)
+
+    def shrink_kv_pool(self, n_blocks_total: int) -> int:
+        """Shrink the block pool to ``n_blocks_total`` (>= N_spec). Returns 0
+        on success, else the number of requests-held tail blocks (no change)."""
+        if n_blocks_total < self.kv_pool_spec_blocks():
+            raise ValueError(f"shrink_kv_pool({n_blocks_total}) is below N_spec")
+        return self.kv_cache_manager.block_pool.shrink_to(n_blocks_total)
+
+    def set_kv_fence(self, max_block_id: int | None) -> None:
+        """F13: ``max_block_id`` = N_spec - 1 stops handing out tail blocks
+        (no drain, no preemption); ``None`` lifts the fence."""
+        self.kv_cache_manager.block_pool.set_max_block_id(max_block_id)
+
+    def get_kv_pool_info(self) -> dict[str, int | None]:
+        pool = self.kv_cache_manager.block_pool
+        spec = self.kv_pool_spec_blocks()
+        return {
+            "pool_blocks": pool.num_gpu_blocks,
+            "spec_blocks": spec,
+            "tail_blocks_max": self.kv_cache_config.elastic_tail_blocks,
+            "fence_max_block_id": pool.max_block_id,
+            "tail_holders": pool.count_blocks_in_use_above(spec),
+            "free_blocks": pool.get_num_free_blocks(),
+        }
+
     def get_num_unfinished_requests(self) -> int:
         if self._pause_state == PauseState.PAUSED_ALL:
             return 0

@@ -44,6 +44,7 @@ from vllm.utils.network_utils import make_zmq_socket
 from vllm.utils.system_utils import decorate_logs, set_process_title
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
+    apply_elastic_kv_tail,
     generate_scheduler_kv_cache_config,
     get_kv_cache_configs,
     get_request_block_hasher,
@@ -238,6 +239,90 @@ class EngineCore:
         enable_envs_cache()
 
     @instrument(span_name="Prepare model")
+    def _make_kv_cache_configs_elastic(
+        self, kv_cache_configs: list[KVCacheConfig]
+    ) -> None:
+        """plan 075 S2 (A2-3): size the elastic KV tail from the drafter
+        weights the workers report, and rewrite the per-rank configs."""
+        probes = self.collective_rpc("get_elastic_kv_probe")
+        granularity = max(int(p["granularity"]) for p in probes)
+        tail = apply_elastic_kv_tail(
+            kv_cache_configs,
+            [int(p["draft_weights_bytes"]) for p in probes],
+            granularity,
+        )
+        if tail == 0:
+            logger.warning(
+                "--spec-hot-switch-elastic: the drafter weights are too small "
+                "for one KV tail chunk (draft bytes %s, granularity %d); the "
+                "KV pool stays fixed-size.",
+                [int(p["draft_weights_bytes"]) for p in probes],
+                granularity,
+            )
+            return
+        logger.info(
+            "Elastic KV tail: N_spec=%d blocks, N_tail_max=%d blocks "
+            "(boundary %d blocks, VMM granularity %d B)",
+            kv_cache_configs[0].num_blocks,
+            tail,
+            kv_cache_configs[0].elastic_boundary_blocks,
+            granularity,
+        )
+
+    def grow_kv_cache(self, n_blocks_total: int | None = None) -> dict:
+        """plan 075 S2 (A2-7, F10): map the KV tail on every worker, and only
+        when all succeeded let the scheduler's block pool grow. A failure
+        leaves the scheduler at its previous size (workers may have mapped
+        more, which is harmless and retried idempotently)."""
+        cfg = self.scheduler.kv_cache_config
+        n_spec, tail = self.scheduler.kv_pool_spec_blocks(), cfg.elastic_tail_blocks
+        if tail <= 0:
+            raise RuntimeError("grow_kv_cache: the engine has no elastic KV tail")
+        target = n_spec + tail if n_blocks_total is None else int(n_blocks_total)
+        if not n_spec <= target <= n_spec + tail:
+            raise ValueError(
+                f"grow_kv_cache target {target} outside [{n_spec}, {n_spec + tail}]"
+            )
+        if (target - n_spec) % cfg.elastic_boundary_blocks:
+            raise ValueError(
+                f"grow_kv_cache target {target} is not N_spec {n_spec} plus a "
+                f"multiple of {cfg.elastic_boundary_blocks} blocks"
+            )
+        workers = self.collective_rpc("grow_kv_cache", args=(target,))
+        added = self.scheduler.grow_kv_pool(target)
+        return {"pool_blocks": target, "added_blocks": added, "workers": workers}
+
+    def shrink_kv_cache(self, n_blocks_total: int | None = None) -> dict:
+        """plan 075 S2 (A2-7, F10): the scheduler stops using the tail first;
+        only then do the workers unmap it. If requests still hold tail blocks
+        nothing changes and ``tail_holders`` says how many."""
+        n_spec = self.scheduler.kv_pool_spec_blocks()
+        target = n_spec if n_blocks_total is None else int(n_blocks_total)
+        if target < n_spec:
+            raise ValueError(f"shrink_kv_cache target {target} below N_spec {n_spec}")
+        holders = self.scheduler.shrink_kv_pool(target)
+        if holders:
+            return {
+                "ok": False,
+                "pool_blocks": self.scheduler.kv_pool_blocks(),
+                "tail_holders": holders,
+            }
+        workers = self.collective_rpc("shrink_kv_cache", args=(target,))
+        return {
+            "ok": True,
+            "pool_blocks": target,
+            "tail_holders": 0,
+            "workers": workers,
+        }
+
+    def set_kv_fence(self, max_block_id: int | None) -> dict:
+        """plan 075 S2 (F13): stop (or resume) handing out tail blocks."""
+        self.scheduler.set_kv_fence(max_block_id)
+        return self.scheduler.get_kv_pool_info()
+
+    def get_kv_pool_info(self) -> dict:
+        return self.scheduler.get_kv_pool_info()
+
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
         start = time.time()
 
@@ -277,6 +362,9 @@ class EngineCore:
         max_model_len_after = vllm_config.model_config.max_model_len
         if max_model_len_after != max_model_len_before:
             self.collective_rpc("update_max_model_len", args=(max_model_len_after,))
+
+        if vllm_config.cache_config.spec_hot_switch_elastic and has_kv_cache:
+            self._make_kv_cache_configs_elastic(kv_cache_configs)
 
         scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
         vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks

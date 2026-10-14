@@ -211,6 +211,30 @@ class SchedulerInterface(ABC):
         """plan 075 S2: record whether the workers hold the drafter weights."""
         raise NotImplementedError
 
+    def kv_pool_spec_blocks(self) -> int:
+        """plan 075 S2: N_spec, the pool size the scheduler started with."""
+        raise NotImplementedError
+
+    def kv_pool_blocks(self) -> int:
+        """plan 075 S2: current pool size in blocks."""
+        raise NotImplementedError
+
+    def grow_kv_pool(self, n_blocks_total: int) -> int:
+        """plan 075 S2: grow the block pool (workers already mapped)."""
+        raise NotImplementedError
+
+    def shrink_kv_pool(self, n_blocks_total: int) -> int:
+        """plan 075 S2: shrink the block pool; 0 = ok, else tail holders."""
+        raise NotImplementedError
+
+    def set_kv_fence(self, max_block_id: int | None) -> None:
+        """plan 075 S2: fence / unfence the elastic tail for new allocations."""
+        raise NotImplementedError
+
+    def get_kv_pool_info(self) -> dict[str, int | None]:
+        """plan 075 S2: pool size, fence, tail_holders, free blocks."""
+        raise NotImplementedError
+
     @abstractmethod
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
