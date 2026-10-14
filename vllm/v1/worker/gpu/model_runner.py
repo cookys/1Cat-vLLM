@@ -782,6 +782,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             r.shrink_to(n_blocks_total * r.block_bytes)
         return self._elastic_report()
 
+    def close_elastic_kv(self) -> None:
+        """plan 075 S2: unmap and free the elastic KV regions (teardown). The
+        KV tensors must not be touched afterwards."""
+        regions = getattr(self, "elastic_kv_regions", None)
+        if not regions:
+            return
+        torch.cuda.synchronize()
+        for region in regions:
+            region.close()
+        regions.clear()
+
     def _init_kv_zero_meta(self) -> None:
         """Precompute metadata used to clear newly allocated cache blocks."""
         self._kv_block_zeroer = KVBlockZeroer(

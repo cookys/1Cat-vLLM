@@ -416,6 +416,34 @@ class Worker(WorkerBase):
             "free_after": free_after,
         }
 
+    def _s2_teardown(self) -> None:
+        """plan 075 S2: shutdown-time cleanup, best effort (never blocks the
+        shutdown): wake released tags, then close the elastic KV regions."""
+        try:
+            if self.vllm_config.model_config.enable_cumem_allocator:
+                from vllm.device_allocator.cumem import CuMemAllocator
+
+                allocator = CuMemAllocator.get_instance()
+                for tag in sorted(self._SLEEPABLE_TAGS):
+                    if allocator.get_current_usage(tag=tag) > (
+                        allocator.get_current_usage(tag=tag, only_mapped=True)
+                    ):
+                        self.wake_tags((tag,))
+        except Exception:
+            logger.exception("shutdown: waking the released tags failed")
+        runner = getattr(self, "model_runner", None)
+        close = getattr(runner, "close_elastic_kv", None)
+        if close is not None:
+            try:
+                close()
+            except Exception:
+                logger.exception("shutdown: closing the elastic KV regions failed")
+
+    def get_gpu_free_bytes(self) -> dict[str, Any]:
+        """plan 075 S2 (D7): free / total device memory, for the grow precheck."""
+        free, total = torch.cuda.mem_get_info()
+        return {"free_bytes": free, "total_bytes": total}
+
     def get_elastic_kv_probe(self) -> dict[str, Any]:
         """plan 075 S2 (A2-3): what the engine needs to size the elastic KV
         tail: the resident drafter weight bytes (what nospec can give back)
@@ -1559,6 +1587,11 @@ class Worker(WorkerBase):
         if self._ple_offload_worker_handle is not None:
             self._ple_offload_worker_handle.close()
             self._ple_offload_worker_handle = None
+
+        # plan 075 S2: put the drafter weights back and close the elastic KV
+        # regions first, so the cumem free callback never cuMemUnmap's an
+        # allocation that is already unmapped (mapped=False).
+        self._s2_teardown()
 
         # Release GPU resources held by the model runner so that memory
         # can be reclaimed when running in-process
