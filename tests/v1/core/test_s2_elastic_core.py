@@ -29,7 +29,10 @@ def make_core(fail_rpc=None):
     )
     sched = Scheduler.__new__(Scheduler)
     sched.kv_cache_config = cfg
-    sched.kv_cache_manager = SimpleNamespace(block_pool=pool)
+    mgr = SimpleNamespace(req_to_blocks={})
+    sched.kv_cache_manager = SimpleNamespace(
+        block_pool=pool, coordinator=SimpleNamespace(single_type_managers=(mgr,))
+    )
     core = EngineCore.__new__(EngineCore)
     core.scheduler = sched
     core.log = log = []
@@ -41,6 +44,7 @@ def make_core(fail_rpc=None):
         return [{"rank": 0}]
 
     core.collective_rpc = rpc
+    core.req_to_blocks = mgr.req_to_blocks
     return core, pool, log
 
 
@@ -80,7 +84,7 @@ def test_shrink_stops_scheduler_first_then_unmaps_workers():
     out = core.shrink_kv_cache()
     # when the worker RPC ran the pool had already been cut back to N_spec
     assert log == [("rpc", "shrink_kv_cache", (N_SPEC,), N_SPEC)]
-    assert out["ok"] and pool.num_gpu_blocks == N_SPEC and out["tail_holders"] == 0
+    assert out["ok"] and pool.num_gpu_blocks == N_SPEC and out["tail_holder_blocks"] == 0
 
 
 def test_shrink_with_tail_holders_changes_nothing_and_reports_them():
@@ -88,8 +92,13 @@ def test_shrink_with_tail_holders_changes_nothing_and_reports_them():
     core.grow_kv_cache()
     log.clear()
     held = pool.get_new_blocks(N_SPEC + TAIL - 1)  # every usable block
+    tail = [b for b in held if b.block_id >= N_SPEC]
+    core.req_to_blocks.update(
+        {"low": [b for b in held if b.block_id < N_SPEC], "t1": tail[:10], "t2": tail[10:]}
+    )
     out = core.shrink_kv_cache()
-    assert out["ok"] is False and out["tail_holders"] == TAIL
+    assert out["ok"] is False and out["tail_holder_blocks"] == TAIL
+    assert out["tail_holder_reqs"] == 2  # D8: requests, not blocks
     assert log == []  # workers were not asked to unmap
     assert pool.num_gpu_blocks == N_SPEC + TAIL
     pool.free_blocks(held)
@@ -117,7 +126,9 @@ def test_fence_and_pool_info_plumbing():
     info = core.set_kv_fence(N_SPEC - 1)
     assert info["fence_max_block_id"] == N_SPEC - 1
     assert info["pool_blocks"] == N_SPEC + TAIL and info["spec_blocks"] == N_SPEC
-    assert info["tail_blocks_max"] == TAIL and info["tail_holders"] == 0
+    assert info["tail_blocks_max"] == TAIL and info["tail_holder_blocks"] == 0
+    assert info["tail_holder_reqs"] == 0 and info["spec_blocks_lost_to_alignment"] == 0
+    assert core.scheduler.get_kv_pool_info() is not None
     assert info["free_blocks"] == N_SPEC - 1  # null block excluded, tail fenced
     got = pool.get_new_blocks(N_SPEC - 1)
     assert all(b.block_id < N_SPEC for b in got)
@@ -135,7 +146,7 @@ def test_core_without_elastic_tail_refuses_grow():
 # ---- tail sizing from the workers' probes ----
 
 
-def test_make_configs_elastic_uses_probes():
+def test_make_configs_elastic_uses_probes(monkeypatch):
     core = EngineCore.__new__(EngineCore)
     core.collective_rpc = lambda m, **k: [
         {"draft_weights_bytes": int(1.1675 * (1 << 30)), "granularity": 2 << 20}
@@ -150,8 +161,16 @@ def test_make_configs_elastic_uses_probes():
         )
         for _ in range(2)
     ]
+    from vllm.v1.engine import core as core_mod
+
+    lines = []
+    monkeypatch.setattr(
+        core_mod.logger, "info", lambda fmt, *a, **k: lines.append(fmt % a)
+    )
     core._make_kv_cache_configs_elastic(cfgs)
     assert cfgs[0].num_blocks == 992 and cfgs[0].elastic_tail_blocks == 64
+    assert cfgs[0].elastic_spec_blocks_lost == 8  # D2: 1000 -> 992
+    assert any("N_spec=992" in l and "8 blocks lost" in l for l in lines)
     assert cfgs[1].kv_cache_tensors[0].max_size == PAGE * (992 + 64)
 
 
@@ -209,3 +228,33 @@ def test_initialize_kv_caches_flag_off_is_unchanged(monkeypatch):
     assert log == []
     assert vc.cache_config.num_gpu_blocks == 1000 and seen["init"] == [1000, 1000]
     assert cfgs[0].kv_cache_tensors[0].max_size is None
+
+
+def test_pool_info_reqs_only_scanned_while_fenced():
+    core, pool, _ = make_core()
+    core.grow_kv_cache()
+    assert core.get_kv_pool_info()["tail_holder_reqs"] is None  # no fence: not scanned
+    assert core.set_kv_fence(N_SPEC - 1)["tail_holder_reqs"] == 0
+
+
+def test_shrink_rejects_non_boundary_target_symmetrically_to_grow():
+    core, pool, log = make_core()
+    core.grow_kv_cache()
+    log.clear()
+    with pytest.raises(ValueError, match="multiple of"):
+        core.shrink_kv_cache(N_SPEC + 5)
+    assert log == [] and pool.num_gpu_blocks == N_SPEC + TAIL
+    out = core.shrink_kv_cache(N_SPEC + BOUNDARY)  # on-boundary partial shrink ok
+    assert out["ok"] and pool.num_gpu_blocks == N_SPEC + BOUNDARY
+
+
+def test_alignment_loss_reaches_log_and_pool_info():
+    from vllm.v1.core.kv_cache_utils import apply_elastic_kv_tail
+
+    t = KVCacheTensor(size=PAGE * 1000, shared_by=["l0"])
+    cfg = KVCacheConfig(num_blocks=1000, kv_cache_tensors=[t], kv_cache_groups=[])
+    tail = apply_elastic_kv_tail([cfg], [PAGE * 64 * 2], 2 << 20)
+    assert tail > 0 and cfg.num_blocks == 992 and cfg.elastic_spec_blocks_lost == 8
+    core, _, _ = make_core()
+    core.scheduler.kv_cache_config.elastic_spec_blocks_lost = 8
+    assert core.get_kv_pool_info()["spec_blocks_lost_to_alignment"] == 8

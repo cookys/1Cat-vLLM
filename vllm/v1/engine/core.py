@@ -260,9 +260,11 @@ class EngineCore:
             )
             return
         logger.info(
-            "Elastic KV tail: N_spec=%d blocks, N_tail_max=%d blocks "
+            "Elastic KV tail: N_spec=%d blocks (aligned down to the boundary, "
+            "%d blocks lost), N_tail_max=%d blocks "
             "(boundary %d blocks, VMM granularity %d B)",
             kv_cache_configs[0].num_blocks,
+            kv_cache_configs[0].elastic_spec_blocks_lost,
             tail,
             kv_cache_configs[0].elastic_boundary_blocks,
             granularity,
@@ -294,23 +296,31 @@ class EngineCore:
     def shrink_kv_cache(self, n_blocks_total: int | None = None) -> dict:
         """plan 075 S2 (A2-7, F10): the scheduler stops using the tail first;
         only then do the workers unmap it. If requests still hold tail blocks
-        nothing changes and ``tail_holders`` says how many."""
+        nothing changes and ``tail_holder_blocks`` / ``tail_holder_reqs`` say how many."""
         n_spec = self.scheduler.kv_pool_spec_blocks()
         target = n_spec if n_blocks_total is None else int(n_blocks_total)
         if target < n_spec:
             raise ValueError(f"shrink_kv_cache target {target} below N_spec {n_spec}")
+        boundary = self.scheduler.kv_cache_config.elastic_boundary_blocks
+        if boundary and (target - n_spec) % boundary:
+            raise ValueError(
+                f"shrink_kv_cache target {target} is not N_spec {n_spec} plus a "
+                f"multiple of {boundary} blocks"
+            )
         holders = self.scheduler.shrink_kv_pool(target)
         if holders:
             return {
                 "ok": False,
                 "pool_blocks": self.scheduler.kv_pool_blocks(),
-                "tail_holders": holders,
+                "tail_holder_blocks": holders,
+                "tail_holder_reqs": self.scheduler.count_tail_holder_reqs(),
             }
         workers = self.collective_rpc("shrink_kv_cache", args=(target,))
         return {
             "ok": True,
             "pool_blocks": target,
-            "tail_holders": 0,
+            "tail_holder_blocks": 0,
+            "tail_holder_reqs": 0,
             "workers": workers,
         }
 

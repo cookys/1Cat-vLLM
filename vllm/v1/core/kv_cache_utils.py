@@ -2643,6 +2643,7 @@ def apply_elastic_kv_tail(
             t.max_size = page * (n_spec + tail)
         cfg.elastic_tail_blocks = tail
         cfg.elastic_boundary_blocks = boundary_blocks
+        cfg.elastic_spec_blocks_lost = n_spec_old - n_spec
     return tail
 
 

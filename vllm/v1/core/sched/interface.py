@@ -232,7 +232,7 @@ class SchedulerInterface(ABC):
         raise NotImplementedError
 
     def get_kv_pool_info(self) -> dict[str, int | None]:
-        """plan 075 S2: pool size, fence, tail_holders, free blocks."""
+        """plan 075 S2: pool size, fence, tail_holder_blocks/_reqs, free blocks."""
         raise NotImplementedError
 
     @abstractmethod

@@ -2603,6 +2603,17 @@ class Scheduler(SchedulerInterface):
         (no drain, no preemption); ``None`` lifts the fence."""
         self.kv_cache_manager.block_pool.set_max_block_id(max_block_id)
 
+    def count_tail_holder_reqs(self) -> int:
+        """Requests that hold at least one block id >= N_spec (D8). Scans
+        ``req_to_blocks``, so only call it while fenced or shrinking."""
+        spec = self.kv_pool_spec_blocks()
+        reqs: set[str] = set()
+        for mgr in self.kv_cache_manager.coordinator.single_type_managers:
+            for req_id, blocks in mgr.req_to_blocks.items():
+                if any(b.block_id >= spec and b.ref_cnt > 0 for b in blocks):
+                    reqs.add(req_id)
+        return len(reqs)
+
     def get_kv_pool_info(self) -> dict[str, int | None]:
         pool = self.kv_cache_manager.block_pool
         spec = self.kv_pool_spec_blocks()
@@ -2611,7 +2622,14 @@ class Scheduler(SchedulerInterface):
             "spec_blocks": spec,
             "tail_blocks_max": self.kv_cache_config.elastic_tail_blocks,
             "fence_max_block_id": pool.max_block_id,
-            "tail_holders": pool.count_blocks_in_use_above(spec),
+            "tail_holder_blocks": pool.count_blocks_in_use_above(spec),
+            # D8: requests holding tail blocks; scanned only while fenced
+            "tail_holder_reqs": (
+                self.count_tail_holder_reqs() if pool.max_block_id is not None else None
+            ),
+            "spec_blocks_lost_to_alignment": (
+                self.kv_cache_config.elastic_spec_blocks_lost
+            ),
             "free_blocks": pool.get_num_free_blocks(),
         }
 

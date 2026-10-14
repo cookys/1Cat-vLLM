@@ -983,6 +983,8 @@ class KVCacheConfig:
     steps."""
     elastic_boundary_blocks: int = 0
     """plan 075 S2: grow / shrink step in blocks = lcm(page, granularity) / page."""
+    elastic_spec_blocks_lost: int = 0
+    """plan 075 S2 (D2): blocks dropped from N_spec to end it on a boundary."""
 
     @property
     def has_mamba_layers(self) -> bool:

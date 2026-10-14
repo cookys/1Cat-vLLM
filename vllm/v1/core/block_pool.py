@@ -570,7 +570,7 @@ class BlockPool:
 
     def count_blocks_in_use_above(self, n_blocks: int) -> int:
         """Number of blocks with id >= ``n_blocks`` that are still referenced
-        (the ``tail_holders`` figure of the fence)."""
+        (the ``tail_holder_blocks`` figure of the fence)."""
         return sum(1 for block in self.blocks[n_blocks:] if block.ref_cnt > 0)
 
     def grow(self, n_new_total: int) -> int:
