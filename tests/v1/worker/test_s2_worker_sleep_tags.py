@@ -121,3 +121,42 @@ def test_legacy_sleep_wake_untouched():
 
     assert list(inspect.signature(gpu_worker.Worker.sleep).parameters) == ["self", "level"]
     assert list(inspect.signature(gpu_worker.Worker.wake_up).parameters) == ["self", "tags"]
+
+
+# ---- M1-fix-1: legacy sleep()/wake_up() are hot-switch aware ----
+
+
+def _legacy_env(env, monkeypatch, resident=True):
+    w, alloc, log = env
+    spec = SimpleNamespace(drafter_resident=resident)
+    w.model_runner = SimpleNamespace(
+        speculator=spec,
+        post_kv_cache_wake_up=lambda: log.append(("post_kv",)),
+    )
+    w._sleep_saved_buffers = {}
+    return w, alloc, log, spec
+
+
+def test_legacy_sleep_level1_offloads_drafter_weights_too(env, monkeypatch):
+    w, alloc, log, _ = _legacy_env(env, monkeypatch)
+    w.sleep(1)
+    assert ("sleep", ("weights", "draft_weights"), None) in log
+
+
+def test_legacy_sleep_refused_while_drafter_released(env, monkeypatch):
+    w, alloc, log, _ = _legacy_env(env, monkeypatch, resident=False)
+    with pytest.raises(RuntimeError, match="DFLASH2"):
+        w.sleep(1)
+    assert not [e for e in log if e[0] == "sleep"]  # nothing was unmapped
+
+
+def test_legacy_wake_weights_also_wakes_draft_weights(env, monkeypatch):
+    w, alloc, log, _ = _legacy_env(env, monkeypatch)
+    w.wake_up(["weights"])
+    assert ("wake", ["weights", "draft_weights"]) in log
+    log.clear()
+    w.wake_up(["weights", "draft_weights"])  # no duplicate tag
+    assert ("wake", ["weights", "draft_weights"]) in log
+    log.clear()
+    w.wake_up(["kv_cache"])  # unrelated tag untouched
+    assert ("wake", ["kv_cache"]) in log

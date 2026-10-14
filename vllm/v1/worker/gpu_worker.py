@@ -283,6 +283,14 @@ class Worker(WorkerBase):
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
 
+        # plan 075 S2 (M1-fix-1): the legacy whole-machine sleep must refuse
+        # when the hot switch already released the drafter (switch back to
+        # DFLASH2 first), and otherwise take the drafter weights along.
+        if self._drafter_released():
+            raise RuntimeError(
+                "legacy sleep() refused: the drafter weights are released "
+                "(draft_weights asleep); switch back to DFLASH2 first"
+            )
         free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
 
         # Save the buffers before level 2 sleep
@@ -293,7 +301,9 @@ class Worker(WorkerBase):
             }
 
         allocator = CuMemAllocator.get_instance()
-        allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
+        allocator.sleep(
+            offload_tags=("weights", "draft_weights") if level == 1 else tuple()
+        )
         free_bytes_after_sleep, total = torch.cuda.mem_get_info()
         freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
         used_bytes = total - free_bytes_after_sleep
@@ -308,6 +318,10 @@ class Worker(WorkerBase):
         from vllm.device_allocator.cumem import CuMemAllocator
 
         allocator = CuMemAllocator.get_instance()
+        # plan 075 S2 (M1-fix-1): waking "weights" also wakes the drafter
+        # weights; allocator.wake_up skips already mapped allocations.
+        if tags is not None and "weights" in tags and "draft_weights" not in tags:
+            tags = [*tags, "draft_weights"]
         allocator.wake_up(tags)
 
         # Restore the buffers after level 2 sleep
@@ -320,6 +334,11 @@ class Worker(WorkerBase):
 
         if tags is None or "kv_cache" in tags:
             self.model_runner.post_kv_cache_wake_up()
+
+    def _drafter_released(self) -> bool:
+        """True when the drafter gate is closed (draft_weights asleep)."""
+        spec = getattr(self.model_runner, "speculator", None)
+        return spec is not None and getattr(spec, "drafter_resident", True) is False
 
     # plan 075 S2: tags that sleep_tags/wake_tags may move. Only the drafter
     # weights; "weights" / "kv_cache" stay on the legacy sleep()/wake_up().
