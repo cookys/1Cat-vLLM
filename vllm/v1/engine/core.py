@@ -1329,6 +1329,12 @@ class EngineCore:
         self._spec_end("NOSPEC_GROWN")
         return True
 
+    def _spec_note_shrink(self, workers: list[dict], pool_blocks=None) -> None:
+        detail = {"mapped_bytes": [w["mapped_bytes"] for w in workers]}
+        if pool_blocks is not None:
+            detail["pool_blocks"] = pool_blocks
+        self._spec_note("shrink", detail)
+
     @staticmethod
     def _spec_shrink_failures(workers: list[dict]) -> str | None:
         """D-fix-2: a worker that could not unmap one of its regions leaves
@@ -1343,6 +1349,7 @@ class EngineCore:
         try:
             if self._spec_shrink_rpc_pending:
                 workers = self._spec_rpc("shrink_kv_cache", (spec_blocks,))
+                self._spec_note_shrink(workers)
                 bad = self._spec_shrink_failures(workers)
                 if bad:
                     return self._spec_to_error(bad)
@@ -1358,16 +1365,10 @@ class EngineCore:
                         },
                     )
                     return False  # wait: requests still hold tail blocks (F13)
+                self._spec_note_shrink(out["workers"], out["pool_blocks"])
                 bad = self._spec_shrink_failures(out["workers"])
                 if bad:
                     return self._spec_to_error(bad)
-                self._spec_note(
-                    "shrink",
-                    {
-                        "pool_blocks": out["pool_blocks"],
-                        "mapped_bytes": [w["mapped_bytes"] for w in out["workers"]],
-                    },
-                )
         except TimeoutError as exc:
             return self._spec_to_error(
                 f"shrink_kv_cache timed out ({exc!r}); worker state unknown"

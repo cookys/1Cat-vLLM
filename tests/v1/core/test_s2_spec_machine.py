@@ -545,3 +545,25 @@ def test_worker_region_shrink_failure_is_an_error_state_with_no_wake():
     assert s.spec_enabled is False and s.drafter_resident is False
     with pytest.raises(RuntimeError):
         core.set_spec_mode("nospec")
+
+
+def test_shrink_region_failure_on_the_pending_retry_path_is_an_error_state():
+    core, cl, s = make()
+    core.set_spec_mode("nospec")
+    cl.inject["shrink_kv_cache"] = [RuntimeError("unmap failed")]  # sets pending
+    assert core.set_spec_mode("dflash2")["state"] == "DFLASH2_FENCING"
+    orig = cl.ranks[1].shrink_kv_cache
+
+    def bad(target):
+        out = orig(target)
+        out["shrink_failed"] = ["region 1: VmmError('unmap failed')"]
+        return out
+
+    cl.ranks[1].shrink_kv_cache = bad
+    cl.log.clear()
+    core.set_spec_mode("dflash2")  # retry: only the unmap is repeated
+    g = core.get_spec_mode()
+    assert g["state"] == "error" and "rank(s) {1:" in g["error"]
+    assert g["last_transition"]["steps"]["shrink"]["mapped_bytes"] == [N_SPEC * PAGE] * 2
+    assert "wake_tags" not in cl.methods()
+    assert s.spec_enabled is False
