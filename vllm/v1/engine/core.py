@@ -1166,10 +1166,22 @@ class EngineCore:
                 self._spec_blocked = False
                 self._spec_last_error = None
                 changed = True
-            elif st in ("NOSPEC_DRAINING", "NOSPEC_RELEASED") and self._spec_blocked:
+            elif st == "NOSPEC_DRAINING" and self._spec_blocked:
                 self._spec_blocked = False
                 self._spec_last_error = None
                 self._advance_spec_transition()
+            elif st == "NOSPEC_RELEASED":
+                # RELEASED is not a resting state: POST nospec retries the grow.
+                self._spec_blocked = False
+                self._spec_last_error = None
+                self._advance_spec_transition()
+                return {
+                    "mode": mode,
+                    "prev": prev,
+                    "changed": False,
+                    "retried": True,
+                    "state": self._spec_state(),
+                }
         return {
             "mode": mode,
             "prev": prev,
@@ -1820,7 +1832,8 @@ class EngineCoreProc(EngineCore):
         self.post_step(model_executed)
         # plan 075 S2: move the spec hot-switch state machine forward.
         if (
-            self.scheduler.spec_state in ("NOSPEC_DRAINING", "DFLASH2_FENCING")
+            self.scheduler.spec_state
+            in ("NOSPEC_DRAINING", "NOSPEC_RELEASED", "DFLASH2_FENCING")
             and not self._spec_blocked
         ):
             self._advance_spec_transition()

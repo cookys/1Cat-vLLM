@@ -411,3 +411,28 @@ def test_twenty_round_trips_do_not_leak_memory_or_pool_blocks():
     assert [r.free for r in cl.ranks] == base
     assert all(r.be.mapped_total() == N_SPEC * PAGE for r in cl.ranks)
     assert s.kv_cache_manager.block_pool.num_gpu_blocks == N_SPEC
+
+
+# ---- M3-fix ---------------------------------------------------------------
+
+LOW_FREE = TAIL_BYTES + MARGIN - DRAFT - 1  # one byte short after the release
+
+
+def _released_unblocked(core, cl):
+    """RELEASED (grow skipped) -> dflash2 whose wake fails -> nospec cancels."""
+    assert core.set_spec_mode("nospec")["state"] == "NOSPEC_RELEASED"
+    cl.inject["wake_tags"] = [RuntimeError("H2D failed")]
+    assert core.set_spec_mode("dflash2")["state"] == "DFLASH2_FENCING"
+    out = core.set_spec_mode("nospec")  # cancel: lift the fence
+    assert out["state"] == "NOSPEC_RELEASED" and core.get_spec_mode()["blocked"] is False
+    for r in cl.ranks:
+        r.free += 2  # memory is available now
+
+
+def test_post_nospec_in_released_retries_the_grow_and_says_so():
+    core, cl, s = make(free=LOW_FREE)
+    _released_unblocked(core, cl)
+    out = core.set_spec_mode("nospec")
+    assert out["changed"] is False and out["retried"] is True
+    assert out["state"] == "NOSPEC_GROWN"
+    assert "retried" not in core.set_spec_mode("nospec")  # GROWN: plain no-op
