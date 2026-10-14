@@ -778,9 +778,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         blocks (F10)."""
         regions = self._elastic_regions()
         torch.cuda.synchronize()
-        for r in regions:
-            r.shrink_to(n_blocks_total * r.block_bytes)
-        return self._elastic_report()
+        failed = []
+        for i, r in enumerate(regions):
+            try:
+                r.shrink_to(n_blocks_total * r.block_bytes)
+            except Exception as exc:  # keep going: report every region's state
+                failed.append(f"region {i}: {exc!r}")
+        report = self._elastic_report()
+        if failed:
+            report["shrink_failed"] = failed  # M3-fix-6: the engine goes to error
+        return report
 
     def close_elastic_kv(self) -> None:
         """plan 075 S2: unmap and free the elastic KV regions (teardown). The

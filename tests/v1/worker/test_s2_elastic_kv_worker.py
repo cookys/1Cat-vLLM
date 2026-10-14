@@ -128,6 +128,26 @@ def test_runner_grow_and_shrink_every_region(no_cuda):
     assert all(x.mapped_bytes == PAGE * N_SPEC for x in regions)
 
 
+def test_runner_shrink_reports_a_failing_second_region_and_still_shrinks_the_rest(
+    no_cuda,
+):
+    r, regions, _ = runner(n=3)
+    GPUModelRunner.grow_kv_cache(r, N_SPEC + TAIL)
+
+    def boom(target):
+        raise VmmError("unmap failed")
+
+    regions[1].shrink_to = boom
+    rep = GPUModelRunner.shrink_kv_cache(r, N_SPEC)
+    assert len(rep["shrink_failed"]) == 1 and "region 1" in rep["shrink_failed"][0]
+    assert regions[0].mapped_bytes == PAGE * N_SPEC  # shrunk before the failure
+    assert regions[2].mapped_bytes == PAGE * N_SPEC  # and after it
+    assert regions[1].mapped_bytes == PAGE * (N_SPEC + TAIL)
+    assert "shrink_failed" not in GPUModelRunner.shrink_kv_cache(
+        runner(n=1)[0], N_SPEC
+    )
+
+
 def test_runner_grow_is_all_or_nothing_across_tensors(no_cuda):
     be = FakeVmmBackend()
     r, regions, _ = runner(be)

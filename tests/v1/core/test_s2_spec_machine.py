@@ -69,13 +69,21 @@ class FakeRank:
         before = self.region.mapped_bytes
         self.region.grow_to(target * PAGE)
         self.free -= self.region.mapped_bytes - before
-        return {"mapped_blocks": self.region.mapped_blocks, "free_bytes": self.free}
+        return {
+            "mapped_bytes": self.region.mapped_bytes,
+            "mapped_blocks": self.region.mapped_blocks,
+            "free_bytes": self.free,
+        }
 
     def shrink_kv_cache(self, target):
         before = self.region.mapped_bytes
         self.region.shrink_to(target * PAGE)
         self.free += before - self.region.mapped_bytes
-        return {"mapped_blocks": self.region.mapped_blocks, "free_bytes": self.free}
+        return {
+            "mapped_bytes": self.region.mapped_bytes,
+            "mapped_blocks": self.region.mapped_blocks,
+            "free_bytes": self.free,
+        }
 
 
 class Cluster:
@@ -193,6 +201,9 @@ def test_idle_round_trip_runs_the_f10_f11_order():
     assert s.kv_cache_manager.block_pool.num_gpu_blocks == N_SPEC
     assert s.kv_cache_manager.block_pool.max_block_id is None
     assert c.get("/spec_mode").json()["last_transition"]["to"] == "DFLASH2"
+    assert c.get("/spec_mode").json()["last_transition"]["steps"]["shrink"][
+        "mapped_bytes"
+    ] == [N_SPEC * PAGE] * 2  # per rank (D-fix-2)
 
 
 def test_draining_waits_for_k7_requests_then_advances_from_the_step_loop():
@@ -513,3 +524,24 @@ def test_get_spec_mode_reports_tail_holder_reqs_and_blocks_side_by_side():
     g = core.get_spec_mode()
     assert "tail_holders" not in g
     assert g["tail_holder_reqs"] == 0 and g["tail_holder_blocks"] == 0
+
+
+def test_worker_region_shrink_failure_is_an_error_state_with_no_wake():
+    core, cl, s = make()
+    core.set_spec_mode("nospec")
+    orig = cl.ranks[1].shrink_kv_cache
+
+    def bad(target):
+        out = orig(target)
+        out["shrink_failed"] = ["region 1: VmmError('unmap failed')"]
+        return out
+
+    cl.ranks[1].shrink_kv_cache = bad
+    cl.log.clear()
+    core.set_spec_mode("dflash2")
+    g = core.get_spec_mode()
+    assert g["state"] == "error" and "rank(s) {1:" in g["error"]
+    assert "wake_tags" not in cl.methods()
+    assert s.spec_enabled is False and s.drafter_resident is False
+    with pytest.raises(RuntimeError):
+        core.set_spec_mode("nospec")

@@ -1329,11 +1329,23 @@ class EngineCore:
         self._spec_end("NOSPEC_GROWN")
         return True
 
+    @staticmethod
+    def _spec_shrink_failures(workers: list[dict]) -> str | None:
+        """D-fix-2: a worker that could not unmap one of its regions leaves
+        its tail half-mapped; that is not retriable, so the machine errors."""
+        bad = {i: w["shrink_failed"] for i, w in enumerate(workers) if w.get("shrink_failed")}
+        if not bad:
+            return None
+        return f"worker shrink failed on rank(s) {bad}; mapped state inconsistent"
+
     def _spec_restore(self) -> bool:
         spec_blocks = self.scheduler.kv_pool_spec_blocks()
         try:
             if self._spec_shrink_rpc_pending:
-                self._spec_rpc("shrink_kv_cache", (spec_blocks,))
+                workers = self._spec_rpc("shrink_kv_cache", (spec_blocks,))
+                bad = self._spec_shrink_failures(workers)
+                if bad:
+                    return self._spec_to_error(bad)
                 self._spec_shrink_rpc_pending = False
             elif self.scheduler.kv_pool_blocks() > spec_blocks:
                 out = self.shrink_kv_cache()
@@ -1346,7 +1358,16 @@ class EngineCore:
                         },
                     )
                     return False  # wait: requests still hold tail blocks (F13)
-                self._spec_note("shrink", {"pool_blocks": out["pool_blocks"]})
+                bad = self._spec_shrink_failures(out["workers"])
+                if bad:
+                    return self._spec_to_error(bad)
+                self._spec_note(
+                    "shrink",
+                    {
+                        "pool_blocks": out["pool_blocks"],
+                        "mapped_bytes": [w["mapped_bytes"] for w in out["workers"]],
+                    },
+                )
         except TimeoutError as exc:
             return self._spec_to_error(
                 f"shrink_kv_cache timed out ({exc!r}); worker state unknown"
