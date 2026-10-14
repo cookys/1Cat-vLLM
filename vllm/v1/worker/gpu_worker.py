@@ -321,6 +321,75 @@ class Worker(WorkerBase):
         if tags is None or "kv_cache" in tags:
             self.model_runner.post_kv_cache_wake_up()
 
+    # plan 075 S2: tags that sleep_tags/wake_tags may move. Only the drafter
+    # weights; "weights" / "kv_cache" stay on the legacy sleep()/wake_up().
+    _SLEEPABLE_TAGS = frozenset({"draft_weights"})
+
+    def _check_sleepable_tags(self, tags: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+        tags = tuple(tags)
+        bad = [t for t in tags if t not in self._SLEEPABLE_TAGS]
+        if not tags or bad:
+            raise ValueError(
+                f"sleep_tags/wake_tags only accept {sorted(self._SLEEPABLE_TAGS)}, "
+                f"got {list(tags)}"
+            )
+        return tags
+
+    def sleep_tags(self, tags: tuple[str, ...] | list[str]) -> dict[str, Any]:
+        """plan 075 S2: back up the given tags to pinned host memory, then unmap
+        them (offload mode). Everything else stays mapped. A second call for
+        the same tags is a no-op that reports ``freed_bytes == 0``.
+        """
+        from vllm.device_allocator.cumem import CuMemAllocator
+        from vllm.utils.platform_utils import is_pin_memory_available
+
+        tags = self._check_sleepable_tags(tags)
+        if not self.vllm_config.model_config.enable_cumem_allocator:
+            raise RuntimeError("sleep_tags requires --enable-cumem-allocator")
+        if not is_pin_memory_available():
+            # A pageable fallback would silently slow wake_tags (F2): fail loud.
+            raise RuntimeError("sleep_tags needs pinned host memory; unavailable")
+        # F12: drain in-flight work before any unmap.
+        torch.cuda.synchronize()
+        allocator = CuMemAllocator.get_instance()
+        free_before = torch.cuda.mem_get_info()[0]
+        mapped_before = allocator.get_current_usage(only_mapped=True)
+        # Close the drafter's entry points before its memory goes away (F7).
+        self.model_runner.set_drafter_resident(False)
+        # If sleep fails midway the gate stays closed (state is half unmapped).
+        allocator.sleep(offload_tags=tags, unmap_tags=tags)
+        free_after = torch.cuda.mem_get_info()[0]
+        return {
+            "tags": list(tags),
+            "freed_bytes": free_after - free_before,
+            "unmapped_bytes": mapped_before
+            - allocator.get_current_usage(only_mapped=True),
+            "free_before": free_before,
+            "free_after": free_after,
+        }
+
+    def wake_tags(self, tags: tuple[str, ...] | list[str]) -> dict[str, Any]:
+        """plan 075 S2: re-map the given tags and copy the host backup back.
+        The drafter gate reopens only after the copy completed.
+        """
+        from vllm.device_allocator.cumem import CuMemAllocator
+
+        tags = self._check_sleepable_tags(tags)
+        allocator = CuMemAllocator.get_instance()
+        free_before = torch.cuda.mem_get_info()[0]
+        mapped_before = allocator.get_current_usage(only_mapped=True)
+        allocator.wake_up(list(tags))
+        torch.cuda.synchronize()
+        self.model_runner.set_drafter_resident(True)
+        free_after = torch.cuda.mem_get_info()[0]
+        return {
+            "tags": list(tags),
+            "mapped_bytes": allocator.get_current_usage(only_mapped=True)
+            - mapped_before,
+            "free_before": free_before,
+            "free_after": free_after,
+        }
+
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
         if not self.vllm_config.model_config.enable_cumem_allocator:
             return nullcontext()
