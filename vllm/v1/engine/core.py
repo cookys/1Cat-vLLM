@@ -1036,33 +1036,302 @@ class EngineCore:
         """Check if engine is sleeping at any level."""
         return self.is_scheduler_paused() or self.model_executor.is_sleeping
 
-    def set_spec_mode(self, mode: str) -> dict:
-        """plan 075 S1: flip the spec mode for requests added from now on.
+    # ---- plan 075 S2 M3: spec hot-switch state machine ----------------------
+    #
+    # DFLASH2 -> NOSPEC_DRAINING -> NOSPEC_RELEASED -> NOSPEC_GROWN
+    #   NOSPEC_GROWN/RELEASED -> DFLASH2_FENCING -> DFLASH2
+    # Only ``spec_enabled`` flips inside the POST; every other step runs in
+    # ``_advance_spec_transition`` between engine steps (and once right after
+    # the POST, which finishes the whole chain on an idle engine). A failed
+    # step stops the machine at the previous stable state with
+    # ``_spec_blocked`` set (no per-step retry loop); the next POST in the
+    # same direction retries. ``error`` is reserved for a failed recovery.
 
-        ``mode`` is "dflash2" (draft/verify, the configured behaviour) or
-        "nospec" (new requests run with K=0). Requests already in the system
-        keep the K they were added with. Re-sending the current mode changes
-        nothing and reports ``changed: false``.
+    _SPEC_GROW_MARGIN_BYTES = 64 << 20  # D7: free memory kept after the grow
+    _SPEC_DRAFT_TAGS = ("draft_weights",)
+    _spec_blocked = False
+    _spec_last_error: str | None = None
+    _spec_last_transition: dict | None = None
+    _spec_shrink_rpc_pending = False
+
+    def _spec_machine_on(self) -> bool:
+        cache_config = self.vllm_config.cache_config
+        return bool(
+            getattr(cache_config, "spec_hot_switch_elastic", False)
+            and self.scheduler.num_spec_tokens > 0
+        )
+
+    def _spec_state(self) -> str:
+        return self.scheduler.get_spec_mode_info()["state"]
+
+    def _spec_set_state(self, state: str) -> None:
+        prev = self.scheduler.spec_state or self._spec_state()
+        self.scheduler.spec_state = state
+        logger.info("spec hot-switch state %s -> %s", prev, state)
+
+    def _spec_fail(self, what: str) -> bool:
+        self._spec_blocked = True
+        self._spec_last_error = what
+        logger.error("spec hot-switch stopped in %s: %s", self._spec_state(), what)
+        return False
+
+    def _spec_begin(self, src: str) -> None:
+        self._spec_blocked = False
+        self._spec_last_error = None
+        self._spec_t0 = time.monotonic()
+        self._spec_last_transition = {
+            "from": src,
+            "to": None,
+            "started_at": time.time(),
+            "finished_at": None,
+            "duration_s": None,
+            "steps": {},
+        }
+
+    def _spec_note(self, step: str, detail: dict) -> None:
+        if self._spec_last_transition is not None:
+            self._spec_last_transition["steps"][step] = detail
+
+    def _spec_end(self, state: str) -> None:
+        tr = self._spec_last_transition
+        if tr is not None and tr["finished_at"] is None:
+            tr["to"] = state
+            tr["finished_at"] = time.time()
+            tr["duration_s"] = time.monotonic() - self._spec_t0
+
+    def set_spec_mode(self, mode: str) -> dict:
+        """plan 075 S1/S2: switch the spec mode.
+
+        S1 (no ``--spec-hot-switch-elastic``): flips the mode for requests
+        added from now on. S2: runs the state machine above. Re-sending the
+        current direction changes nothing and reports ``changed: false`` (a
+        blocked machine retries its stopped step). Returns the new state.
         """
         if mode not in ("dflash2", "nospec"):
             raise ValueError(f"mode must be 'dflash2' or 'nospec', got {mode!r}")
         want = mode == "dflash2"
-        was = self.scheduler.get_spec_mode_info()["spec_enabled"]
-        if want != was:
-            self.scheduler.set_spec_enabled(want)
+        if not self._spec_machine_on():
+            was = self.scheduler.get_spec_mode_info()["spec_enabled"]
+            if want != was:
+                self.scheduler.set_spec_enabled(want)
+            return {
+                "mode": mode,
+                "prev": "dflash2" if was else "nospec",
+                "changed": want != was,
+                "state": self._spec_state(),
+            }
+        st = self._spec_state()
+        if st == "error":
+            raise RuntimeError(
+                f"spec hot-switch is in the error state ({self._spec_last_error}); "
+                "restart the engine"
+            )
+        prev = "dflash2" if st == "DFLASH2" else "nospec"
+        changed = False
+        spec_blocks = self.scheduler.kv_pool_spec_blocks()
+        if want:
+            if st == "NOSPEC_DRAINING":
+                # the weights were never released: only flip the flag back
+                self._spec_begin(st)
+                self.scheduler.set_spec_enabled(True)
+                self._spec_set_state("DFLASH2")
+                self._spec_end("DFLASH2")
+                changed = True
+            elif st in ("NOSPEC_RELEASED", "NOSPEC_GROWN"):
+                self._spec_begin(st)
+                self.scheduler.set_kv_fence(spec_blocks - 1)  # F13
+                self._spec_set_state("DFLASH2_FENCING")
+                changed = True
+                self._advance_spec_transition()
+            elif st == "DFLASH2_FENCING" and self._spec_blocked:
+                self._spec_blocked = False
+                self._spec_last_error = None
+                self._advance_spec_transition()
+        else:
+            if st == "DFLASH2":
+                self._spec_begin(st)
+                self.scheduler.set_spec_enabled(False)
+                self._spec_set_state("NOSPEC_DRAINING")
+                changed = True
+                self._advance_spec_transition()
+            elif st == "DFLASH2_FENCING":
+                # cancel the switch back: lift the fence, keep what is mapped
+                self.scheduler.set_kv_fence(None)
+                back = (
+                    "NOSPEC_GROWN"
+                    if self.scheduler.kv_pool_blocks() > spec_blocks
+                    else "NOSPEC_RELEASED"
+                )
+                self._spec_set_state(back)
+                self._spec_blocked = False
+                self._spec_last_error = None
+                changed = True
+            elif st in ("NOSPEC_DRAINING", "NOSPEC_RELEASED") and self._spec_blocked:
+                self._spec_blocked = False
+                self._spec_last_error = None
+                self._advance_spec_transition()
         return {
             "mode": mode,
-            "prev": "dflash2" if was else "nospec",
-            "changed": want != was,
+            "prev": prev,
+            "changed": changed,
+            "state": self._spec_state(),
         }
 
+    def _advance_spec_transition(self) -> None:
+        """Run the pending steps of the state machine until one has to wait or
+        fails. Cheap when stable; never raises (failures stop the machine)."""
+        if not self._spec_machine_on():
+            return
+        for _ in range(4):
+            if self._spec_blocked:
+                return
+            st = self._spec_state()
+            if st == "NOSPEC_DRAINING":
+                ok = self._spec_release()
+            elif st == "NOSPEC_RELEASED":
+                ok = self._spec_grow()
+            elif st == "DFLASH2_FENCING":
+                ok = self._spec_restore()
+            else:
+                return
+            if not ok:
+                return
+
+    def _spec_release(self) -> bool:
+        if self.scheduler.count_spec_inflight() > 0:
+            return False  # wait: K>0 requests must drain first (F6)
+        try:
+            res = self.collective_rpc("sleep_tags", args=(self._SPEC_DRAFT_TAGS,))
+        except Exception as exc:
+            # D8 failure edge: put the weights back at once.
+            try:
+                self.collective_rpc("wake_tags", args=(self._SPEC_DRAFT_TAGS,))
+            except Exception as exc2:
+                self.scheduler.set_drafter_resident(False)
+                self._spec_last_error = (
+                    f"sleep_tags failed ({exc!r}) and the recovery wake_tags "
+                    f"failed too ({exc2!r}); drafter gate closed"
+                )
+                self._spec_set_state("error")
+                self._spec_end("error")
+                logger.error("spec hot-switch: %s", self._spec_last_error)
+                return False
+            self.scheduler.set_drafter_resident(True)
+            return self._spec_fail(
+                f"sleep_tags failed ({exc!r}); drafter weights restored"
+            )
+        self.scheduler.set_drafter_resident(False)
+        self._spec_note(
+            "release",
+            {
+                "freed_bytes": [r["freed_bytes"] for r in res],
+                "free_after": [r["free_after"] for r in res],
+            },
+        )
+        self._spec_set_state("NOSPEC_RELEASED")
+        return True
+
+    def _spec_grow(self) -> bool:
+        cfg = self.scheduler.kv_cache_config
+        if cfg.elastic_tail_blocks <= 0:
+            self._spec_end("NOSPEC_RELEASED")
+            return self._spec_fail(
+                "no elastic KV tail: the drafter weights are released but the "
+                "pool cannot grow"
+            )
+        need = sum(
+            t.max_size - t.size for t in cfg.kv_cache_tensors if t.max_size is not None
+        )
+        try:
+            free = min(
+                int(r["free_bytes"]) for r in self.collective_rpc("get_gpu_free_bytes")
+            )
+        except Exception as exc:
+            return self._spec_fail(f"get_gpu_free_bytes failed ({exc!r})")
+        if free < need + self._SPEC_GROW_MARGIN_BYTES:
+            self._spec_end("NOSPEC_RELEASED")
+            return self._spec_fail(
+                f"grow skipped: min free {free} B over ranks < tail {need} B + "
+                f"{self._SPEC_GROW_MARGIN_BYTES} B margin"
+            )
+        try:
+            out = self.grow_kv_cache()
+        except Exception as exc:
+            return self._spec_fail(f"grow_kv_cache failed ({exc!r}); staying released")
+        self._spec_note(
+            "grow",
+            {
+                "pool_blocks": out["pool_blocks"],
+                "added_blocks": out["added_blocks"],
+                "free_bytes": [w.get("free_bytes") for w in out["workers"]],
+            },
+        )
+        self._spec_set_state("NOSPEC_GROWN")
+        self._spec_end("NOSPEC_GROWN")
+        return True
+
+    def _spec_restore(self) -> bool:
+        spec_blocks = self.scheduler.kv_pool_spec_blocks()
+        try:
+            if self._spec_shrink_rpc_pending:
+                self.collective_rpc("shrink_kv_cache", args=(spec_blocks,))
+                self._spec_shrink_rpc_pending = False
+            elif self.scheduler.kv_pool_blocks() > spec_blocks:
+                out = self.shrink_kv_cache()
+                if not out["ok"]:
+                    self._spec_note(
+                        "shrink_wait",
+                        {
+                            "tail_holder_blocks": out["tail_holder_blocks"],
+                            "tail_holder_reqs": out["tail_holder_reqs"],
+                        },
+                    )
+                    return False  # wait: requests still hold tail blocks (F13)
+                self._spec_note("shrink", {"pool_blocks": out["pool_blocks"]})
+        except Exception as exc:
+            if self.scheduler.kv_pool_blocks() <= spec_blocks:
+                # scheduler already dropped the tail; only the unmap is missing
+                self._spec_shrink_rpc_pending = True
+            return self._spec_fail(f"shrink_kv_cache failed ({exc!r})")
+        try:
+            res = self.collective_rpc("wake_tags", args=(self._SPEC_DRAFT_TAGS,))
+        except Exception as exc:
+            return self._spec_fail(f"wake_tags failed ({exc!r}); drafter still released")
+        self._spec_note("wake", {"mapped_bytes": [r["mapped_bytes"] for r in res]})
+        self.scheduler.set_drafter_resident(True)
+        self.scheduler.set_kv_fence(None)
+        # F11: spec turns back on only after every rank has its weights again.
+        self.scheduler.set_spec_enabled(True)
+        self._spec_set_state("DFLASH2")
+        self._spec_end("DFLASH2")
+        return True
+
+    def get_gpu_free_bytes(self) -> list[dict]:
+        return self.collective_rpc("get_gpu_free_bytes")
+
     def get_spec_mode(self) -> dict:
-        """plan 075 S1: current mode and running requests by K (read-only)."""
+        """plan 075 S1/S2: mode, state machine state, request counts by K, the
+        KV pool and the last transition (read-only)."""
         info = self.scheduler.get_spec_mode_info()
+        spec_blocks = self.scheduler.kv_pool_spec_blocks()
+        pool_blocks = self.scheduler.kv_pool_blocks()
+        grown = pool_blocks > spec_blocks
+        pool = self.scheduler.get_kv_pool_info()
+        tail_reqs = self.scheduler.count_tail_holder_reqs() if grown else 0
         return {
             "mode": "dflash2" if info["spec_enabled"] else "nospec",
+            "state": info["state"],
             "running_spec": info["running_spec"],
             "running_nospec": info["running_nospec"],
+            "spec_inflight": info["spec_inflight"],
+            "drafter_resident": info["drafter_resident"],
+            "pool_blocks": pool_blocks,
+            "spec_blocks": spec_blocks,
+            "tail_holders": tail_reqs,  # requests (F13); blocks below
+            "tail_holder_blocks": pool["tail_holder_blocks"],
+            "error": self._spec_last_error,
+            "blocked": self._spec_blocked,
+            "last_transition": self._spec_last_transition,
         }
 
     def execute_dummy_batch(self):
@@ -1549,6 +1818,12 @@ class EngineCoreProc(EngineCore):
             self.output_queue.put_nowait(output)
         # Post-step hook.
         self.post_step(model_executed)
+        # plan 075 S2: move the spec hot-switch state machine forward.
+        if (
+            self.scheduler.spec_state in ("NOSPEC_DRAINING", "DFLASH2_FENCING")
+            and not self._spec_blocked
+        ):
+            self._advance_spec_transition()
 
         # If no model execution happened but there is still scheduler work
         # (e.g. WAITING_FOR_REMOTE_KVS or delayed KV connector frees), yield

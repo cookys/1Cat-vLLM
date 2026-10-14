@@ -552,7 +552,13 @@ class _Client:
     """EngineClient stand-in routing straight into the real EngineCore methods."""
 
     def __init__(self, scheduler):
-        self.core = SimpleNamespace(scheduler=scheduler)
+        # plan 075 S2 D3: the real EngineCore methods now also read the config
+        # (state machine off = the S1 soft switch) and the pool.
+        self.core = EngineCore.__new__(EngineCore)
+        self.core.scheduler = scheduler
+        self.core.vllm_config = SimpleNamespace(
+            cache_config=SimpleNamespace(spec_hot_switch_elastic=False)
+        )
 
     async def set_spec_mode(self, mode):
         return EngineCore.set_spec_mode(self.core, mode)
@@ -566,6 +572,25 @@ def _app(scheduler):
     app.include_router(spec_mode_router)
     app.state.engine_client = _Client(scheduler)
     return TestClient(app)
+
+
+def _lit(s, mode, running_spec, running_nospec, state, inflight=None):
+    """Literal /spec_mode GET body (S2 D3: extended fields, state machine off)."""
+    return {
+        "mode": mode,
+        "state": state,
+        "running_spec": running_spec,
+        "running_nospec": running_nospec,
+        "spec_inflight": s.count_spec_inflight() if inflight is None else inflight,
+        "drafter_resident": True,
+        "pool_blocks": s.kv_cache_manager.block_pool.num_gpu_blocks,
+        "spec_blocks": s.kv_cache_config.num_blocks,
+        "tail_holders": 0,
+        "tail_holder_blocks": 0,
+        "error": None,
+        "blocked": False,
+        "last_transition": None,
+    }
 
 
 def _snapshot(s):
@@ -586,41 +611,53 @@ def test_spec_mode_post_get_literals_and_same_state_is_zero_change():
     complete(s, s.schedule())
     c = _app(s)
 
-    assert c.get("/spec_mode").json() == {
-        "mode": "dflash2",
-        "running_spec": 2,
-        "running_nospec": 0,
-    }
+    assert c.get("/spec_mode").json() == _lit(s, "dflash2", 2, 0, "DFLASH2", 2)
     before = _snapshot(s)
     r = c.post("/spec_mode", params={"mode": "dflash2"})
     assert r.status_code == 200
-    assert r.json() == {"mode": "dflash2", "prev": "dflash2", "changed": False}
+    assert r.json() == {
+        "mode": "dflash2",
+        "prev": "dflash2",
+        "changed": False,
+        "state": "DFLASH2",
+    }
     assert _snapshot(s) == before  # same-mode resend: nothing moved
 
     r = c.post("/spec_mode", params={"mode": "nospec"})
     assert r.status_code == 200
-    assert r.json() == {"mode": "nospec", "prev": "dflash2", "changed": True}
-    # flipping the mode does not touch the K of requests already running
-    assert c.get("/spec_mode").json() == {
+    assert r.json() == {
         "mode": "nospec",
-        "running_spec": 2,
-        "running_nospec": 0,
+        "prev": "dflash2",
+        "changed": True,
+        "state": "NOSPEC_DRAINING",  # S1 soft switch: K=7 requests still run
     }
+    # flipping the mode does not touch the K of requests already running
+    assert c.get("/spec_mode").json() == _lit(
+        s, "nospec", 2, 0, "NOSPEC_DRAINING", 2
+    )
     again = _snapshot(s)
     r = c.post("/spec_mode", params={"mode": "nospec"})
-    assert r.json() == {"mode": "nospec", "prev": "nospec", "changed": False}
+    assert r.json() == {
+        "mode": "nospec",
+        "prev": "nospec",
+        "changed": False,
+        "state": "NOSPEC_DRAINING",
+    }
     assert _snapshot(s) == again
 
     (late,) = utils.create_requests(1, num_tokens=30, req_ids=["c"], max_tokens=64)
     s.add_request(late)
     complete(s, s.schedule())
-    assert c.get("/spec_mode").json() == {
-        "mode": "nospec",
-        "running_spec": 2,
-        "running_nospec": 1,
-    }
+    assert c.get("/spec_mode").json() == _lit(
+        s, "nospec", 2, 1, "NOSPEC_DRAINING", 2
+    )
     r = c.post("/spec_mode", params={"mode": "dflash2"})
-    assert r.json() == {"mode": "dflash2", "prev": "nospec", "changed": True}
+    assert r.json() == {
+        "mode": "dflash2",
+        "prev": "nospec",
+        "changed": True,
+        "state": "DFLASH2",
+    }
     # GET is read-only
     snap = _snapshot(s)
     for _ in range(3):
