@@ -409,6 +409,39 @@ class Worker(WorkerBase):
             "free_after": free_after,
         }
 
+    def get_elastic_kv_probe(self) -> dict[str, Any]:
+        """plan 075 S2 (A2-3): what the engine needs to size the elastic KV
+        tail: the resident drafter weight bytes (what nospec can give back)
+        and the VMM granularity. Call after load_model, before KV sizing."""
+        from vllm.device_allocator.cumem import CuMemAllocator
+        from vllm.device_allocator.vmm import get_vmm_backend
+
+        if not self.vllm_config.model_config.enable_cumem_allocator:
+            raise RuntimeError("elastic KV needs --enable-cumem-allocator")
+        allocator = CuMemAllocator.get_instance()
+        index = torch.cuda.current_device()
+        return {
+            "draft_weights_bytes": allocator.get_current_usage(
+                tag="draft_weights", only_mapped=True
+            ),
+            "granularity": get_vmm_backend().granularity(index),
+            "device": index,
+        }
+
+    def grow_kv_cache(self, n_blocks_total: int) -> dict[str, Any]:
+        """plan 075 S2 (A2-7): map the elastic KV tail up to ``n_blocks_total``
+        blocks on this rank. Reports mapped size and ``mem_get_info``."""
+        report = self.model_runner.grow_kv_cache(n_blocks_total)
+        free, total = torch.cuda.mem_get_info()
+        return {**report, "free_bytes": free, "total_bytes": total}
+
+    def shrink_kv_cache(self, n_blocks_total: int) -> dict[str, Any]:
+        """plan 075 S2 (A2-7): unmap the elastic KV tail above
+        ``n_blocks_total`` blocks on this rank."""
+        report = self.model_runner.shrink_kv_cache(n_blocks_total)
+        free, total = torch.cuda.mem_get_info()
+        return {**report, "free_bytes": free, "total_bytes": total}
+
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
         if not self.vllm_config.model_config.enable_cumem_allocator:
             return nullcontext()
@@ -839,7 +872,14 @@ class Worker(WorkerBase):
         # related to kv cache connector (e.g. kv cache sharing layers).
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
 
-        with self._maybe_get_memory_pool_context(tag="kv_cache"):
+        # plan 075 S2 (F8): an elastic KV tensor owns its VA through
+        # ElasticKvRegion, so it must not go through the cumem kv_cache pool.
+        elastic = any(t.max_size is not None for t in kv_cache_config.kv_cache_tensors)
+        with (
+            nullcontext()
+            if elastic
+            else self._maybe_get_memory_pool_context(tag="kv_cache")
+        ):
             self.model_runner.initialize_kv_cache(kv_cache_config)
 
         if self.model_config.enable_return_routed_experts:

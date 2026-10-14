@@ -34,6 +34,7 @@ from vllm import envs
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.device_allocator.elastic_region import ElasticKvRegion
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
@@ -718,6 +719,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         self.kv_caches: list[torch.Tensor] = []
+        # plan 075 S2: one ElasticKvRegion per elastic KV tensor (empty when
+        # the config is not elastic).
+        self.elastic_kv_regions: list[ElasticKvRegion] = []
         kv_caches_dict = init_kv_cache(
             self.kv_caches,
             self.compilation_config.static_forward_context,
@@ -727,8 +731,56 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.cache_config.cache_dtype,
             kernel_block_sizes,
             self.vllm_config,
+            elastic_regions=self.elastic_kv_regions,
         )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
+
+    def _elastic_regions(self) -> list[ElasticKvRegion]:
+        regions = getattr(self, "elastic_kv_regions", None)
+        if not regions:
+            raise RuntimeError(
+                "no elastic KV regions: start with --spec-hot-switch-elastic "
+                "and enough released drafter memory for a non-empty tail"
+            )
+        return regions
+
+    def _elastic_report(self) -> dict[str, Any]:
+        regions = self._elastic_regions()
+        return {
+            "mapped_bytes": sum(r.mapped_bytes for r in regions),
+            "mapped_blocks": min(r.mapped_blocks for r in regions),
+            "spec_blocks": regions[0].spec_blocks,
+            "max_blocks": regions[0].max_blocks,
+            "regions": len(regions),
+        }
+
+    def grow_kv_cache(self, n_blocks_total: int) -> dict[str, Any]:
+        """plan 075 S2 (A2-7): map every elastic KV tensor up to
+        ``n_blocks_total`` blocks (zeroed). All-or-nothing across tensors: on
+        failure the ones already grown go back to their previous size."""
+        regions = self._elastic_regions()
+        before = [r.mapped_bytes for r in regions]
+        grown: list[int] = []
+        try:
+            for i, r in enumerate(regions):
+                r.grow_to(n_blocks_total * r.block_bytes)
+                grown.append(i)
+            torch.cuda.synchronize()
+        except BaseException:
+            for i in grown:
+                regions[i].shrink_to(before[i])
+            raise
+        return self._elastic_report()
+
+    def shrink_kv_cache(self, n_blocks_total: int) -> dict[str, Any]:
+        """plan 075 S2 (A2-7): unmap the tail above ``n_blocks_total`` blocks
+        (never below N_spec). The scheduler must already have dropped those
+        blocks (F10)."""
+        regions = self._elastic_regions()
+        torch.cuda.synchronize()
+        for r in regions:
+            r.shrink_to(n_blocks_total * r.block_bytes)
+        return self._elastic_report()
 
     def _init_kv_zero_meta(self) -> None:
         """Precompute metadata used to clear newly allocated cache blocks."""

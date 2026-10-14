@@ -7,6 +7,8 @@ from typing import Any, cast
 import torch
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
+from vllm.device_allocator.elastic_region import ElasticKvRegion
+from vllm.device_allocator.vmm import VmmBackend
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.utils.torch_utils import get_dtype_size
@@ -18,6 +20,7 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    KVCacheTensor,
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -148,12 +151,52 @@ def init_attn_backend(
     return attn_groups, attn_cg_support_info, kernel_block_sizes
 
 
+def _allocate_elastic_kv_tensor(
+    kv_cache_config: KVCacheConfig,
+    kv_cache_tensor: KVCacheTensor,
+    device: torch.device,
+    elastic_regions: list[ElasticKvRegion],
+    vmm_backend: VmmBackend | None,
+) -> torch.Tensor:
+    """plan 075 S2 (F8/F9): the KV tensor lives in an ElasticKvRegion (own VA,
+    not the cumem ``kv_cache`` pool). The first ``size`` bytes are mapped and
+    zeroed; the tail up to ``max_size`` is mapped later by ``grow_kv_cache``."""
+    assert kv_cache_tensor.max_size is not None
+    block_bytes = kv_cache_tensor.size // kv_cache_config.num_blocks
+    assert block_bytes * kv_cache_config.num_blocks == kv_cache_tensor.size
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    region = ElasticKvRegion(
+        index,
+        kv_cache_tensor.max_size,
+        kv_cache_tensor.size,
+        kv_cache_config.elastic_boundary_blocks * block_bytes,
+        block_bytes,
+        backend=vmm_backend,
+    )
+    elastic_regions.append(region)
+    return region.as_tensor()
+
+
 def _allocate_kv_cache(
-    kv_cache_config: KVCacheConfig, shared_layers: dict[str, str], device: torch.device
+    kv_cache_config: KVCacheConfig,
+    shared_layers: dict[str, str],
+    device: torch.device,
+    elastic_regions: list[ElasticKvRegion] | None = None,
+    vmm_backend: VmmBackend | None = None,
 ):
     kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-        tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
+        if kv_cache_tensor.max_size is not None:
+            if elastic_regions is None:
+                raise RuntimeError(
+                    "elastic KV tensor (max_size set) but the caller gave no "
+                    "elastic_regions list to own the regions"
+                )
+            tensor = _allocate_elastic_kv_tensor(
+                kv_cache_config, kv_cache_tensor, device, elastic_regions, vmm_backend
+            )
+        else:
+            tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
         for layer_name in kv_cache_tensor.shared_by:
             kv_cache_raw_tensors[layer_name] = tensor
 
@@ -372,10 +415,16 @@ def init_kv_cache(
     cache_dtype: str,
     kernel_block_sizes: list[int],
     vllm_config: VllmConfig,
+    elastic_regions: list[ElasticKvRegion] | None = None,
+    vmm_backend: VmmBackend | None = None,
 ) -> dict[str, Any]:
     shared_kv_cache_layers = get_shared_kv_cache_layers(vllm_config)
     kv_cache_raw_tensors = _allocate_kv_cache(
-        kv_cache_config, shared_kv_cache_layers, device
+        kv_cache_config,
+        shared_kv_cache_layers,
+        device,
+        elastic_regions=elastic_regions,
+        vmm_backend=vmm_backend,
     )
     flattened_attn_groups = list(group for groups in attn_groups for group in groups)
     kv_caches = _reshape_kv_cache(
