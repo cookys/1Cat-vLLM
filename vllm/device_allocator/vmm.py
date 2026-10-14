@@ -29,6 +29,11 @@ class VmmError(RuntimeError):
     """A CUDA VMM driver call failed."""
 
 
+class VmmReleaseError(VmmError):
+    """``cuMemUnmap`` succeeded but ``cuMemRelease`` of the handle failed: the
+    range is already unmapped (the physical handle leaked)."""
+
+
 class VmmBackend(ABC):
     """Reserve one VA range, then map / unmap physical chunks inside it."""
 
@@ -145,7 +150,10 @@ class CudaPythonVmmBackend(VmmBackend):
     def unmap(self, va: int, offset: int, size: int, handle: Any) -> None:
         d = self.drv
         _check(d.cuMemUnmap(va + offset, size), "cuMemUnmap")
-        _check(d.cuMemRelease(handle), "cuMemRelease")
+        try:
+            _check(d.cuMemRelease(handle), "cuMemRelease")
+        except VmmError as exc:
+            raise VmmReleaseError(str(exc)) from exc
 
     def release_va(self, va: int, size: int) -> None:
         _check(self.drv.cuMemAddressFree(va, size), "cuMemAddressFree")
@@ -295,7 +303,10 @@ class CtypesVmmBackend(VmmBackend):
             ),
             "cuMemUnmap",
         )
-        self._ck(self.lib.cuMemRelease(handle), "cuMemRelease")
+        try:
+            self._ck(self.lib.cuMemRelease(handle), "cuMemRelease")
+        except VmmError as exc:
+            raise VmmReleaseError(str(exc)) from exc
 
     def release_va(self, va: int, size: int) -> None:
         self._ck(
@@ -348,6 +359,9 @@ class FakeVmmBackend(VmmBackend):
         self.reservations: dict[int, int] = {}  # va -> size
         self.mapped: dict[tuple[int, int], int] = {}  # (abs_start, size) -> handle
         self.fail_map_after: int | None = None  # raise after N successful maps
+        self.fail_memset_after: int | None = None  # raise after N ok memsets
+        self._memsets_done = 0
+        self.fail_release_on_unmap = False  # unmap ok, handle release fails
         self._maps_done = 0
         self._next_va = base
         self._next_handle = 1
@@ -394,6 +408,8 @@ class FakeVmmBackend(VmmBackend):
         if self.mapped.get(key) != handle:
             raise VmmError(f"unmap {key} is not exactly one mapped range")
         del self.mapped[key]
+        if self.fail_release_on_unmap:
+            raise VmmReleaseError("injected cuMemRelease failure")
 
     def release_va(self, va: int, size: int) -> None:
         self.calls.append(("release_va", va, size))
@@ -408,6 +424,11 @@ class FakeVmmBackend(VmmBackend):
         start = va + offset
         if not self._covered(start, size):
             raise VmmError(f"memset [{start:#x}, +{size:#x}) hits unmapped memory")
+        if self.fail_memset_after is not None and (
+            self._memsets_done >= self.fail_memset_after
+        ):
+            raise VmmError("injected memset failure")
+        self._memsets_done += 1
 
     def _covered(self, start: int, size: int) -> bool:
         """True when [start, start+size) is fully covered by mapped chunks."""

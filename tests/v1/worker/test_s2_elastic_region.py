@@ -4,7 +4,7 @@
 import pytest
 
 from vllm.device_allocator.elastic_region import ElasticKvRegion
-from vllm.device_allocator.vmm import FakeVmmBackend, VmmError
+from vllm.device_allocator.vmm import FakeVmmBackend, VmmError, VmmReleaseError
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
 
@@ -134,3 +134,46 @@ def test_non_2mib_granularity_changes_the_boundary_requirement():
         0, 5 * 2 * BOUNDARY, 2 * 2 * BOUNDARY, 2 * BOUNDARY, PAGE,
         backend=FakeVmmBackend(granularity=4 * MIB),
     )
+
+
+def test_memset_failure_during_grow_rolls_back_and_retry_zeroes():
+    be = FakeVmmBackend()
+    r, _ = make(backend=be)
+    be.fail_memset_after = 1  # first tail chunk ok, second chunk's memset fails
+    with pytest.raises(VmmError, match="injected memset"):
+        r.grow_to(5 * BOUNDARY)
+    assert r.mapped_bytes == 2 * BOUNDARY
+    assert be.mapped_total() == 2 * BOUNDARY
+    be.fail_memset_after = None
+    before = len(be.ops("memset"))
+    assert r.grow_to(4 * BOUNDARY) == 4 * BOUNDARY
+    ms = be.ops("memset")[before:]
+    assert [m[2] for m in ms] == [2 * BOUNDARY, 3 * BOUNDARY]  # every new chunk zeroed
+
+
+def test_memset_failure_in_init_keeps_original_error_and_frees_va():
+    be = FakeVmmBackend()
+    be.fail_memset_after = 0
+    with pytest.raises(VmmError, match="injected memset"):
+        ElasticKvRegion(0, 5 * BOUNDARY, 2 * BOUNDARY, BOUNDARY, PAGE, backend=be)
+    assert be.mapped_total() == 0 and be.reservations == {}
+
+
+def test_release_failure_after_unmap_does_not_resurrect_chunk():
+    r, be = make()
+    r.grow_to(4 * BOUNDARY)
+    be.fail_release_on_unmap = True
+    with pytest.raises(VmmReleaseError):
+        r.shrink_to(0)
+    be.fail_release_on_unmap = False
+    assert r.mapped_bytes == 3 * BOUNDARY == be.mapped_total()
+    assert r.shrink_to(0) == 2 * BOUNDARY  # retry does not re-unmap a dead range
+
+
+def test_startup_and_grow_synchronize_after_memset():
+    r, be = make()
+    names = [c[0] for c in be.calls]
+    assert names.index("synchronize") > names.index("memset")
+    n = len(be.ops("synchronize"))
+    r.grow_to(3 * BOUNDARY)
+    assert len(be.ops("synchronize")) == n + 1

@@ -23,7 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from vllm.device_allocator.vmm import VmmBackend, get_vmm_backend
+from vllm.device_allocator.vmm import VmmBackend, VmmReleaseError, get_vmm_backend
 
 
 @dataclass
@@ -75,8 +75,13 @@ class ElasticKvRegion:
         self.va = self.backend.reserve(n_max_bytes, device)
         try:
             self._map_chunk(0, n_spec_bytes, zero=True)
-        except BaseException:
-            self.backend.release_va(self.va, n_max_bytes)
+            self.backend.synchronize()  # startup memset done before first use
+        except BaseException as exc:
+            # keep the original error even when the cleanup itself fails
+            try:
+                self.close()
+            except BaseException as cleanup_exc:
+                raise exc from cleanup_exc
             raise
 
     # ---- state -------------------------------------------------------
@@ -119,10 +124,19 @@ class ElasticKvRegion:
 
     def _map_chunk(self, offset: int, size: int, zero: bool) -> None:
         handle = self.backend.map(self.va, offset, size, self.device)
-        self._chunks.append(_Chunk(offset, size, handle))
         if zero:
-            # F9: never rely on cuMemCreate returning zeroed memory.
-            self.backend.memset(self.va, offset, size, 0)
+            # F9: never rely on cuMemCreate returning zeroed memory. A chunk
+            # whose memset failed must not stay mapped: a retry would see it
+            # as already grown and hand out non-zeroed memory.
+            try:
+                self.backend.memset(self.va, offset, size, 0)
+            except BaseException as exc:
+                try:
+                    self.backend.unmap(self.va, offset, size, handle)
+                except BaseException as cleanup_exc:
+                    raise exc from cleanup_exc
+                raise
+        self._chunks.append(_Chunk(offset, size, handle))
 
     def grow_to(self, target_bytes: int) -> int:
         """Map chunks until ``mapped_bytes >= target_bytes`` (rounded up to a
@@ -141,12 +155,18 @@ class ElasticKvRegion:
             for _ in range(added):
                 self._unmap_last()
             raise
+        if added:
+            self.backend.synchronize()
         return self.mapped_bytes
 
     def _unmap_last(self) -> None:
         chunk = self._chunks.pop()
         try:
             self.backend.unmap(self.va, chunk.offset, chunk.size, chunk.handle)
+        except VmmReleaseError:
+            # cuMemUnmap succeeded, only the handle release failed: the range
+            # is no longer mapped, so the chunk must not come back.
+            raise
         except BaseException:
             self._chunks.append(chunk)
             raise
