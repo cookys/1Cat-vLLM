@@ -238,7 +238,6 @@ class EngineCore:
         # environment variable overrides after this point)
         enable_envs_cache()
 
-    @instrument(span_name="Prepare model")
     def _make_kv_cache_configs_elastic(
         self, kv_cache_configs: list[KVCacheConfig]
     ) -> None:
@@ -323,6 +322,7 @@ class EngineCore:
     def get_kv_pool_info(self) -> dict:
         return self.scheduler.get_kv_pool_info()
 
+    @instrument(span_name="Prepare model")
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
         start = time.time()
 
