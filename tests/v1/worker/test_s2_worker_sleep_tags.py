@@ -160,3 +160,11 @@ def test_legacy_wake_weights_also_wakes_draft_weights(env, monkeypatch):
     log.clear()
     w.wake_up(["kv_cache"])  # unrelated tag untouched
     assert ("wake", ["kv_cache"]) in log
+
+
+def test_legacy_sleep_refused_with_elastic_kv_regions(env, monkeypatch):
+    w, alloc, log, _ = _legacy_env(env, monkeypatch)
+    w.model_runner.elastic_kv_regions = [object()]
+    with pytest.raises(RuntimeError, match="elastic"):
+        w.sleep(1)
+    assert not [e for e in log if e[0] == "sleep"]

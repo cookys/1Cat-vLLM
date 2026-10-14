@@ -291,6 +291,13 @@ class Worker(WorkerBase):
                 "legacy sleep() refused: the drafter weights are released "
                 "(draft_weights asleep); switch back to DFLASH2 first"
             )
+        if getattr(self.model_runner, "elastic_kv_regions", None):
+            # plan 075 S2 (F8): the elastic KV lives outside the cumem
+            # kv_cache pool, so a legacy sleep could not free it.
+            raise RuntimeError(
+                "legacy sleep() refused: the KV cache is an elastic region "
+                "(--spec-hot-switch-elastic), not part of the cumem kv_cache pool"
+            )
         free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
 
         # Save the buffers before level 2 sleep
