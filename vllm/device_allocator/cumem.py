@@ -53,6 +53,8 @@ class AllocationData:
     handle: HandleType
     tag: str
     cpu_backup_tensor: torch.Tensor | None = None
+    # False while the physical memory is unmapped by a (tag-scoped) sleep.
+    mapped: bool = True
 
 
 def create_and_map(allocation_handle: HandleType) -> None:
@@ -174,7 +176,11 @@ class CuMemAllocator:
         )
         return data.handle
 
-    def sleep(self, offload_tags: tuple[str, ...] | str | None = None) -> None:
+    def sleep(
+        self,
+        offload_tags: tuple[str, ...] | str | None = None,
+        unmap_tags: tuple[str, ...] | str | None = None,
+    ) -> None:
         """
         Put the allocator in sleep mode.
         All data in the memory allocation with the specified tag will be
@@ -182,6 +188,12 @@ class CuMemAllocator:
 
         :param offload_tags: The tags of the memory allocation that will be
             offloaded. The rest of the memory allocation will be discarded.
+        :param unmap_tags: If given, only allocations with these tags are
+            processed (backed up if also in ``offload_tags``, then unmapped);
+            every other allocation is left mapped and untouched. If None,
+            every allocation is processed (the historical behaviour). In both
+            cases allocations that are already unmapped are skipped, so a
+            repeated sleep of the same tag is a no-op.
         """
         if offload_tags is None:
             # by default, allocated tensors are offloaded
@@ -192,10 +204,19 @@ class CuMemAllocator:
 
         assert isinstance(offload_tags, tuple)
 
+        if isinstance(unmap_tags, str):
+            unmap_tags = (unmap_tags,)
+        if unmap_tags is not None:
+            assert isinstance(unmap_tags, tuple)
+
         total_bytes = 0
         backup_bytes = 0
 
         for ptr, data in self.pointer_to_data.items():
+            if not data.mapped:
+                continue
+            if unmap_tags is not None and data.tag not in unmap_tags:
+                continue
             handle = data.handle
             total_bytes += handle[1]
             if data.tag in offload_tags:
@@ -211,6 +232,7 @@ class CuMemAllocator:
                 libcudart.cudaMemcpy(cpu_ptr, ptr, size_in_bytes)
                 data.cpu_backup_tensor = cpu_backup_tensor
             unmap_and_release(handle)
+            data.mapped = False
 
         logger.info(
             "CuMemAllocator: sleep freed %.2f GiB memory in total, of which "
@@ -235,9 +257,10 @@ class CuMemAllocator:
             back to GPU memory.
         """
         for ptr, data in self.pointer_to_data.items():
-            if tags is None or data.tag in tags:
+            if (tags is None or data.tag in tags) and not data.mapped:
                 handle = data.handle
                 create_and_map(handle)
+                data.mapped = True
                 if data.cpu_backup_tensor is not None:
                     cpu_backup_tensor = data.cpu_backup_tensor
                     if cpu_backup_tensor is not None:
@@ -307,12 +330,22 @@ class CuMemAllocator:
             if expandable_was_enabled:
                 torch.cuda.memory._set_allocator_settings("expandable_segments:True")
 
-    def get_current_usage(self) -> int:
+    def get_current_usage(
+        self, tag: str | None = None, only_mapped: bool = False
+    ) -> int:
         """
         Get the total number of bytes allocated in the memory pool.
+
+        :param tag: If given, only count allocations with this tag.
+        :param only_mapped: If True, skip allocations currently unmapped by
+            a sleep (their physical memory is not resident).
         """
         sum_bytes: int = 0
         for ptr, data in self.pointer_to_data.items():
+            if tag is not None and data.tag != tag:
+                continue
+            if only_mapped and not data.mapped:
+                continue
             handle = data.handle
             sum_bytes += handle[1]
         return sum_bytes
