@@ -429,6 +429,14 @@ def _released_unblocked(core, cl):
         r.free += 2  # memory is available now
 
 
+def test_released_unblocked_advances_to_grown_from_the_step_loop():
+    core, cl, s = make(free=LOW_FREE)
+    _released_unblocked(core, cl)
+    step(core)  # RELEASED is not a resting state
+    assert core.get_spec_mode()["state"] == "NOSPEC_GROWN"
+    assert s.kv_cache_manager.block_pool.num_gpu_blocks == N_SPEC + TAIL
+
+
 def test_post_nospec_in_released_retries_the_grow_and_says_so():
     core, cl, s = make(free=LOW_FREE)
     _released_unblocked(core, cl)
@@ -450,6 +458,54 @@ def test_last_transition_follows_the_last_successful_round_with_attempts():
     assert core.get_spec_mode()["state"] == "NOSPEC_GROWN"
     assert tr["to"] == "NOSPEC_GROWN" and tr["attempts"] == 2
     assert tr["duration_s"] >= 0 and set(tr["steps"]) >= {"release", "grow"}
+
+
+def test_reply_missing_a_key_is_an_error_state_not_an_engine_crash():
+    core, cl, s = make()
+    cl.ranks[0].sleep_tags = lambda tags: {"free_after": 1}  # no freed_bytes
+    cl.ranks[1].sleep_tags = lambda tags: {"free_after": 1}
+    core.set_spec_mode("nospec")  # must not raise
+    g = core.get_spec_mode()
+    assert g["state"] == "error" and "freed_bytes" in g["error"]
+    assert s.spec_enabled is False and s.drafter_resident is False
+    with pytest.raises(RuntimeError):
+        core.set_spec_mode("nospec")
+
+
+def test_missing_key_in_the_grow_reply_is_an_error_state():
+    core, cl, s = make()
+    core.grow_kv_cache = lambda: {"pool_blocks": 1}  # no added_blocks / workers
+    core.set_spec_mode("nospec")
+    assert core.get_spec_mode()["state"] == "error"
+
+
+def test_rpc_timeout_is_an_error_state_and_every_rpc_carries_the_timeout():
+    core, cl, s = make()
+    core._SPEC_RPC_TIMEOUT_S = 0.05  # injectable short timeout
+    seen = []
+    orig = cl.rpc
+
+    def rpc(method, timeout=None, args=(), kwargs=None):
+        seen.append((method, timeout))
+        if method == "wake_tags":
+            raise TimeoutError("worker did not answer")
+        return orig(method, timeout, args, kwargs)
+
+    core.collective_rpc = rpc
+    core.set_spec_mode("nospec")
+    assert [t for _, t in seen] == [0.05] * len(seen) and seen
+    core.set_spec_mode("dflash2")
+    g = core.get_spec_mode()
+    assert g["state"] == "error" and "timed out" in g["error"]
+    assert ("wake_tags", 0.05) in seen and s.spec_enabled is False
+
+
+def test_sleep_timeout_is_an_error_state():
+    core, cl, s = make()
+    cl.inject["sleep_tags"] = [TimeoutError("hung")]
+    core.set_spec_mode("nospec")
+    assert core.get_spec_mode()["state"] == "error"
+    assert s.drafter_resident is False
 
 
 def test_get_spec_mode_reports_tail_holder_reqs_and_blocks_side_by_side():

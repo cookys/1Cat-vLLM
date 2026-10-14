@@ -289,7 +289,9 @@ class EngineCore:
                 f"grow_kv_cache target {target} is not N_spec {n_spec} plus a "
                 f"multiple of {cfg.elastic_boundary_blocks} blocks"
             )
-        workers = self.collective_rpc("grow_kv_cache", args=(target,))
+        workers = self.collective_rpc(
+            "grow_kv_cache", timeout=self._SPEC_RPC_TIMEOUT_S, args=(target,)
+        )
         added = self.scheduler.grow_kv_pool(target)
         return {"pool_blocks": target, "added_blocks": added, "workers": workers}
 
@@ -315,7 +317,9 @@ class EngineCore:
                 "tail_holder_blocks": holders,
                 "tail_holder_reqs": self.scheduler.count_tail_holder_reqs(),
             }
-        workers = self.collective_rpc("shrink_kv_cache", args=(target,))
+        workers = self.collective_rpc(
+            "shrink_kv_cache", timeout=self._SPEC_RPC_TIMEOUT_S, args=(target,)
+        )
         return {
             "ok": True,
             "pool_blocks": target,
@@ -1053,6 +1057,12 @@ class EngineCore:
     _spec_last_error: str | None = None
     _spec_last_transition: dict | None = None
     _spec_shrink_rpc_pending = False
+    _SPEC_RPC_TIMEOUT_S = 120.0  # M3-fix-3: a hung worker must not hang the engine
+
+    def _spec_rpc(self, method: str, args: tuple = ()):
+        return self.collective_rpc(
+            method, timeout=self._SPEC_RPC_TIMEOUT_S, args=args
+        )
 
     def _spec_machine_on(self) -> bool:
         cache_config = self.vllm_config.cache_config
@@ -1073,6 +1083,18 @@ class EngineCore:
         self._spec_blocked = True
         self._spec_last_error = what
         logger.error("spec hot-switch stopped in %s: %s", self._spec_state(), what)
+        return False
+
+    def _spec_to_error(self, what: str) -> bool:
+        """Terminal state for what a retry cannot fix (a worker that does not
+        answer, or answers in an unexpected shape): gate closed, restart."""
+        self.scheduler.set_drafter_resident(False)
+        self.scheduler.set_spec_enabled(False)
+        self._spec_blocked = True
+        self._spec_last_error = what
+        self._spec_set_state("error")
+        self._spec_end("error")
+        logger.error("spec hot-switch: %s", what)
         return False
 
     def _spec_begin(self, src: str) -> None:
@@ -1202,13 +1224,19 @@ class EngineCore:
             if self._spec_blocked:
                 return
             st = self._spec_state()
-            if st == "NOSPEC_DRAINING":
-                ok = self._spec_release()
-            elif st == "NOSPEC_RELEASED":
-                ok = self._spec_grow()
-            elif st == "DFLASH2_FENCING":
-                ok = self._spec_restore()
-            else:
+            try:
+                if st == "NOSPEC_DRAINING":
+                    ok = self._spec_release()
+                elif st == "NOSPEC_RELEASED":
+                    ok = self._spec_grow()
+                elif st == "DFLASH2_FENCING":
+                    ok = self._spec_restore()
+                else:
+                    return
+            except Exception as exc:  # e.g. a worker reply missing a key
+                self._spec_to_error(
+                    f"unexpected failure in {st} ({exc!r}); worker state unknown"
+                )
                 return
             if not ok:
                 return
@@ -1217,11 +1245,15 @@ class EngineCore:
         if self.scheduler.count_spec_inflight() > 0:
             return False  # wait: K>0 requests must drain first (F6)
         try:
-            res = self.collective_rpc("sleep_tags", args=(self._SPEC_DRAFT_TAGS,))
+            res = self._spec_rpc("sleep_tags", (self._SPEC_DRAFT_TAGS,))
+        except TimeoutError as exc:
+            return self._spec_to_error(
+                f"sleep_tags timed out ({exc!r}); worker state unknown"
+            )
         except Exception as exc:
             # D8 failure edge: put the weights back at once.
             try:
-                self.collective_rpc("wake_tags", args=(self._SPEC_DRAFT_TAGS,))
+                self._spec_rpc("wake_tags", (self._SPEC_DRAFT_TAGS,))
             except Exception as exc2:
                 self.scheduler.set_drafter_resident(False)
                 self._spec_last_error = (
@@ -1260,8 +1292,10 @@ class EngineCore:
         )
         try:
             free = min(
-                int(r["free_bytes"]) for r in self.collective_rpc("get_gpu_free_bytes")
+                int(r["free_bytes"]) for r in self._spec_rpc("get_gpu_free_bytes")
             )
+        except TimeoutError as exc:
+            return self._spec_to_error(f"get_gpu_free_bytes timed out ({exc!r})")
         except Exception as exc:
             return self._spec_fail(f"get_gpu_free_bytes failed ({exc!r})")
         if free < need + self._SPEC_GROW_MARGIN_BYTES:
@@ -1272,6 +1306,10 @@ class EngineCore:
             )
         try:
             out = self.grow_kv_cache()
+        except TimeoutError as exc:
+            return self._spec_to_error(
+                f"grow_kv_cache timed out ({exc!r}); worker state unknown"
+            )
         except Exception as exc:
             return self._spec_fail(f"grow_kv_cache failed ({exc!r}); staying released")
         self._spec_note(
@@ -1290,7 +1328,7 @@ class EngineCore:
         spec_blocks = self.scheduler.kv_pool_spec_blocks()
         try:
             if self._spec_shrink_rpc_pending:
-                self.collective_rpc("shrink_kv_cache", args=(spec_blocks,))
+                self._spec_rpc("shrink_kv_cache", (spec_blocks,))
                 self._spec_shrink_rpc_pending = False
             elif self.scheduler.kv_pool_blocks() > spec_blocks:
                 out = self.shrink_kv_cache()
@@ -1304,13 +1342,21 @@ class EngineCore:
                     )
                     return False  # wait: requests still hold tail blocks (F13)
                 self._spec_note("shrink", {"pool_blocks": out["pool_blocks"]})
+        except TimeoutError as exc:
+            return self._spec_to_error(
+                f"shrink_kv_cache timed out ({exc!r}); worker state unknown"
+            )
         except Exception as exc:
             if self.scheduler.kv_pool_blocks() <= spec_blocks:
                 # scheduler already dropped the tail; only the unmap is missing
                 self._spec_shrink_rpc_pending = True
             return self._spec_fail(f"shrink_kv_cache failed ({exc!r})")
         try:
-            res = self.collective_rpc("wake_tags", args=(self._SPEC_DRAFT_TAGS,))
+            res = self._spec_rpc("wake_tags", (self._SPEC_DRAFT_TAGS,))
+        except TimeoutError as exc:
+            return self._spec_to_error(
+                f"wake_tags timed out ({exc!r}); drafter state unknown"
+            )
         except Exception as exc:
             return self._spec_fail(f"wake_tags failed ({exc!r}); drafter still released")
         self._spec_note("wake", {"mapped_bytes": [r["mapped_bytes"] for r in res]})
