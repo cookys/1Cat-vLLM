@@ -181,6 +181,10 @@ class BlockPool:
 
         self.metrics_collector = metrics_collector
 
+        # plan 075 S2 (F13): while not None, get_new_blocks never hands out a
+        # block with id > max_block_id (the elastic tail is being given back).
+        self.max_block_id: int | None = None
+
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
     ) -> list[KVCacheBlock] | None:
@@ -343,7 +347,10 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        if self.max_block_id is None:
+            ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        else:
+            ret = self._pop_free_blocks_below_fence(num_blocks)
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -470,7 +477,7 @@ class BlockPool:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
-        num_used_blocks = self.num_gpu_blocks - self.get_num_free_blocks()
+        num_used_blocks = self.num_gpu_blocks - self.free_block_queue.num_free_blocks
         if num_used_blocks != 1:  # The null block is always marked as used
             logger.warning(
                 "Failed to reset prefix cache because some "
@@ -502,7 +509,11 @@ class BlockPool:
         Returns:
             The number of free blocks.
         """
-        return self.free_block_queue.num_free_blocks
+        free = self.free_block_queue.num_free_blocks
+        if self.max_block_id is not None:
+            # Fenced tail blocks are free but not allocatable.
+            free -= self._num_fenced_free_blocks()
+        return free
 
     def get_usage(self) -> float:
         """Get the KV cache usage.
@@ -516,6 +527,89 @@ class BlockPool:
         if not total_gpu_blocks:
             return 0
         return 1.0 - (self.get_num_free_blocks() / total_gpu_blocks)
+
+    # ---- plan 075 S2: elastic tail -------------------------------------
+
+    def _num_fenced_free_blocks(self) -> int:
+        """Free blocks above the fence (O(tail); only used while fenced)."""
+        assert self.max_block_id is not None
+        return sum(
+            1
+            for block in self.blocks[self.max_block_id + 1 :]
+            if block.ref_cnt == 0 and not block.is_null
+        )
+
+    def _pop_free_blocks_below_fence(self, num_blocks: int) -> list[KVCacheBlock]:
+        assert self.max_block_id is not None
+        picked: list[KVCacheBlock] = []
+        if num_blocks == 0:
+            return picked
+        block = self.free_block_queue.fake_free_list_head.next_free_block
+        tail = self.free_block_queue.fake_free_list_tail
+        while block is not None and block is not tail and len(picked) < num_blocks:
+            if block.block_id <= self.max_block_id:
+                picked.append(block)
+            block = block.next_free_block
+        if len(picked) < num_blocks:
+            raise ValueError(
+                f"Cannot get {num_blocks} free blocks below the fence "
+                f"(max_block_id={self.max_block_id})"
+            )
+        for picked_block in picked:
+            self.free_block_queue.remove(picked_block)
+        return picked
+
+    def set_max_block_id(self, max_block_id: int | None) -> None:
+        """F13: fence the tail (``max_block_id = N_spec - 1``) or lift it
+        (``None``). Does not touch blocks that are already allocated."""
+        if max_block_id is not None and not 0 <= max_block_id < len(self.blocks):
+            raise ValueError(
+                f"max_block_id {max_block_id} outside [0, {len(self.blocks)})"
+            )
+        self.max_block_id = max_block_id
+
+    def count_blocks_in_use_above(self, n_blocks: int) -> int:
+        """Number of blocks with id >= ``n_blocks`` that are still referenced
+        (the ``tail_holders`` figure of the fence)."""
+        return sum(1 for block in self.blocks[n_blocks:] if block.ref_cnt > 0)
+
+    def grow(self, n_new_total: int) -> int:
+        """Extend the pool to ``n_new_total`` blocks. The new ids are
+        consecutive, appended at the *end* of the free queue (so low ids are
+        used first) and start with no hash. The worker must have mapped the
+        memory first (F10). Returns the number of blocks added."""
+        n_old = len(self.blocks)
+        if n_new_total < n_old:
+            raise ValueError(f"grow({n_new_total}) is smaller than the pool {n_old}")
+        if n_new_total == n_old:
+            return 0
+        new_blocks = [KVCacheBlock(idx) for idx in range(n_old, n_new_total)]
+        self.blocks.extend(new_blocks)
+        self.free_block_queue.append_n(new_blocks)
+        self.num_gpu_blocks = n_new_total
+        return len(new_blocks)
+
+    def shrink_to(self, n_blocks: int) -> int:
+        """Drop every block with id >= ``n_blocks`` (called before the worker
+        unmaps, F10). If any of them is still referenced nothing is changed
+        and the number of such holders is returned; returns 0 on success.
+        Prefix-cached tail blocks are evicted from the cache."""
+        if not 1 <= n_blocks <= len(self.blocks):
+            raise ValueError(
+                f"shrink_to({n_blocks}) outside [1, {len(self.blocks)}]"
+            )
+        holders = self.count_blocks_in_use_above(n_blocks)
+        if holders:
+            return holders
+        for block in self.blocks[n_blocks:]:
+            assert not block.is_null
+            self._maybe_evict_cached_block(block)
+            self.free_block_queue.remove(block)
+        del self.blocks[n_blocks:]
+        self.num_gpu_blocks = n_blocks
+        if self.max_block_id is not None and self.max_block_id >= n_blocks - 1:
+            self.max_block_id = None
+        return 0
 
     def take_events(self) -> list[KVCacheEvent]:
         """Atomically takes all events and clears the queue.
