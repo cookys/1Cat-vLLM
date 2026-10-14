@@ -937,6 +937,11 @@ class KVCacheTensor:
 
     size: int  # size of the KV cache tensor in bytes
     shared_by: list[str]  # layer names that share the same KV cache tensor
+    # plan 075 S2: when set, the worker reserves this many bytes of virtual
+    # address space and maps only ``size`` of them; the rest (the tail) can be
+    # grown / shrunk at runtime. ``size`` stays what the scheduler's block pool
+    # starts with.
+    max_size: int | None = None
 
 
 @dataclass
@@ -972,6 +977,12 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
+    elastic_tail_blocks: int = 0
+    """plan 075 S2: how many blocks beyond ``num_blocks`` the elastic tail can
+    hold (0 = not elastic). Tail grows / shrinks in ``elastic_boundary_blocks``
+    steps."""
+    elastic_boundary_blocks: int = 0
+    """plan 075 S2: grow / shrink step in blocks = lcm(page, granularity) / page."""
 
     @property
     def has_mamba_layers(self) -> bool:
