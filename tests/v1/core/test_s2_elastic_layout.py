@@ -101,3 +101,19 @@ def test_scheduler_config_keeps_nspec():
 def test_defaults_are_not_elastic():
     c = cfg(100)
     assert c.elastic_tail_blocks == 0 and c.kv_cache_tensors[0].max_size is None
+
+
+def test_alignment_below_max_model_len_fails_at_startup_with_both_numbers():
+    # 1000 blocks x 16 tokens = 16000 fit max_model_len; aligned 992 x 16 = 15872 do not
+    cfgs = [cfg(1000), cfg(1000)]
+    with pytest.raises(ValueError) as e:
+        apply_elastic_kv_tail(
+            cfgs, [GIB] * 2, 2 * MIB, max_model_len=16000, block_size=16
+        )
+    msg = str(e.value)
+    assert "992" in msg and "1000" in msg and "16000" in msg
+    assert cfgs[0].num_blocks == 1000 and cfgs[0].elastic_tail_blocks == 0  # untouched
+    # exactly enough after alignment: fine
+    assert apply_elastic_kv_tail(
+        cfgs, [GIB] * 2, 2 * MIB, max_model_len=15872, block_size=16
+    ) > 0 and cfgs[0].num_blocks == 992

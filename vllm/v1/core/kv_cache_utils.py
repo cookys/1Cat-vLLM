@@ -2598,6 +2598,8 @@ def apply_elastic_kv_tail(
     kv_cache_configs: list[KVCacheConfig],
     draft_weights_bytes: Sequence[int],
     granularity: int,
+    max_model_len: int | None = None,
+    block_size: int | None = None,
 ) -> int:
     """plan 075 S2 (A2-3): turn per-rank KV configs elastic, in place.
 
@@ -2608,6 +2610,11 @@ def apply_elastic_kv_tail(
       N_tail_max the smallest tail any rank can pay for (all ranks must agree
       because the scheduler pool is global);
     * the scheduler config derived afterwards keeps ``num_blocks = N_spec``.
+
+    With ``max_model_len`` and ``block_size`` given, ``N_spec * block_size``
+    must still hold one ``max_model_len`` request after the alignment, else
+    ``ValueError`` (M3-fix-5: the loss must not silently break the length the
+    server was started with).
 
     Returns N_tail_max (0 = leave the configs untouched / not elastic).
     """
@@ -2636,6 +2643,18 @@ def apply_elastic_kv_tail(
     n_spec = n_spec_old // boundary_blocks * boundary_blocks
     if tail <= 0 or n_spec <= 0:
         return 0
+    if (
+        max_model_len is not None
+        and block_size is not None
+        and n_spec * block_size < max_model_len
+    ):
+        raise ValueError(
+            f"--spec-hot-switch-elastic: aligning N_spec down to the boundary "
+            f"({boundary_blocks} blocks) leaves {n_spec} blocks (before: "
+            f"{n_spec_old}) x block_size {block_size} = {n_spec * block_size} "
+            f"tokens, below max_model_len {max_model_len}; lower max_model_len "
+            f"or raise gpu_memory_utilization"
+        )
     for cfg, pages in zip(kv_cache_configs, rank_pages):
         cfg.num_blocks = n_spec
         for t, page in zip(cfg.kv_cache_tensors, pages):

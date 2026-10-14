@@ -249,6 +249,11 @@ class EngineCore:
             kv_cache_configs,
             [int(p["draft_weights_bytes"]) for p in probes],
             granularity,
+            max_model_len=self.vllm_config.model_config.max_model_len,
+            block_size=max(
+                [g.kv_cache_spec.block_size for g in kv_cache_configs[0].kv_cache_groups]
+                or [self.vllm_config.cache_config.block_size]
+            ),
         )
         if tail == 0:
             logger.warning(

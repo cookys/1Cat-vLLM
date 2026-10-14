@@ -151,6 +151,10 @@ def test_make_configs_elastic_uses_probes(monkeypatch):
     core.collective_rpc = lambda m, **k: [
         {"draft_weights_bytes": int(1.1675 * (1 << 30)), "granularity": 2 << 20}
     ] * 2
+    core.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=8192),
+        cache_config=SimpleNamespace(block_size=16),
+    )
     cfgs = [
         KVCacheConfig(
             num_blocks=1000,
@@ -206,11 +210,14 @@ def _init_kv_caches(monkeypatch, elastic):
         or [{"draft_weights_bytes": int(1.1675 * (1 << 30)), "granularity": 2 << 20}] * 2
     )
     vc = SimpleNamespace(
-        cache_config=SimpleNamespace(spec_hot_switch_elastic=elastic, num_gpu_blocks=None),
+        cache_config=SimpleNamespace(
+            spec_hot_switch_elastic=elastic, num_gpu_blocks=None, block_size=16
+        ),
         model_config=SimpleNamespace(max_model_len=4096),
         compilation_config=SimpleNamespace(compilation_time=0.0, encoder_compilation_time=0.0),
         validate_block_size=lambda: None,
     )
+    core.vllm_config = vc  # the real __init__ sets it before this call
     core._initialize_kv_caches(vc)
     return vc, cfgs, seen, log
 
@@ -258,3 +265,26 @@ def test_alignment_loss_reaches_log_and_pool_info():
     core, _, _ = make_core()
     core.scheduler.kv_cache_config.elastic_spec_blocks_lost = 8
     assert core.get_kv_pool_info()["spec_blocks_lost_to_alignment"] == 8
+
+
+def test_core_passes_max_model_len_and_block_size_to_the_alignment_check():
+    core = EngineCore.__new__(EngineCore)
+    core.collective_rpc = lambda m, **k: [
+        {"draft_weights_bytes": int(1.1675 * (1 << 30)), "granularity": 2 << 20}
+    ] * 2
+    core.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=16000),
+        cache_config=SimpleNamespace(block_size=16),
+    )
+    cfgs = [
+        KVCacheConfig(
+            num_blocks=1000,
+            kv_cache_tensors=[
+                KVCacheTensor(size=PAGE * 1000, shared_by=[f"l{i}"]) for i in range(16)
+            ],
+            kv_cache_groups=[],
+        )
+        for _ in range(2)
+    ]
+    with pytest.raises(ValueError, match="max_model_len 16000"):
+        core._make_kv_cache_configs_elastic(cfgs)
