@@ -177,6 +177,60 @@ def _allocate_elastic_kv_tensor(
     return region.as_tensor()
 
 
+def check_elastic_kv_layout(
+    kv_cache_config: KVCacheConfig,
+    attn_groups: Iterable[AttentionGroup],
+    kernel_block_sizes: list[int],
+    cache_dtype: str,
+) -> None:
+    """plan 075 S2 startup guards for the elastic KV tail (no-op otherwise).
+
+    * The tail is the high-address end of each tensor, so a low block id must
+      mean a low address (block-major). Hybrid models get that from
+      ``_update_hybrid_attention_layout``; a non-hybrid backend whose block
+      index is not dim 0 keeps K/V planes outermost and would put the V plane
+      in the unmapped tail.
+    * FlexAttention builds its metadata from the startup ``num_gpu_blocks``.
+    """
+    if not any(t.max_size is not None for t in kv_cache_config.kv_cache_tensors):
+        return
+    groups = list(attn_groups)
+    is_hybrid = any(isinstance(g.kv_cache_spec, MambaSpec) for g in groups)
+    for group in groups:
+        if group.backend.get_name() == "FLEX_ATTENTION":
+            raise ValueError(
+                "--spec-hot-switch-elastic is not compatible with the "
+                "FlexAttention backend: it sizes its block metadata from the "
+                "startup num_gpu_blocks, so block ids in the grown tail would "
+                "be out of range"
+            )
+        spec = group.kv_cache_spec
+        if (
+            is_hybrid
+            or not isinstance(spec, AttentionSpec)
+            or group.kv_cache_group_id >= len(kernel_block_sizes)
+        ):
+            continue
+        block_dim = group.backend.get_kv_cache_block_dim(
+            kernel_block_sizes[group.kv_cache_group_id],
+            spec.num_kv_heads,
+            spec.head_size,
+            cache_dtype_str=(
+                "auto"
+                if cache_dtype == "nvfp4" and spec.dtype == torch.float16
+                else cache_dtype
+            ),
+        )
+        if block_dim != 0:
+            raise ValueError(
+                "--spec-hot-switch-elastic needs a block-major KV layout "
+                "(num_blocks as dim 0), but the "
+                f"{group.backend.get_name()} backend puts num_blocks at dim "
+                f"{block_dim} of a non-hybrid model: the K/V planes would be "
+                "outermost and the V plane would land in the unmapped tail"
+            )
+
+
 def _allocate_kv_cache(
     kv_cache_config: KVCacheConfig,
     shared_layers: dict[str, str],
@@ -419,6 +473,12 @@ def init_kv_cache(
     vmm_backend: VmmBackend | None = None,
 ) -> dict[str, Any]:
     shared_kv_cache_layers = get_shared_kv_cache_layers(vllm_config)
+    check_elastic_kv_layout(
+        kv_cache_config,
+        [g for groups in attn_groups for g in groups],
+        kernel_block_sizes,
+        cache_dtype,
+    )
     kv_cache_raw_tensors = _allocate_kv_cache(
         kv_cache_config,
         shared_kv_cache_layers,
