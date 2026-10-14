@@ -201,8 +201,14 @@ class SchedulerInterface(ABC):
         """plan 075 S1: flip the spec mode for newly added requests; returns prev."""
         raise NotImplementedError
 
-    def get_spec_mode_info(self) -> dict[str, int | bool]:
-        """plan 075 S1: ``spec_enabled`` plus running request counts by K."""
+    def get_spec_mode_info(self) -> dict[str, int | bool | str]:
+        """plan 075 S1/S2: ``spec_enabled``, running request counts by K,
+        ``spec_inflight`` (K>0 requests in any queue), ``drafter_resident`` and
+        the hot-switch ``state``."""
+        raise NotImplementedError
+
+    def set_drafter_resident(self, resident: bool) -> None:
+        """plan 075 S2: record whether the workers hold the drafter weights."""
         raise NotImplementedError
 
     @abstractmethod

@@ -270,6 +270,11 @@ class Scheduler(SchedulerInterface):
         # requests that are already in the system. Meaningless (and inert) on
         # an engine without speculative tokens.
         self.spec_enabled = True
+        # plan 075 S2: drafter weights mapped on the workers, and the hot-switch
+        # state name (None = derived from spec_enabled / spec_inflight; the
+        # engine-core state machine overrides it).
+        self.drafter_resident = True
+        self.spec_state: str | None = None
         if speculative_config and speculative_config.use_eagle_kv_cache():
             self.use_eagle = True
 
@@ -2523,14 +2528,49 @@ class Scheduler(SchedulerInterface):
         self.spec_enabled = bool(enabled)
         return prev
 
-    def get_spec_mode_info(self) -> dict[str, int | bool]:
-        """plan 075 S1: read-only view of the mode and of running requests by K."""
+    def count_spec_inflight(self) -> int:
+        """plan 075 S2 F6: requests anywhere in the system that still run K>0.
+
+        Counts running + waiting + skipped_waiting. ``Request.spec_off`` is
+        fixed at add_request and a preempted request keeps it, so a K=7 request
+        that was preempted back to ``waiting`` still counts. Zero on an engine
+        without speculative tokens.
+        """
+        if self.num_spec_tokens <= 0:
+            return 0
+        return sum(
+            1
+            for queue in (self.running, self.waiting, self.skipped_waiting)
+            for r in queue
+            if not r.spec_off
+        )
+
+    def set_drafter_resident(self, resident: bool) -> None:
+        """plan 075 S2: record whether the drafter weights are mapped on the
+        workers (the engine core flips it around ``sleep_tags``/``wake_tags``).
+        """
+        self.drafter_resident = bool(resident)
+
+    def get_spec_mode_info(self) -> dict[str, int | bool | str]:
+        """plan 075 S1/S2: read-only view of the mode, of running requests by K
+        and of how many K>0 requests remain anywhere in the system."""
         spec_capable = self.num_spec_tokens > 0
         running_nospec = sum(1 for r in self.running if r.spec_off or not spec_capable)
+        spec_inflight = self.count_spec_inflight()
+        spec_enabled = spec_capable and self.spec_enabled
+        if self.spec_state is not None:
+            state = self.spec_state
+        elif spec_enabled:
+            state = "DFLASH2"
+        else:
+            state = "NOSPEC_DRAINING" if spec_inflight > 0 else "NOSPEC"
         return {
-            "spec_enabled": spec_capable and self.spec_enabled,
+            "spec_enabled": spec_enabled,
             "running_spec": len(self.running) - running_nospec,
             "running_nospec": running_nospec,
+            "spec_inflight": spec_inflight,
+            "drafter_resident": self.drafter_resident,
+            "state": state,
         }
 
     def get_num_unfinished_requests(self) -> int:
