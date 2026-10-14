@@ -1085,6 +1085,7 @@ class EngineCore:
             "started_at": time.time(),
             "finished_at": None,
             "duration_s": None,
+            "attempts": 0,
             "steps": {},
         }
 
@@ -1093,8 +1094,11 @@ class EngineCore:
             self._spec_last_transition["steps"][step] = detail
 
     def _spec_end(self, state: str) -> None:
+        # every round that ends overwrites ``to`` / ``finished_at`` /
+        # ``duration_s`` (the last round wins); ``attempts`` counts the rounds.
         tr = self._spec_last_transition
-        if tr is not None and tr["finished_at"] is None:
+        if tr is not None:
+            tr["attempts"] += 1
             tr["to"] = state
             tr["finished_at"] = time.time()
             tr["duration_s"] = time.monotonic() - self._spec_t0

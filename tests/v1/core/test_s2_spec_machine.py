@@ -436,3 +436,17 @@ def test_post_nospec_in_released_retries_the_grow_and_says_so():
     assert out["changed"] is False and out["retried"] is True
     assert out["state"] == "NOSPEC_GROWN"
     assert "retried" not in core.set_spec_mode("nospec")  # GROWN: plain no-op
+
+
+def test_last_transition_follows_the_last_successful_round_with_attempts():
+    core, cl, s = make(free=LOW_FREE)
+    core.set_spec_mode("nospec")
+    tr = core.get_spec_mode()["last_transition"]
+    assert tr["to"] == "NOSPEC_RELEASED" and tr["attempts"] == 1
+    for r in cl.ranks:
+        r.free += 2
+    core.set_spec_mode("nospec")
+    tr = core.get_spec_mode()["last_transition"]
+    assert core.get_spec_mode()["state"] == "NOSPEC_GROWN"
+    assert tr["to"] == "NOSPEC_GROWN" and tr["attempts"] == 2
+    assert tr["duration_s"] >= 0 and set(tr["steps"]) >= {"release", "grow"}
