@@ -2017,6 +2017,24 @@ class EngineArgs:
                 "(the drafter weights are released through the cumem pool)"
             )
 
+        # plan 075 S2 (D2): with the drafter weights released, the DP dummy-run
+        # propose would hit the drafter_resident gate (RuntimeError). Refuse at
+        # startup instead of skipping the dummy propose: hot switch is TP-only.
+        draft_pool_active = bool(
+            model_config.enable_cumem_allocator
+            and isinstance(self.speculative_config, dict)
+            and self.speculative_config.get("method") == "dflash"
+        )
+        if (
+            self.spec_hot_switch_elastic or draft_pool_active
+        ) and self.data_parallel_size > 1:
+            raise ValueError(
+                "--spec-hot-switch-elastic / the draft_weights cumem pool "
+                "(--enable-cumem-allocator with a dflash speculator) is not "
+                "supported with data parallelism (data_parallel_size > 1): "
+                "the DP dummy-run propose needs the drafter resident"
+            )
+
         cache_config = CacheConfig(
             block_size=self.block_size,  # type: ignore[arg-type]
             gpu_memory_utilization=self.gpu_memory_utilization,

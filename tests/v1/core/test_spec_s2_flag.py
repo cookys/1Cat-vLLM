@@ -72,3 +72,27 @@ def test_elastic_with_cumem_reaches_cache_config(local_model):
     assert cfg.cache_config.spec_hot_switch_elastic is True
     off = EngineArgs(model=local_model, skip_tokenizer_init=True).create_engine_config()
     assert off.cache_config.spec_hot_switch_elastic is False
+
+
+def test_elastic_with_dp_is_rejected(local_model):
+    args = EngineArgs(
+        model=local_model,
+        skip_tokenizer_init=True,
+        spec_hot_switch_elastic=True,
+        enable_cumem_allocator=True,
+        data_parallel_size=2,
+    )
+    with pytest.raises(ValueError, match="data parallelism"):
+        args.create_engine_config()
+
+
+def test_draft_pool_with_dp_is_rejected(local_model):
+    args = EngineArgs(
+        model=local_model,
+        skip_tokenizer_init=True,
+        enable_cumem_allocator=True,
+        speculative_config={"method": "dflash", "model": local_model},
+        data_parallel_size=2,
+    )
+    with pytest.raises(ValueError, match="data parallelism"):
+        args.create_engine_config()
