@@ -570,6 +570,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def get_model(self) -> nn.Module:
         return self.model
 
+    def set_drafter_resident(self, resident: bool) -> None:
+        """plan 075 S2: close / reopen every drafter GPU entry point."""
+        spec = self.speculator
+        if spec is None or not hasattr(spec, "set_drafter_resident"):
+            raise RuntimeError(
+                "no releasable drafter: speculator is missing or does not "
+                "support the draft_weights pool"
+            )
+        spec.set_drafter_resident(resident)
+
+    def _require_drafter_resident(self, entry: str) -> None:
+        spec = self.speculator
+        if spec is not None and not getattr(spec, "drafter_resident", True):
+            raise RuntimeError(
+                f"drafter entry point {entry!r} reached while the drafter "
+                "weights are released (draft_weights asleep)"
+            )
+
     def reload_weights(self, *args, **kwargs) -> None:
         # TODO(Wentao): Use full version instead of import when fully migrated to v2
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner as GPUModelRunnerV1
@@ -833,6 +851,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # dummy run the eagle speculator's propose to ensure DP/EP sync.
         if self.speculator is not None:
+            self._require_drafter_resident("dummy_propose")
             assert self.sampler is not None
             mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
             if self.speculator.supports_mm_inputs:
@@ -1944,6 +1963,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch, no_drafts, num_draft_tokens=0
             )
         elif self.speculator is not None:
+            self._require_drafter_resident("propose")
             assert self.sampler is not None
             requires_host_token_state = bool(
                 getattr(self.speculator, "requires_host_token_state", False)

@@ -158,6 +158,22 @@ class DraftModelSpeculator(BaseSpeculator):
     # slept/woken independently of the target (plan 075 S2 P2).
     supports_draft_weights_pool = True
 
+    # False while the drafter weights are unmapped by ``Worker.sleep_tags``.
+    # Every GPU entry point that reads drafter weights or replays a drafter
+    # graph calls ``_require_drafter_resident`` (fail loud, not a CUDA fault).
+    drafter_resident: bool = True
+
+    def set_drafter_resident(self, resident: bool) -> None:
+        self.drafter_resident = bool(resident)
+
+    def _require_drafter_resident(self, entry: str) -> None:
+        if not self.drafter_resident:
+            raise RuntimeError(
+                f"drafter entry point {entry!r} called while the drafter "
+                "weights are released (draft_weights tag is asleep); the "
+                "scheduler must keep every request at K=0 until wake_tags"
+            )
+
     def load_model(
         self,
         target_model: nn.Module,
