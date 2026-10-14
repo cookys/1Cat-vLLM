@@ -345,9 +345,11 @@ def test_partial_rank_sleep_failure_is_recovered_by_wake_on_every_rank():
     assert all(r.resident for r in cl.ranks)  # rank 0 was half-released: put back
 
 
-def test_grow_skipped_when_free_memory_is_below_tail_plus_margin_then_retried():
-    # after the release a rank has base + DRAFT free; make it one byte short
-    base = TAIL_BYTES + MARGIN - DRAFT - 1
+def test_grow_skipped_when_free_memory_leaves_no_whole_chunk_then_retried():
+    # M-fix-9 (X2R-26): the target follows free - margin, so the skip is only
+    # "not even one boundary chunk fits". After the release a rank has
+    # base + DRAFT free; make it one byte short of margin + one chunk.
+    base = BOUNDARY * PAGE + MARGIN - DRAFT - 1
     core, cl, s = make(free=base)
     out = core.set_spec_mode("nospec")
     assert out["state"] == "NOSPEC_RELEASED"
@@ -355,16 +357,45 @@ def test_grow_skipped_when_free_memory_is_below_tail_plus_margin_then_retried():
     assert s.kv_cache_manager.block_pool.num_gpu_blocks == N_SPEC
     err = core.get_spec_mode()["error"]
     assert "margin" in err and "grow skipped" in err
-    # exactly enough free memory: grows; the poorest rank decides
+    gt = core.get_spec_mode()["last_transition"]["steps"]["grow_target"]
+    assert gt["target_blocks"] == N_SPEC  # never below N_spec, never negative
+    # exactly one chunk of free memory above the margin: grows one chunk
     cl.ranks[1].free += 1
     cl.ranks[0].free += 1
     out = core.set_spec_mode("nospec")
     assert out["changed"] is False and out["state"] == "NOSPEC_GROWN"
+    assert s.kv_cache_manager.block_pool.num_gpu_blocks == N_SPEC + BOUNDARY
+
+
+def test_grow_target_is_min_of_tail_max_and_free_minus_margin():
+    # branch 1: plenty of free memory -> N_spec + N_tail_max
+    core, cl, s = make(free=40 * GIB)
+    core.set_spec_mode("nospec")
+    g = core.get_spec_mode()["last_transition"]["steps"]["grow"]
+    assert g["target_blocks"] == g["pool_blocks"] == N_SPEC + TAIL
+    assert g["n_tail_max"] == TAIL and g["margin_bytes"] == MARGIN
+    assert g["min_rank_free_bytes"] == 40 * GIB + DRAFT
+    # branch 2: free is the limit -> floor((free - margin)/page/boundary)*boundary
+    chunks = 2
+    base = chunks * BOUNDARY * PAGE + MARGIN + PAGE // 2 - DRAFT
+    core, cl, s = make(free=base)
+    core.set_spec_mode("nospec")
+    g = core.get_spec_mode()["last_transition"]["steps"]["grow"]
+    assert g["target_blocks"] == N_SPEC + chunks * BOUNDARY < N_SPEC + TAIL
+    assert (g["target_blocks"] - N_SPEC) % BOUNDARY == 0
+    assert cl.ranks[0].region.mapped_blocks == N_SPEC + chunks * BOUNDARY
+    # the grow RPC carries the computed target, not N_spec + tail
+    assert ("grow_kv_cache", (N_SPEC + chunks * BOUNDARY,)) in cl.log
+    # restore: shrink back to N_spec still works from a partial grow
+    assert core.set_spec_mode("dflash2")["state"] in ("DFLASH2", "DFLASH2_WAKING", "DFLASH2_SHRINKING")
+    for _ in range(5):
+        core.get_spec_mode()
+    assert cl.ranks[0].region.mapped_blocks >= N_SPEC
 
 
 def test_poorest_rank_decides_the_grow_precheck():
     core, cl, s = make(free=40 * GIB)
-    cl.ranks[1].free = TAIL_BYTES + MARGIN - DRAFT - 1
+    cl.ranks[1].free = BOUNDARY * PAGE + MARGIN - DRAFT - 1
     assert core.set_spec_mode("nospec")["state"] == "NOSPEC_RELEASED"
 
 
@@ -426,7 +457,7 @@ def test_twenty_round_trips_do_not_leak_memory_or_pool_blocks():
 
 # ---- M3-fix ---------------------------------------------------------------
 
-LOW_FREE = TAIL_BYTES + MARGIN - DRAFT - 1  # one byte short after the release
+LOW_FREE = BOUNDARY * PAGE + MARGIN - DRAFT - 1  # one byte short of one chunk after the release
 
 
 def _released_unblocked(core, cl):
@@ -437,7 +468,7 @@ def _released_unblocked(core, cl):
     out = core.set_spec_mode("nospec")  # cancel: lift the fence
     assert out["state"] == "NOSPEC_RELEASED" and core.get_spec_mode()["blocked"] is False
     for r in cl.ranks:
-        r.free += 2  # memory is available now
+        r.free += TAIL_BYTES  # memory is available now
 
 
 def test_released_unblocked_advances_to_grown_from_the_step_loop():
@@ -463,7 +494,7 @@ def test_last_transition_follows_the_last_successful_round_with_attempts():
     tr = core.get_spec_mode()["last_transition"]
     assert tr["to"] == "NOSPEC_RELEASED" and tr["attempts"] == 1
     for r in cl.ranks:
-        r.free += 2
+        r.free += TAIL_BYTES
     core.set_spec_mode("nospec")
     tr = core.get_spec_mode()["last_transition"]
     assert core.get_spec_mode()["state"] == "NOSPEC_GROWN"
@@ -485,7 +516,7 @@ def test_reply_missing_a_key_is_an_error_state_not_an_engine_crash():
 
 def test_missing_key_in_the_grow_reply_is_an_error_state():
     core, cl, s = make()
-    core.grow_kv_cache = lambda: {"pool_blocks": 1}  # no added_blocks / workers
+    core.grow_kv_cache = lambda target=None: {"pool_blocks": 1}  # no added_blocks / workers
     core.set_spec_mode("nospec")
     assert core.get_spec_mode()["state"] == "error"
 

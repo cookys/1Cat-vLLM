@@ -214,10 +214,12 @@ def test_worker_probe_reports_resident_draft_bytes_and_granularity(worker, monke
         "vllm.device_allocator.vmm.get_vmm_backend",
         lambda: FakeVmmBackend(granularity=2 * MIB),
     )
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *a: (123, 456))
     assert worker.get_elastic_kv_probe() == {
         "draft_weights_bytes": 1_200_000_000,
         "granularity": 2 * MIB,
         "device": 3,
+        "total_vram_bytes": 456,  # mem_get_info()[1], same source as the engine
     }
 
 

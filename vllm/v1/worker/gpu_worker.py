@@ -461,6 +461,8 @@ class Worker(WorkerBase):
             ),
             "granularity": get_vmm_backend().granularity(index),
             "device": index,
+            # M-fix-9 (X2R-26/35): same source as the engine's total_bytes
+            "total_vram_bytes": torch.cuda.mem_get_info()[1],
         }
 
     def grow_kv_cache(self, n_blocks_total: int) -> dict[str, Any]:

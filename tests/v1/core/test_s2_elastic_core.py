@@ -145,11 +145,15 @@ def test_core_without_elastic_tail_refuses_grow():
 
 # ---- tail sizing from the workers' probes ----
 
+TOTAL_1056 = 1056 * 16 * PAGE  # M-fix-9: N_total = 1056 -> N_tail_max_v2 = 64 at N_spec 992
+
+
 
 def test_make_configs_elastic_uses_probes(monkeypatch):
     core = EngineCore.__new__(EngineCore)
     core.collective_rpc = lambda m, **k: [
-        {"draft_weights_bytes": int(1.1675 * (1 << 30)), "granularity": 2 << 20}
+        {"draft_weights_bytes": int(1.1675 * (1 << 30)), "granularity": 2 << 20,
+         "total_vram_bytes": TOTAL_1056}
     ] * 2
     core.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(max_model_len=8192),
@@ -175,6 +179,8 @@ def test_make_configs_elastic_uses_probes(monkeypatch):
     assert cfgs[0].num_blocks == 992 and cfgs[0].elastic_tail_blocks == 64
     assert cfgs[0].elastic_spec_blocks_lost == 8  # D2: 1000 -> 992
     assert any("N_spec=992" in l and "8 blocks lost" in l for l in lines)
+    # the log line carries N_tail_max (v2) = N_total - N_spec (X2R-27 grep)
+    assert any("N_tail_max=64" in l and "N_total=1056" in l for l in lines)
     assert cfgs[1].kv_cache_tensors[0].max_size == PAGE * (992 + 64)
 
 
@@ -207,7 +213,8 @@ def _init_kv_caches(monkeypatch, elastic):
     core.model_executor = ex
     core.collective_rpc = lambda m, **k: (
         log.append(m)
-        or [{"draft_weights_bytes": int(1.1675 * (1 << 30)), "granularity": 2 << 20}] * 2
+        or [{"draft_weights_bytes": int(1.1675 * (1 << 30)), "granularity": 2 << 20,
+         "total_vram_bytes": TOTAL_1056}] * 2
     )
     vc = SimpleNamespace(
         cache_config=SimpleNamespace(
@@ -270,7 +277,8 @@ def test_alignment_loss_reaches_log_and_pool_info():
 def test_core_passes_max_model_len_and_block_size_to_the_alignment_check():
     core = EngineCore.__new__(EngineCore)
     core.collective_rpc = lambda m, **k: [
-        {"draft_weights_bytes": int(1.1675 * (1 << 30)), "granularity": 2 << 20}
+        {"draft_weights_bytes": int(1.1675 * (1 << 30)), "granularity": 2 << 20,
+         "total_vram_bytes": TOTAL_1056}
     ] * 2
     core.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(max_model_len=16000),

@@ -117,3 +117,76 @@ def test_alignment_below_max_model_len_fails_at_startup_with_both_numbers():
     assert apply_elastic_kv_tail(
         cfgs, [GIB] * 2, 2 * MIB, max_model_len=15872, block_size=16
     ) > 0 and cfgs[0].num_blocks == 992
+
+
+# ---- plan 075 S3 M-fix-9 (X2R-26): VA for the whole card, grow by free memory
+from vllm.device_allocator.elastic_region import ElasticKvRegion  # noqa: E402
+from vllm.device_allocator.vmm import FakeVmmBackend  # noqa: E402
+from vllm.v1.core.kv_cache_utils import (  # noqa: E402
+    ELASTIC_GROW_MARGIN_BYTES,
+    elastic_grow_target,
+    elastic_n_total,
+)
+
+PAGE_SUM = 8 * PAGE  # 9 MiB per block over 8 KV tensors
+TOTAL = int(31.65 * GIB)
+
+
+def test_n_total_is_floor_of_total_over_page_aligned_down_to_boundary():
+    n = elastic_n_total(TOTAL, PAGE_SUM, 16)
+    assert n % 16 == 0
+    assert n * PAGE_SUM <= TOTAL < (n + 16) * PAGE_SUM
+    assert 3590 <= n <= 3610  # X2R-35: ~3600
+    assert elastic_n_total(16 * PAGE_SUM - 1, PAGE_SUM, 16) == 0  # never rounds up
+
+
+def test_apply_v2_reserves_va_for_the_whole_card():
+    cfgs = [cfg(1696, group_size=8), cfg(1696, group_size=8)]
+    # a 1.17 GiB drafter pays only 64 blocks (v1), v2 must not be capped by it
+    tail = apply_elastic_kv_tail(
+        cfgs, [int(1.1675 * GIB)] * 2, 2 * MIB, total_vram_bytes=[TOTAL, TOTAL + GIB]
+    )
+    n_total = elastic_n_total(TOTAL, PAGE_SUM, 16)  # the poorest rank decides
+    assert tail == n_total - 1696 and tail > 1800
+    for c in cfgs:
+        assert c.num_blocks == 1696 and c.elastic_tail_blocks == tail
+        assert c.elastic_boundary_blocks == 16 and (c.num_blocks + tail) % 16 == 0
+        for t in c.kv_cache_tensors:
+            assert t.max_size == PAGE * n_total  # VA = page x N_total
+    # the worker reserves exactly that much VA (no physical memory: FakeVmm)
+    be = FakeVmmBackend()
+    t = cfgs[0].kv_cache_tensors[0]
+    ElasticKvRegion(0, t.max_size, t.size, 16 * PAGE, PAGE, backend=be)
+    assert ("reserve", PAGE * n_total, 0) in be.calls
+
+
+def test_apply_v2_keeps_the_drafter_gate_and_never_returns_negative_tail():
+    cfgs = [cfg(1000)]
+    assert apply_elastic_kv_tail(cfgs, [10 * MIB], 2 * MIB, total_vram_bytes=[TOTAL]) == 0
+    assert cfgs[0].kv_cache_tensors[0].max_size is None
+    # card smaller than N_spec: nothing to reserve
+    cfgs = [cfg(1000, group_size=8)]
+    assert apply_elastic_kv_tail(cfgs, [GIB], 2 * MIB, total_vram_bytes=[900 * PAGE_SUM]) == 0
+
+
+@pytest.mark.parametrize(
+    "free_blocks, expected_extra",
+    [(10_000, 1904), (500, 496), (100, 96), (15, 0), (0, 0)],
+)
+def test_grow_target_is_min_of_tail_max_and_free_minus_margin(free_blocks, expected_extra):
+    m = ELASTIC_GROW_MARGIN_BYTES
+    free = free_blocks * PAGE_SUM + m + 1  # +1: strictly inside the last block
+    t = elastic_grow_target(1696, 1904, 16, PAGE_SUM, free)
+    assert t == 1696 + expected_extra
+    assert (t - 1696) % 16 == 0 and 1696 <= t <= 1696 + 1904
+
+
+def test_grow_target_free_below_margin_never_shrinks_below_nspec():
+    assert elastic_grow_target(1696, 1904, 16, PAGE_SUM, 0) == 1696
+    assert elastic_grow_target(1696, 1904, 16, PAGE_SUM, ELASTIC_GROW_MARGIN_BYTES - 1) == 1696
+    assert ELASTIC_GROW_MARGIN_BYTES == 64 << 20
+
+
+def test_grow_target_matches_x2r26_prediction_for_8_34_gib_free():
+    t = elastic_grow_target(1696, 1904, 16, PAGE_SUM, int(8.34 * GIB))
+    assert 2600 <= t <= 2640  # prereg predicts grown ~2624

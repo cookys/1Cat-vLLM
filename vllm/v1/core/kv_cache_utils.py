@@ -2594,12 +2594,42 @@ def elastic_tail_layout(
     return boundary_blocks, raw // boundary_blocks * boundary_blocks
 
 
+# plan 075 S3 M-fix-9 (X2R-26): free memory kept on the poorest rank after a grow.
+ELASTIC_GROW_MARGIN_BYTES = 64 << 20
+
+
+def elastic_n_total(total_vram_bytes: int, page_bytes: int, boundary: int) -> int:
+    """plan 075 S3 M-fix-9 (X2R-26): N_total = floor(total / page / boundary) x
+    boundary, the number of blocks the whole card could hold. ``page_bytes`` =
+    bytes of one block summed over every KV tensor."""
+    if page_bytes <= 0 or boundary <= 0:
+        return 0
+    return total_vram_bytes // page_bytes // boundary * boundary
+
+
+def elastic_grow_target(
+    n_spec: int,
+    tail_max: int,
+    boundary: int,
+    page_bytes: int,
+    min_rank_free: int,
+    margin: int = ELASTIC_GROW_MARGIN_BYTES,
+) -> int:
+    """plan 075 S3 M-fix-9 (X2R-26): the pool size a nospec grow aims for =
+    min(N_spec + N_tail_max_v2,
+        N_spec + floor((min_rank_free - margin) / page / boundary) x boundary).
+    Never below ``n_spec`` (free too small -> no growth, never negative)."""
+    by_free = max(min_rank_free - margin, 0) // page_bytes // boundary * boundary
+    return n_spec + min(tail_max, by_free)
+
+
 def apply_elastic_kv_tail(
     kv_cache_configs: list[KVCacheConfig],
     draft_weights_bytes: Sequence[int],
     granularity: int,
     max_model_len: int | None = None,
     block_size: int | None = None,
+    total_vram_bytes: Sequence[int] | None = None,
 ) -> int:
     """plan 075 S2 (A2-3): turn per-rank KV configs elastic, in place.
 
@@ -2615,6 +2645,12 @@ def apply_elastic_kv_tail(
     must still hold one ``max_model_len`` request after the alignment, else
     ``ValueError`` (M3-fix-5: the loss must not silently break the length the
     server was started with).
+
+    With ``total_vram_bytes`` (one per rank, M-fix-9 / X2R-26) the VA is
+    reserved for the whole card: N_total = elastic_n_total(min total, page sum,
+    boundary) and N_tail_max_v2 = N_total - N_spec. The drafter bytes then only
+    gate "is there anything to give back" (the v1 tail must still be >= 1
+    boundary), they no longer cap the tail.
 
     Returns N_tail_max (0 = leave the configs untouched / not elastic).
     """
@@ -2643,6 +2679,15 @@ def apply_elastic_kv_tail(
     n_spec = n_spec_old // boundary_blocks * boundary_blocks
     if tail <= 0 or n_spec <= 0:
         return 0
+    if total_vram_bytes is not None:
+        assert len(total_vram_bytes) == len(rank_pages)
+        n_total = min(
+            elastic_n_total(total, sum(pages), boundary_blocks)
+            for pages, total in zip(rank_pages, total_vram_bytes)
+        )
+        tail = n_total - n_spec
+        if tail <= 0:
+            return 0
     if (
         max_model_len is not None
         and block_size is not None

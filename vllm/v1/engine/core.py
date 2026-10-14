@@ -44,7 +44,9 @@ from vllm.utils.network_utils import make_zmq_socket
 from vllm.utils.system_utils import decorate_logs, set_process_title
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
+    ELASTIC_GROW_MARGIN_BYTES,
     apply_elastic_kv_tail,
+    elastic_grow_target,
     generate_scheduler_kv_cache_config,
     get_kv_cache_configs,
     get_request_block_hasher,
@@ -254,6 +256,8 @@ class EngineCore:
                 [g.kv_cache_spec.block_size for g in kv_cache_configs[0].kv_cache_groups]
                 or [self.vllm_config.cache_config.block_size]
             ),
+            # M-fix-9 (X2R-26): reserve VA for the whole card
+            total_vram_bytes=[int(p["total_vram_bytes"]) for p in probes],
         )
         if tail == 0:
             logger.warning(
@@ -266,11 +270,12 @@ class EngineCore:
             return
         logger.info(
             "Elastic KV tail: N_spec=%d blocks (aligned down to the boundary, "
-            "%d blocks lost), N_tail_max=%d blocks "
-            "(boundary %d blocks, VMM granularity %d B)",
+            "%d blocks lost), N_tail_max=%d blocks (v2: N_total - N_spec, "
+            "N_total=%d) (boundary %d blocks, VMM granularity %d B)",
             kv_cache_configs[0].num_blocks,
             kv_cache_configs[0].elastic_spec_blocks_lost,
             tail,
+            kv_cache_configs[0].num_blocks + tail,
             kv_cache_configs[0].elastic_boundary_blocks,
             granularity,
         )
@@ -1056,7 +1061,7 @@ class EngineCore:
     # ``_spec_blocked`` set (no per-step retry loop); the next POST in the
     # same direction retries. ``error`` is reserved for a failed recovery.
 
-    _SPEC_GROW_MARGIN_BYTES = 64 << 20  # D7: free memory kept after the grow
+    _SPEC_GROW_MARGIN_BYTES = ELASTIC_GROW_MARGIN_BYTES  # D7: free memory kept after the grow
     _SPEC_DRAFT_TAGS = ("draft_weights",)
     _spec_blocked = False
     _spec_last_error: str | None = None
@@ -1292,25 +1297,43 @@ class EngineCore:
                 "no elastic KV tail: the drafter weights are released but the "
                 "pool cannot grow"
             )
-        need = sum(
-            t.max_size - t.size for t in cfg.kv_cache_tensors if t.max_size is not None
-        )
+        n_spec = self.scheduler.kv_pool_spec_blocks()
+        boundary = cfg.elastic_boundary_blocks
+        page_bytes = sum(t.size for t in cfg.kv_cache_tensors) // n_spec
         try:
-            free = min(
-                int(r["free_bytes"]) for r in self._spec_rpc("get_gpu_free_bytes")
-            )
+            frees = [int(r["free_bytes"]) for r in self._spec_rpc("get_gpu_free_bytes")]
+            free = min(frees)  # min_rank_free: the poorest rank decides
         except TimeoutError as exc:
             return self._spec_to_error(f"get_gpu_free_bytes timed out ({exc!r})")
         except Exception as exc:
             return self._spec_fail(f"get_gpu_free_bytes failed ({exc!r})")
-        if free < need + self._SPEC_GROW_MARGIN_BYTES:
+        # M-fix-9 (X2R-26): grow to what the card has now, up to N_tail_max_v2
+        target = elastic_grow_target(
+            n_spec,
+            cfg.elastic_tail_blocks,
+            boundary,
+            page_bytes,
+            free,
+            self._SPEC_GROW_MARGIN_BYTES,
+        )
+        grow_inputs = {
+            "min_rank_free_bytes": free,
+            "rank_free_bytes": frees,
+            "n_tail_max": cfg.elastic_tail_blocks,
+            "margin_bytes": self._SPEC_GROW_MARGIN_BYTES,
+            "page_bytes": page_bytes,
+            "target_blocks": target,
+        }
+        if target <= n_spec:
+            self._spec_note("grow_target", grow_inputs)
             self._spec_end("NOSPEC_RELEASED")
             return self._spec_fail(
-                f"grow skipped: min free {free} B over ranks < tail {need} B + "
+                f"grow skipped: min free {free} B over ranks leaves no whole "
+                f"{boundary}-block chunk ({boundary * page_bytes} B) after the "
                 f"{self._SPEC_GROW_MARGIN_BYTES} B margin"
             )
         try:
-            out = self.grow_kv_cache()
+            out = self.grow_kv_cache(target)
         except TimeoutError as exc:
             return self._spec_to_error(
                 f"grow_kv_cache timed out ({exc!r}); worker state unknown"
@@ -1323,6 +1346,7 @@ class EngineCore:
                 "pool_blocks": out["pool_blocks"],
                 "added_blocks": out["added_blocks"],
                 "free_bytes": [w.get("free_bytes") for w in out["workers"]],
+                **grow_inputs,
             },
         )
         self._spec_set_state("NOSPEC_GROWN")
