@@ -2035,6 +2035,18 @@ class EngineArgs:
                 "the DP dummy-run propose needs the drafter resident"
             )
 
+        # plan 075 S2 (A2-6): KV connectors / CPU offloading register the KV
+        # tensors with the pool size they saw at startup (N_spec); a tail that
+        # grows later would be invisible to them.
+        if self.spec_hot_switch_elastic and (
+            self.kv_transfer_config is not None or self.kv_offloading_size
+        ):
+            raise ValueError(
+                "--spec-hot-switch-elastic cannot be combined with "
+                "--kv-transfer-config or --kv-offloading-size: they register "
+                "the startup KV pool size"
+            )
+
         cache_config = CacheConfig(
             block_size=self.block_size,  # type: ignore[arg-type]
             gpu_memory_utilization=self.gpu_memory_utilization,

@@ -96,3 +96,15 @@ def test_draft_pool_with_dp_is_rejected(local_model):
     )
     with pytest.raises(ValueError, match="data parallelism"):
         args.create_engine_config()
+
+
+def test_elastic_with_kv_offloading_is_rejected(local_model):
+    args = EngineArgs(
+        model=local_model,
+        skip_tokenizer_init=True,
+        spec_hot_switch_elastic=True,
+        enable_cumem_allocator=True,
+        kv_offloading_size=1.0,
+    )
+    with pytest.raises(ValueError, match="kv-offloading-size"):
+        args.create_engine_config()
