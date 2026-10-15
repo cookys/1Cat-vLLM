@@ -44,7 +44,7 @@ from vllm.utils.network_utils import make_zmq_socket
 from vllm.utils.system_utils import decorate_logs, set_process_title
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
-    ELASTIC_GROW_MARGIN_BYTES,
+    ELASTIC_GROW_RESERVE_BYTES,
     apply_elastic_kv_tail,
     elastic_grow_headroom,
     elastic_grow_target,
@@ -252,6 +252,7 @@ class EngineCore:
         self._spec_peak_activation_bytes = [
             int(p.get("peak_activation_bytes", 0) or 0) for p in probes
         ]
+        self._spec_non_torch_bytes = [int(p.get("non_torch_bytes", 0) or 0) for p in probes]
         tail = apply_elastic_kv_tail(
             kv_cache_configs,
             [int(p["draft_weights_bytes"]) for p in probes],
@@ -285,7 +286,7 @@ class EngineCore:
             kv_cache_configs[0].num_blocks + tail,
             kv_cache_configs[0].elastic_boundary_blocks,
             granularity,
-            ELASTIC_GROW_MARGIN_BYTES,
+            ELASTIC_GROW_RESERVE_BYTES,
             self._spec_peak_activation_bytes,
         )
 
@@ -1070,10 +1071,11 @@ class EngineCore:
     # ``_spec_blocked`` set (no per-step retry loop); the next POST in the
     # same direction retries. ``error`` is reserved for a failed recovery.
 
-    _SPEC_GROW_MARGIN_BYTES = ELASTIC_GROW_MARGIN_BYTES  # D7: free memory kept after the grow
+    _SPEC_GROW_MARGIN_BYTES = ELASTIC_GROW_RESERVE_BYTES  # D7 / X2R-157: free memory kept on top of the activation peak after the grow
     _SPEC_DRAFT_TAGS = ("draft_weights",)
     # M-fix-10 (X2R-154): per-rank forward activation peak, set at startup
     _spec_peak_activation_bytes: list[int] | None = None
+    _spec_non_torch_bytes: list[int] | None = None
     _spec_blocked = False
     _spec_last_error: str | None = None
     _spec_last_transition: dict | None = None
@@ -1336,6 +1338,7 @@ class EngineCore:
         )
         grow_inputs = {
             "peak_activation_bytes": list(peaks) if peaks else None,
+            "non_torch_bytes": list(self._spec_non_torch_bytes) if self._spec_non_torch_bytes else None,
             "headroom_bytes": headroom,
             "n_tail_grow": target - n_spec,
             "min_rank_free_bytes": free,

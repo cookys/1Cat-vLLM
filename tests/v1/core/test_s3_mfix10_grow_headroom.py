@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """plan 075 S3 M-fix-10 (X2R-154): the nospec grow keeps, per rank, at least
-the startup-profiled forward activation peak + 64 MiB free (M-fix-9 kept only
+the startup-profiled forward activation peak + 512 MiB free (X2R-157; M-fix-9 kept only
 64 MiB and the first post-grow forward OOMed with ~130 MiB left)."""
 
 from types import SimpleNamespace
@@ -13,6 +13,7 @@ from tests.v1.core.test_s2_spec_machine import (
 )
 from vllm.v1.core.kv_cache_utils import (
     ELASTIC_GROW_MARGIN_BYTES,
+    ELASTIC_GROW_RESERVE_BYTES,
     elastic_grow_headroom,
     elastic_grow_target,
 )
@@ -21,8 +22,9 @@ PEAK = 700 * MIB  # ~ the 0.69 GiB per-rank peak activation of the 27B NVFP4 sta
 CHUNK = BOUNDARY * PAGE
 
 
-def test_margin_constant_unchanged():
-    assert ELASTIC_GROW_MARGIN_BYTES == 64 << 20 == MARGIN
+def test_reserve_constant_is_512_mib_and_old_margin_constant_unchanged():
+    assert ELASTIC_GROW_MARGIN_BYTES == 64 << 20
+    assert ELASTIC_GROW_RESERVE_BYTES == 512 << 20 == MARGIN
 
 
 def test_headroom_is_min_over_ranks_of_free_minus_peak():
@@ -51,6 +53,7 @@ def _grow_machine(frees_after_release, peaks):
     core, cl, s = make(free=0)
     cl.ranks = [FakeRank(f - DRAFT) for f in frees_after_release]  # sleep adds DRAFT back
     core._spec_peak_activation_bytes = list(peaks)
+    core._spec_non_torch_bytes = [123 * MIB] * len(frees_after_release)
     return core, cl, s
 
 
@@ -63,6 +66,7 @@ def test_machine_exact_peak_plus_margin_and_one_byte_short():
     assert g["target_blocks"] == N_SPEC + k * BOUNDARY
     assert g["peak_activation_bytes"] == [PEAK] * 4 and g["headroom_bytes"] == free - PEAK
     assert g["n_tail_grow"] == k * BOUNDARY and g["min_rank_free_bytes"] == free
+    assert g["non_torch_bytes"] == [123 * MIB] * 4
     # after the grow every rank still has >= peak + margin free
     assert all(f >= PEAK + MARGIN for f in g["free_bytes"])
     assert min(g["free_bytes"]) == PEAK + MARGIN
@@ -80,12 +84,12 @@ def test_w2a_f5_shape_m_fix_9_vs_m_fix_10():
     # N_tail_max 1904, boundary 16. M-fix-9 target = 2688 (left ~130 MiB, forward OOM);
     # peak 0.69 GiB per rank is the S3-C startup profiling of the same config.
     page, free, peak = 9437184, 9492496384, int(0.69 * GIB)
-    t9 = elastic_grow_target(1696, 1904, 16, page, free, MARGIN)
+    t9 = elastic_grow_target(1696, 1904, 16, page, free, 64 * MIB)
     assert t9 == 2688
     assert free - (t9 - 1696) * page < peak
     h = elastic_grow_headroom([free] * 4, [peak] * 4)
-    t10 = elastic_grow_target(1696, 1904, 16, page, h, MARGIN)
-    assert t10 == 1696 + 912  # 57 chunks of 16 blocks
+    t10 = elastic_grow_target(1696, 1904, 16, page, h, ELASTIC_GROW_RESERVE_BYTES)
+    assert t10 == 1696 + 864  # 54 chunks of 16 blocks (peak + 512 MiB)
     assert free - (t10 - 1696) * page >= peak + MARGIN
     # and one more chunk would break the rule
     assert free - (t10 - 1696 + 16) * page < peak + MARGIN
@@ -142,6 +146,7 @@ def test_startup_stores_per_rank_peak_from_the_probe():
     cfgs = [cfg(1000) for _ in range(4)]
     core._make_kv_cache_configs_elastic(cfgs)
     assert core._spec_peak_activation_bytes == [PEAK + i for i in range(4)]
+    assert core._spec_non_torch_bytes == [0] * 4  # probes above carry no non_torch_bytes
     assert cfgs[0].elastic_tail_blocks > 0
     # a worker that predates the field (or skipped profiling) reports 0
     probes2 = [{k: v for k, v in p.items() if k != "peak_activation_bytes"} for p in probes]

@@ -2596,6 +2596,9 @@ def elastic_tail_layout(
 
 # plan 075 S3 M-fix-9 (X2R-26): free memory kept on the poorest rank after a grow.
 ELASTIC_GROW_MARGIN_BYTES = 64 << 20
+# plan 075 S3 M-fix-10 (X2R-157): the reserve the nospec grow keeps on top of the startup-profiled
+# activation peak, per rank. profile_run runs with skip_attn=True so the peak is a lower bound.
+ELASTIC_GROW_RESERVE_BYTES = 512 << 20
 
 
 def elastic_n_total(total_vram_bytes: int, page_bytes: int, boundary: int) -> int:
@@ -2622,7 +2625,8 @@ def elastic_grow_target(
 
     M-fix-10 (X2R-154): callers pass ``min_rank_free = elastic_grow_headroom(
     free_r, peak_r)``, so what stays free per rank after the grow is at least
-    peak_activation_r + ``margin`` (64 MiB)."""
+    peak_activation_r + ``margin``; M-fix-10 passes ELASTIC_GROW_RESERVE_BYTES
+    (512 MiB, X2R-157) as the margin."""
     by_free = max(min_rank_free - margin, 0) // page_bytes // boundary * boundary
     return n_spec + min(tail_max, by_free)
 
