@@ -46,6 +46,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     ELASTIC_GROW_MARGIN_BYTES,
     apply_elastic_kv_tail,
+    elastic_grow_headroom,
     elastic_grow_target,
     generate_scheduler_kv_cache_config,
     get_kv_cache_configs,
@@ -247,6 +248,10 @@ class EngineCore:
         weights the workers report, and rewrite the per-rank configs."""
         probes = self.collective_rpc("get_elastic_kv_probe")
         granularity = max(int(p["granularity"]) for p in probes)
+        # M-fix-10 (X2R-154): per-rank forward activation peak from the startup profiling
+        self._spec_peak_activation_bytes = [
+            int(p.get("peak_activation_bytes", 0) or 0) for p in probes
+        ]
         tail = apply_elastic_kv_tail(
             kv_cache_configs,
             [int(p["draft_weights_bytes"]) for p in probes],
@@ -271,13 +276,17 @@ class EngineCore:
         logger.info(
             "Elastic KV tail: N_spec=%d blocks (aligned down to the boundary, "
             "%d blocks lost), N_tail_max=%d blocks (v2: N_total - N_spec, "
-            "N_total=%d) (boundary %d blocks, VMM granularity %d B)",
+            "N_total=%d) (boundary %d blocks, VMM granularity %d B); "
+            "M-fix-10 grow keeps free >= peak_activation + %d B per rank, "
+            "peak_activation_bytes=%s",
             kv_cache_configs[0].num_blocks,
             kv_cache_configs[0].elastic_spec_blocks_lost,
             tail,
             kv_cache_configs[0].num_blocks + tail,
             kv_cache_configs[0].elastic_boundary_blocks,
             granularity,
+            ELASTIC_GROW_MARGIN_BYTES,
+            self._spec_peak_activation_bytes,
         )
 
     def grow_kv_cache(self, n_blocks_total: int | None = None) -> dict:
@@ -1063,6 +1072,8 @@ class EngineCore:
 
     _SPEC_GROW_MARGIN_BYTES = ELASTIC_GROW_MARGIN_BYTES  # D7: free memory kept after the grow
     _SPEC_DRAFT_TAGS = ("draft_weights",)
+    # M-fix-10 (X2R-154): per-rank forward activation peak, set at startup
+    _spec_peak_activation_bytes: list[int] | None = None
     _spec_blocked = False
     _spec_last_error: str | None = None
     _spec_last_transition: dict | None = None
@@ -1307,16 +1318,26 @@ class EngineCore:
             return self._spec_to_error(f"get_gpu_free_bytes timed out ({exc!r})")
         except Exception as exc:
             return self._spec_fail(f"get_gpu_free_bytes failed ({exc!r})")
+        # M-fix-10 (X2R-154): what stays free per rank after the grow must cover
+        # that rank's startup-profiled forward activation peak + the margin
+        peaks = self._spec_peak_activation_bytes
+        try:
+            headroom = elastic_grow_headroom(frees, peaks)
+        except ValueError as exc:
+            return self._spec_fail(f"grow skipped: {exc}")
         # M-fix-9 (X2R-26): grow to what the card has now, up to N_tail_max_v2
         target = elastic_grow_target(
             n_spec,
             cfg.elastic_tail_blocks,
             boundary,
             page_bytes,
-            free,
+            headroom,
             self._SPEC_GROW_MARGIN_BYTES,
         )
         grow_inputs = {
+            "peak_activation_bytes": list(peaks) if peaks else None,
+            "headroom_bytes": headroom,
+            "n_tail_grow": target - n_spec,
             "min_rank_free_bytes": free,
             "rank_free_bytes": frees,
             "n_tail_max": cfg.elastic_tail_blocks,
@@ -1328,7 +1349,8 @@ class EngineCore:
             self._spec_note("grow_target", grow_inputs)
             self._spec_end("NOSPEC_RELEASED")
             return self._spec_fail(
-                f"grow skipped: min free {free} B over ranks leaves no whole "
+                f"grow skipped: min free {free} B over ranks (headroom {headroom} B "
+                f"after the activation peak {peaks}) leaves no whole "
                 f"{boundary}-block chunk ({boundary * page_bytes} B) after the "
                 f"{self._SPEC_GROW_MARGIN_BYTES} B margin"
             )

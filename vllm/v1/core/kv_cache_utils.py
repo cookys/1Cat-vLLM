@@ -2618,9 +2618,35 @@ def elastic_grow_target(
     """plan 075 S3 M-fix-9 (X2R-26): the pool size a nospec grow aims for =
     min(N_spec + N_tail_max_v2,
         N_spec + floor((min_rank_free - margin) / page / boundary) x boundary).
-    Never below ``n_spec`` (free too small -> no growth, never negative)."""
+    Never below ``n_spec`` (free too small -> no growth, never negative).
+
+    M-fix-10 (X2R-154): callers pass ``min_rank_free = elastic_grow_headroom(
+    free_r, peak_r)``, so what stays free per rank after the grow is at least
+    peak_activation_r + ``margin`` (64 MiB)."""
     by_free = max(min_rank_free - margin, 0) // page_bytes // boundary * boundary
     return n_spec + min(tail_max, by_free)
+
+
+def elastic_grow_headroom(
+    rank_free: Sequence[int],
+    rank_peak_activation: Sequence[int] | None,
+) -> int:
+    """plan 075 S3 M-fix-10 (X2R-154): the free bytes the grow may spend =
+    min over ranks of (free_r - peak_activation_r). The peak is the forward
+    activation peak the engine measured at startup (``determine_available_memory``
+    profiling, torch_peak_increase); the fixed margin is kept on top of it by
+    ``elastic_grow_target``. ``None`` / empty peaks = unknown, counted as 0.
+    Never negative."""
+    if not rank_free:
+        return 0
+    peaks = list(rank_peak_activation or [])
+    if peaks and len(peaks) != len(rank_free):
+        raise ValueError(
+            f"{len(peaks)} activation peaks for {len(rank_free)} ranks"
+        )
+    if not peaks:
+        peaks = [0] * len(rank_free)
+    return max(min(f - p for f, p in zip(rank_free, peaks)), 0)
 
 
 def apply_elastic_kv_tail(

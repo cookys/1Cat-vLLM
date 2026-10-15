@@ -463,6 +463,11 @@ class Worker(WorkerBase):
             "device": index,
             # M-fix-9 (X2R-26/35): same source as the engine's total_bytes
             "total_vram_bytes": torch.cuda.mem_get_info()[1],
+            # M-fix-10 (X2R-154): forward activation peak measured by the
+            # startup memory profiling (determine_available_memory); 0 =
+            # profiling was skipped (--kv-cache-memory-bytes)
+            "peak_activation_bytes": int(getattr(self, "peak_activation_memory", 0) or 0),
+            "non_torch_bytes": int(getattr(self, "non_torch_memory", 0) or 0),
         }
 
     def grow_kv_cache(self, n_blocks_total: int) -> dict[str, Any]:
