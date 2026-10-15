@@ -198,6 +198,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FA2_D256_LIBRARY: str | None = None
     VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST: str | None = None
     VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS: bool = True
+    VLLM_SM70_DFLASH2_Q1_BATCH_CUDAGRAPHS: bool = False
     VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST: str | None = None
     VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM: bool = False
     VLLM_SM70_NVFP4_QPN2: bool = False
@@ -1959,6 +1960,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS=0 restores the eager-tail behaviour.
     "VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS", "1"))
+    ),
+    # plan 075 M-fix12: also capture request-major uniform q1 batches (B>=2) in a
+    # DFlash2 process, so a hot-switched nospec batch replays FULL instead of
+    # PIECEWISE. Needs VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS=1. Default-off keeps the
+    # descriptor set (and graph memory) identical to the base.
+    "VLLM_SM70_DFLASH2_Q1_BATCH_CUDAGRAPHS": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_Q1_BATCH_CUDAGRAPHS", "0"))
     ),
     "VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST": lambda: os.getenv(
         "VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST", None
