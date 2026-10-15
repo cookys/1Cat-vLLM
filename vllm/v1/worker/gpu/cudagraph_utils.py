@@ -234,6 +234,13 @@ class CudaGraphManager:
             and _worker_device_is_pre_ampere()
             and not self.compilation_config.pass_config.enable_sp
         )
+        # plan 075 M-fix12: a hot-switched nospec process keeps
+        # decode_query_len=8, so a B>=2 uniform q1 batch matches no FULL
+        # descriptor and falls to PIECEWISE. Opt-in: also admit q1 batches.
+        self._sm70_dflash2_q1_batch_graphs = bool(
+            self._sm70_dflash2_tail_graphs
+            and envs.VLLM_SM70_DFLASH2_Q1_BATCH_CUDAGRAPHS
+        )
         if self._sm70_dflash2_tail_graphs:
             # Target verifier tails are independent of adaptive lookup. The
             # drafter always produces its trained block width and must not
@@ -316,9 +323,15 @@ class CudaGraphManager:
                             self._sm70_dflash2_tail_graphs
                             and query_len < self.decode_query_len
                             and num_tokens != query_len
+                            and not (
+                                self._sm70_dflash2_q1_batch_graphs
+                                and query_len == 1
+                            )
                         ):
-                            # Only single-request tails are admitted. Avoid
-                            # changing batching routes or multiplying captures.
+                            # Only single-request tails are admitted (plus
+                            # request-major q1 batches when M-fix12 is on).
+                            # Avoid changing batching routes or multiplying
+                            # captures.
                             continue
                         desc = BatchExecutionDescriptor(
                             cg_mode=decode_mode,
