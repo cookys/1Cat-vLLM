@@ -31,6 +31,10 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionType
+from vllm.v1.attention.backends.flash_attn_v100_nospec import (
+    nospec_long_scope,
+    record_attn_route,
+)
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionBackend,
     TritonAttentionImpl,
@@ -447,6 +451,9 @@ class FlashAttnV100Metadata(TritonAttentionMetadata):
     flash_v100_decode_workspace_seq_capacity_hint: int | None
     flash_v100_static_decode_seq_hint: int | None
     flash_v100_decode_active_num_partitions: torch.Tensor | None
+    flash_v100_decode_partition_size_hint: int | None = None
+    flash_v100_decode_active_partition_size: int | None = None
+    flash_v100_nospec_long_scope: bool = False
     ddtree_parent_ids: torch.Tensor | None
     ddtree_parent_ids_cpu: torch.Tensor | None
     ddtree_num_tree_tokens_cpu: torch.Tensor | None
@@ -3779,6 +3786,21 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         self._smallq_token_indices: torch.Tensor | None = None
         self._smallq_buffer_shape: tuple[int, int, int] | None = None
         self._decode_active_num_partitions: torch.Tensor | None = None
+        self._nospec_long_p1024 = envs.VLLM_FLASH_V100_NOSPEC_LONG_P1024
+        self._nospec_long_configured = (
+            (self._nospec_long_p1024 or envs.VLLM_FLASH_V100_ATTN_ROUTE_TRACE)
+            and spec_config is None
+            and self.device.type == "cuda"
+            and current_platform.is_device_capability(70)
+            and self.decode_cudagraph_enabled
+            and self.vllm_config.parallel_config.tensor_parallel_size == 4
+            and getattr(cache_config, "cache_dtype", None) == "nvfp4"
+            and self.block_size == 4096
+            and self.headdim == 256
+            and self.num_heads_q == 6
+            and self.num_heads_kv == 1
+            and self.decode_sliding_window is None
+        )
 
     def _attach_prefix_anchored_metadata(
         self,
@@ -3924,6 +3946,8 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         flash_metadata.flash_v100_decode_max_seq_len_hint = None
         flash_metadata.flash_v100_decode_workspace_seq_capacity_hint = None
         flash_metadata.flash_v100_static_decode_seq_hint = None
+        flash_metadata.flash_v100_decode_partition_size_hint = None
+        flash_metadata.flash_v100_nospec_long_scope = False
 
         max_query_len = int(getattr(common_attn_metadata, "max_query_len", 0) or 0)
         if max_query_len != 1:
@@ -3938,6 +3962,33 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
             return
 
         flash_metadata.flash_v100_decode_max_seq_len_hint = max_seq_len_hint
+        scope = False
+        if getattr(self, "_nospec_long_configured", False):
+            scope = nospec_long_scope(
+                configured=True,
+                batch=int(attn_metadata.seq_lens.shape[0]),
+                q_len=max_query_len,
+                capacity=min(
+                    int(attn_metadata.block_table.shape[1]) * self.block_size,
+                    int(self.vllm_config.model_config.max_model_len),
+                ),
+                graph_variant=int(
+                    getattr(common_attn_metadata, "cudagraph_graph_variant", 0) or 0
+                ),
+            )
+        flash_metadata.flash_v100_nospec_long_scope = scope
+        if scope and self._nospec_long_p1024:
+            if (
+                envs.VLLM_FLASH_V100_DECODE_PARTITION_SIZE is not None
+                or not _decode_dynamic_partitions_enabled()
+                or os.getenv("VLLM_FLASH_V100_DECODE_USE_XQA", "1") == "0"
+            ):
+                raise RuntimeError(
+                    "NOSPEC_LONG_P1024 requires dynamic XQA and no global P override"
+                )
+            # Pin to the model/graph capacity, not a changing live-length hint.
+            # The native 192-thread route remains enabled (no global override).
+            flash_metadata.flash_v100_decode_partition_size_hint = 1024
         if not static_decode:
             return
 
@@ -3980,6 +4031,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
     ) -> None:
         flash_metadata = _as_flash_v100_metadata(attn_metadata)
         flash_metadata.flash_v100_decode_active_num_partitions = None
+        flash_metadata.flash_v100_decode_active_partition_size = None
         if not _decode_dynamic_partitions_enabled():
             return
 
@@ -4002,11 +4054,14 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         ):
             return
 
-        partition_size = _decode_partition_size_for_metadata(int(max_seq_len_hint))
+        partition_size = getattr(
+            attn_metadata, "flash_v100_decode_partition_size_hint", None
+        ) or _decode_partition_size_for_metadata(int(max_seq_len_hint))
         active = max(1, (int(max_seq_len_hint) + partition_size - 1) // partition_size)
         active_num_partitions = self._ensure_decode_active_num_partitions()
         active_num_partitions.fill_(active)
         flash_metadata.flash_v100_decode_active_num_partitions = active_num_partitions
+        flash_metadata.flash_v100_decode_active_partition_size = partition_size
         _trace_decode_active_metadata(
             stage=stage,
             max_seq_len_hint=int(max_seq_len_hint),
@@ -8111,6 +8166,34 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 value_cache,
                 self.kv_cache_dtype,
             )
+            fixed_partition = getattr(
+                attn_metadata, "flash_v100_decode_partition_size_hint", None
+            )
+            if fixed_partition is not None:
+                if not (
+                    fixed_partition == 1024
+                    and attn_metadata.flash_v100_nospec_long_scope
+                    and self.kv_cache_dtype == "nvfp4"
+                    and query.dtype == torch.float16
+                    and query.shape[1:] == (6, 256)
+                    and 2 <= query.shape[0] <= 16
+                    and key_cache.shape[1:3] == (4096, 1)
+                ):
+                    raise RuntimeError("NOSPEC_LONG_P1024 dispatch shape mismatch")
+                partition_size_hint = fixed_partition
+            route_kwargs = {}
+            if envs.VLLM_FLASH_V100_ATTN_ROUTE_TRACE and getattr(
+                attn_metadata, "flash_v100_nospec_long_scope", False
+            ):
+                if not _callable_accepts_keyword(
+                    self.flash_attn_decode_paged_xqa, "route_observer"
+                ):
+                    raise RuntimeError(
+                        "ATTN_ROUTE requires patched Flash-V100 interface"
+                    )
+                route_kwargs["route_observer"] = partial(
+                    record_attn_route, metadata=attn_metadata, log=logger.info
+                )
             if partition_size_hint is not None:
                 if (
                     self.kv_cache_dtype in ("fp8", "fp8_e4m3")
@@ -8158,10 +8241,13 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                         False,
                     )
                 ),
+                **route_kwargs,
             )
             _record_route("decode_xqa_paged")
             return output
 
+        if getattr(attn_metadata, "flash_v100_decode_partition_size_hint", None):
+            raise RuntimeError("NOSPEC_LONG_P1024 cannot fall back from XQA")
         _log_fp8_kv_cache_route("decode", self.kv_cache_dtype, "scalar_paged")
         _trace_decode_active(
             route="decode_scalar_paged",

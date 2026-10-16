@@ -19,7 +19,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("decode_paged_fwd", &flash_attention_decode_paged,
         "FlashAttention decode over paged KV cache (Volta)");
   m.def("decode_paged_xqa_fwd", &flash_attention_decode_paged_xqa,
-        "FlashAttention XQA decode over paged KV cache (Volta)");
+        "FlashAttention XQA decode over paged KV cache (Volta)",
+        py::arg("q"), py::arg("k_cache"), py::arg("v_cache"), py::arg("out"),
+        py::arg("block_table"), py::arg("seq_lens"), py::arg("tmp_out"),
+        py::arg("max_logits"), py::arg("exp_sums"),
+        py::arg("active_num_partitions"), py::arg("softmax_scale"),
+        py::arg("partition_size"), py::arg("launch_num_partitions"),
+        py::arg("kv_cache_dtype"), py::arg("k_scale"), py::arg("v_scale"),
+        py::arg("window_size_left"), py::arg("window_size_right"),
+        py::arg("batch_context_max_seq_len"), py::arg("route_info") = py::none());
+  m.attr("decode_paged_xqa_route_version") = 1;
   m.def("decode_paged_xqa_staged_fwd", &flash_attention_decode_paged_xqa_staged,
         "Staged FlashAttention XQA decode over paged KV cache (Volta)");
   m.def("grouped_verify_paged_fwd", &flash_attention_grouped_verify_paged,

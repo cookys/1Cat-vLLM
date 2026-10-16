@@ -26,6 +26,15 @@ from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.sm70_decode_trace import sm70_trace_call
 from vllm.utils.torch_utils import current_stream, weak_ref_tensors
+from vllm.v1.attention.backends.flash_attn_v100_nospec import (
+    attn_graph_batch,
+    attn_live_batch,
+    attn_runtime_keys,
+    bind_attn_graph,
+    collect_attn_routes,
+    log_attn_routes,
+    validate_attn_replay,
+)
 
 logger = init_logger(__name__)
 
@@ -135,6 +144,8 @@ class CUDAGraphEntry:
     # during capture, and check if they are the same during replay
     input_addresses: list[int] | None = None
     input_debug: list[str] | None = None
+    attn_routes: list[dict] | None = None
+    attn_route_replayed: set[int] = dataclasses.field(default_factory=set)
 
 
 @dataclasses.dataclass
@@ -195,6 +206,7 @@ class CUDAGraphWrapper:
             self.is_debugging_mode or envs.VLLM_CUDAGRAPH_INPUT_ADDR_DEBUG
         )
         self._runnable_str = str(runnable) if self.is_debugging_mode else None
+        self._attn_route_trace = envs.VLLM_FLASH_V100_ATTN_ROUTE_TRACE
 
         # assert runtime_mode is not NONE(no cudagraph), otherwise, we don't
         # need to initialize a CUDAGraphWrapper.
@@ -332,6 +344,11 @@ class CUDAGraphWrapper:
             cudagraph = torch.cuda.CUDAGraph()
 
             with ExitStack() as stack:
+                attn_routes = (
+                    stack.enter_context(collect_attn_routes())
+                    if self._attn_route_trace
+                    else None
+                )
                 if self.cudagraph_options.gc_disable:
                     # during every model forward for piecewise cudagraph
                     # mode, we will capture many pieces of cudagraphs
@@ -385,6 +402,16 @@ class CUDAGraphWrapper:
             # to save memory
             entry.output = weak_ref_tensors(output)
             entry.cudagraph = cudagraph
+            entry.attn_routes = (
+                bind_attn_graph(attn_routes, cudagraph) if attn_routes else attn_routes
+            )
+            if attn_routes:
+                log_attn_routes(
+                    entry.attn_routes,
+                    phase="capture",
+                    graph_id=id(cudagraph),
+                    log=logger.info,
+                )
 
             compilation_counter.num_cudagraph_captured += 1
 
@@ -414,8 +441,45 @@ class CUDAGraphWrapper:
             f"cudagraph.{self.runtime_mode.name}.sync_prev_onload",
             get_offloader().sync_prev_onload,
         )
+        live_b = (
+            attn_live_batch(forward_context.attn_metadata)
+            if entry.attn_routes and not forward_context.is_dummy_run
+            else None
+        )
+        first_attn_replay = (
+            bool(entry.attn_routes)
+            and live_b not in entry.attn_route_replayed
+            and not forward_context.is_dummy_run
+        )
+        if first_attn_replay:
+            graph_b = attn_graph_batch(
+                live_b, self.compilation_config.cudagraph_capture_sizes
+            )
+            runtime_keys = attn_runtime_keys(
+                forward_context.attn_metadata,
+                live_B=live_b,
+                graph_B=graph_b,
+                config=self.vllm_config,
+            )
+            validate_attn_replay(
+                entry.attn_routes,
+                forward_context.attn_metadata,
+                graph=entry.cudagraph,
+                runtime_keys=runtime_keys,
+            )
         sm70_trace_call(
             f"cudagraph.{self.runtime_mode.name}.replay",
             entry.cudagraph.replay,
         )
+        if first_attn_replay:
+            # Successful host submission, not proof that GPU work completed.
+            log_attn_routes(
+                entry.attn_routes,
+                phase="replay",
+                graph_id=id(entry.cudagraph),
+                log=logger.info,
+                live_B=live_b,
+                runtime_keys=runtime_keys,
+            )
+            entry.attn_route_replayed.add(live_b)
         return entry.output

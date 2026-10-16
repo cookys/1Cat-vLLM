@@ -37,7 +37,8 @@ at::Tensor flash_attention_decode_paged_xqa(
     const float softmax_scale, const int partition_size,
     const int launch_num_partitions, const std::string& kv_cache_dtype,
     const float k_scale, const float v_scale, const int window_size_left,
-    const int window_size_right, const int batch_context_max_seq_len);
+    const int window_size_right, const int batch_context_max_seq_len,
+    const std::optional<at::Tensor>& route_info = std::nullopt);
 
 at::Tensor flash_attention_decode_paged_xqa_staged(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,

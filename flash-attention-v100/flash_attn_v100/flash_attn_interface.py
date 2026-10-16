@@ -330,6 +330,7 @@ def _get_decode_workspace_for_plan(
     plan: _DecodePlan,
     active_num_partitions: torch.Tensor | None = None,
     partial_dtype: torch.dtype = torch.float16,
+    route_observer=None,
 ):
     device_index = q.device.index if q.device.index is not None else -1
     stream_id = _workspace_stream_id(q.device)
@@ -385,6 +386,13 @@ def _get_decode_workspace_for_plan(
     if active_num_partitions is None:
         workspace.active_num_partitions.fill_(plan.actual_num_partitions)
         active_num_partitions = workspace.active_num_partitions
+    if route_observer is not None:
+        route_observer(
+            plan=plan,
+            workspace_key=key,
+            active_num_partitions=active_num_partitions,
+            batch_capacity=batch_capacity,
+        )
     return (
         workspace.tmp_out[:batch_capacity],
         workspace.max_logits[:batch_capacity],
@@ -1286,6 +1294,7 @@ def flash_attn_decode_paged_xqa(
     active_num_partitions: torch.Tensor | None = None,
     partition_size_hint: int | None = None,
     batch_context_routing: bool = False,
+    route_observer=None,
 ):
     if not flash_attn_decode_paged_xqa_available():
         raise RuntimeError("flash_attn_v100 CUDA extension lacks XQA decode")
@@ -1348,6 +1357,12 @@ def flash_attn_decode_paged_xqa(
         seq_lens,
         workspace_seq_capacity_hint=workspace_seq_capacity_hint,
     )
+    route_context = {}
+    native_route = None
+    if route_observer is not None:
+        if getattr(flash_attn_v100_cuda, "decode_paged_xqa_route_version", 0) != 1:
+            raise RuntimeError("ATTN_ROUTE requires rebuilt native route ABI v1")
+        native_route = torch.full((4,), -1, dtype=torch.int64, device="cpu")
     tmp_out, max_logits, exp_sums, active_num_partitions = (
         _get_decode_workspace_for_plan(
             q,
@@ -1362,6 +1377,7 @@ def flash_attn_decode_paged_xqa(
                 if kv_cache_dtype in ("fp8", "fp8_e4m3")
                 else torch.float16
             ),
+            route_observer=route_context.update if route_observer is not None else None,
         )
     )
 
@@ -1422,7 +1438,8 @@ def flash_attn_decode_paged_xqa(
         if batch_context_max_seq_len <= 0:
             batch_context_max_seq_len = plan.launch_num_partitions * plan.partition_size
 
-    return flash_attn_v100_cuda.decode_paged_xqa_fwd(
+    native_kwargs = {"route_info": native_route} if native_route is not None else {}
+    result = flash_attn_v100_cuda.decode_paged_xqa_fwd(
         q,
         k_cache,
         v_cache,
@@ -1442,7 +1459,12 @@ def flash_attn_decode_paged_xqa(
         int(window_size_left),
         int(window_size_right),
         int(batch_context_max_seq_len),
+        **native_kwargs,
     )
+    if route_observer is not None:
+        # Host-owned CPU tensor: no CUDA .item(), sync, or device readback.
+        route_observer(**route_context, native_route=tuple(native_route.tolist()))
+    return result
 
 
 def flash_attn_decode_paged_wmma(

@@ -480,6 +480,8 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_SMALLQ_DECODE_MAX_MODEL_LEN: int = 0
     VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS: bool = True
     VLLM_FLASH_V100_DECODE_PARTITION_SIZE: str | None = None
+    VLLM_FLASH_V100_NOSPEC_LONG_P1024: bool = False
+    VLLM_FLASH_V100_ATTN_ROUTE_TRACE: bool = False
     VLLM_FLASH_V100_DECODE_DENSE_REFERENCE: bool = False
     VLLM_FLASH_V100_DECODE_DENSE_CACHE: bool = False
     VLLM_FLASH_V100_DECODE_USE_PAGED_PREFILL: bool = False
@@ -3222,6 +3224,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_FLASH_V100_DECODE_PARTITION_SIZE": lambda: os.getenv(
         "VLLM_FLASH_V100_DECODE_PARTITION_SIZE"
+    ),
+    # ATTN-A: only cold nospec target q1 NVFP4 G6/D256/Hkv1, block4096.
+    "VLLM_FLASH_V100_NOSPEC_LONG_P1024": lambda: (
+        os.getenv("VLLM_FLASH_V100_NOSPEC_LONG_P1024") == "1"
+    ),
+    # Independent so both OFF and ON arms can record actual graph plans.
+    "VLLM_FLASH_V100_ATTN_ROUTE_TRACE": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_ATTN_ROUTE_TRACE", "0"))
     ),
     "VLLM_FLASH_V100_DECODE_DENSE_REFERENCE": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_DECODE_DENSE_REFERENCE", "0"))

@@ -3813,7 +3813,7 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
     const bool use_split_reduce, const int split_reduce_dim_tile,
     cudaStream_t stream, const int route_seq_len_begin = 0,
     const int route_seq_len_end = 0, const int route_seq_len_final = 0,
-    const bool launch_reduce = true) {
+    const bool launch_reduce = true, int64_t* route_info = nullptr) {
   static_assert(!E4M3_SHARED_LUT ||
                     KV_DTYPE_OVERRIDE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3,
                 "The shared conversion LUT requires an E4M3 specialization");
@@ -3828,6 +3828,17 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
   const int num_heads_kv = k_cache.size(2);
   const int max_num_blocks = block_table.size(1);
   const dim3 partition_grid(batch_size, num_heads_kv, launch_num_partitions);
+  // ATTN-18: host evidence from the exact immutable launch grid. This CPU
+  // out-arg is never passed to a kernel, copied from CUDA, or captured as work.
+  if (route_info != nullptr) {
+    cudaStreamCaptureStatus capture_status;
+    C10_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+    route_info[0] = partition_grid.x;
+    route_info[1] = PARTITION_SIZE;
+    route_info[2] = partition_grid.z;
+    route_info[3] = capture_status != cudaStreamCaptureStatusNone;
+  }
+
   using SmemLayout = std::conditional_t<
       QK_SW_PIPELINE,
       XQATCQKPipelineSmem256WideLayout<PADDED_SMEM, ALIGNED_PADDED_SMEM>,
@@ -5325,7 +5336,8 @@ at::Tensor flash_attention_decode_paged_xqa(
     const float softmax_scale, const int partition_size,
     const int launch_num_partitions, const std::string& kv_cache_dtype,
     const float k_scale, const float v_scale, const int window_size_left,
-    const int window_size_right, const int batch_context_max_seq_len) {
+    const int window_size_right, const int batch_context_max_seq_len,
+    const std::optional<at::Tensor>& route_info) {
   TORCH_CHECK(q.is_cuda(), "q must be on CUDA");
   TORCH_CHECK(k_cache.is_cuda() && v_cache.is_cuda(),
               "k_cache and v_cache must be on CUDA");
@@ -5406,6 +5418,19 @@ at::Tensor flash_attention_decode_paged_xqa(
   TORCH_CHECK(num_heads_kv > 0 && num_heads_q % num_heads_kv == 0,
               "num_heads_q must be divisible by num_heads_kv");
   const int q_per_kv = num_heads_q / num_heads_kv;
+  int64_t* route_ptr = nullptr;
+  if (route_info.has_value()) {
+    const auto& diag = route_info.value();
+    TORCH_CHECK(diag.device().is_cpu() && diag.scalar_type() == at::kLong &&
+                    diag.is_contiguous() && diag.dim() == 1 && diag.numel() == 4,
+                "route_info must be a contiguous CPU int64 tensor of shape [4]");
+    TORCH_CHECK(is_nvfp4_kv && q.size(0) >= 2 && q.size(0) <= 16 &&
+                    q_per_kv == 6 && num_heads_kv == 1 && k_cache.size(1) == 4096,
+                "route_info is scoped to NVFP4 q1 B2..16/G6/Hkv1/block4096");
+    route_ptr = diag.data_ptr<int64_t>();
+    route_ptr[0] = route_ptr[1] = route_ptr[2] = route_ptr[3] = -1;
+  }
+
   TORCH_CHECK(q_per_kv == 4 || q_per_kv == 6 || q_per_kv == 8,
               "XQA decode supports q_per_kv in {4, 6, 8}, got ", q_per_kv);
   TORCH_CHECK(partition_size == 64 || partition_size == 128 ||
@@ -5523,7 +5548,7 @@ at::Tensor flash_attention_decode_paged_xqa(
         flash_v100::KV_CACHE_DTYPE_NVFP4, false, __half, kHalfP>(                \
         q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,    \
         exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,        \
-        launch_num_partitions, false, 8, stream)
+        launch_num_partitions, false, 8, stream, 0, 0, 0, true, route_ptr)
       if (use_nvfp4_smallq_192) {
         if (partition_size == 256) {
           LAUNCH_NVFP4_SMALLQ_192(256);
@@ -5543,7 +5568,7 @@ at::Tensor flash_attention_decode_paged_xqa(
         flash_v100::KV_CACHE_DTYPE_NVFP4, false, __half, HALF_P>(                \
         q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,    \
         exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,        \
-        launch_num_partitions, false, 8, stream)
+        launch_num_partitions, false, 8, stream, 0, 0, 0, true, route_ptr)
 #define DISPATCH_NVFP4_PARTITION(GROUP_SIZE, HALF_P)                           \
     do {                                                                         \
       if (partition_size == 256) {                                               \

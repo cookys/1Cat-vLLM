@@ -3,6 +3,7 @@
 import os
 from collections import defaultdict
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import Any, NamedTuple
 
@@ -29,6 +30,13 @@ from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.v1.attention.backends.flash_attn_v100_nospec import (
+    attn_runtime_keys,
+    bind_attn_graph,
+    collect_attn_routes,
+    log_attn_routes,
+    validate_attn_replay,
+)
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
@@ -272,6 +280,9 @@ class CudaGraphManager:
         self.is_last_pp_rank = get_pp_group().is_last_rank
 
         self.graphs: dict[BatchExecutionDescriptor, torch.cuda.CUDAGraph] = {}
+        self._attn_route_trace = envs.VLLM_FLASH_V100_ATTN_ROUTE_TRACE
+        self._attn_routes: dict[BatchExecutionDescriptor, list[dict]] = {}
+        self._attn_route_replays: set[tuple[BatchExecutionDescriptor, int]] = set()
         self.pool = current_platform.get_global_graph_pool() if cudagraph_mode else None
 
         self._graphs_captured = False
@@ -337,8 +348,7 @@ class CudaGraphManager:
                             and query_len < self.decode_query_len
                             and num_tokens != query_len
                             and not (
-                                self._sm70_dflash2_q1_batch_graphs
-                                and query_len == 1
+                                self._sm70_dflash2_q1_batch_graphs and query_len == 1
                             )
                         ):
                             # Only single-request tails are admitted (plus
@@ -463,7 +473,14 @@ class CudaGraphManager:
                             # Sync offloader's copy stream before capture.
                             # Finish any pre-capture offloader prefetches.
                             get_offloader().sync_prev_onload()
-                            with torch.cuda.graph(graph, self.pool):
+                            with (
+                                (
+                                    collect_attn_routes()
+                                    if self._attn_route_trace
+                                    else nullcontext(None)
+                                ) as attn_routes,
+                                torch.cuda.graph(graph, self.pool),
+                            ):
                                 forward_fn(CUDAGraphMode.NONE)
                                 # Join offloader's copy stream after forward to avoid
                                 # unjoined stream error. The last layer's start_prefetch
@@ -471,6 +488,15 @@ class CudaGraphManager:
                                 # the next forward pass.
                                 get_offloader().join_after_forward()
                             self.graphs[desc] = graph
+                            if attn_routes:
+                                attn_routes = bind_attn_graph(attn_routes, graph)
+                                self._attn_routes[desc] = attn_routes
+                                log_attn_routes(
+                                    attn_routes,
+                                    phase="capture",
+                                    graph_id=id(graph),
+                                    log=logger.info,
+                                )
                             compilation_counter.num_cudagraph_captured += 1
         self._graphs_captured = True
         return captured_attn_states
@@ -490,7 +516,14 @@ class CudaGraphManager:
             cg_mode=CUDAGraphMode.NONE, num_tokens=num_tokens, num_reqs=num_reqs
         )
 
-    def run_fullgraph(self, desc: BatchExecutionDescriptor):
+    def run_fullgraph(
+        self,
+        desc: BatchExecutionDescriptor,
+        *,
+        live_B: int | None = None,
+        attn_metadata=None,
+        dummy_run: bool = False,
+    ):
         """Replay a captured FULL cudagraph."""
         assert desc.cg_mode == CUDAGraphMode.FULL, (
             f"Expected FULL mode, got {desc.cg_mode}"
@@ -503,7 +536,45 @@ class CudaGraphManager:
         # cannot see. Without this, replay could overwrite static buffers
         # while those copies are still in flight.
         get_offloader().sync_prev_onload()
-        self.graphs[desc].replay()
+        routes = self._attn_routes.get(desc)
+        first_replay = (
+            bool(routes)
+            and not dummy_run
+            and ((desc, live_B) not in self._attn_route_replays)
+        )
+        if first_replay:
+            if not isinstance(live_B, int) or not 0 < live_B <= desc.num_reqs:
+                raise RuntimeError("ATTN_ROUTE V2 missing unpadded live_B")
+            # Re-run the actual candidate lookup using unpadded q1 inputs.
+            # Do not derive the expected graph shape from the selected desc.
+            lookup_desc = self.dispatch(live_B, live_B, 1)
+            if lookup_desc.cg_mode != CUDAGraphMode.FULL:
+                raise RuntimeError("ATTN_ROUTE runtime lookup is not FULL")
+            runtime_keys = attn_runtime_keys(
+                attn_metadata,
+                live_B=live_B,
+                graph_B=lookup_desc.num_reqs,
+                config=self.vllm_config,
+            )
+            validate_attn_replay(
+                routes,
+                attn_metadata,
+                graph=self.graphs[desc],
+                runtime_keys=runtime_keys,
+            )
+        graph = self.graphs[desc]
+        graph.replay()
+        if first_replay:
+            # ATTN-21: one successful host submission per (graph key, live B).
+            log_attn_routes(
+                routes,
+                phase="replay",
+                graph_id=id(graph),
+                live_B=live_B,
+                runtime_keys=runtime_keys,
+                log=logger.info,
+            )
+            self._attn_route_replays.add((desc, live_B))
 
 
 class ModelCudaGraphManager(CudaGraphManager):
@@ -794,10 +865,17 @@ class ModelCudaGraphManager(CudaGraphManager):
         return super().capture(create_forward_fn, progress_bar_desc)
 
     def run_fullgraph(
-        self, desc: BatchExecutionDescriptor
+        self,
+        desc: BatchExecutionDescriptor,
+        *,
+        live_B: int | None = None,
+        attn_metadata=None,
+        dummy_run: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | IntermediateTensors:
         """Replay a captured FULL cudagraph and return hidden states."""
-        super().run_fullgraph(desc)
+        super().run_fullgraph(
+            desc, live_B=live_B, attn_metadata=attn_metadata, dummy_run=dummy_run
+        )
         if not self.is_last_pp_rank:
             assert self.intermediate_tensors is not None
             return self.intermediate_tensors[: desc.num_tokens]

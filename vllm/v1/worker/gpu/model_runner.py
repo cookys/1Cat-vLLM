@@ -1834,7 +1834,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 batch_desc, input_batch.seq_lens_cpu_upper_bound
             )
             self.kv_connector.pre_forward(scheduler_output)
-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            model_output = self.cudagraph_manager.run_fullgraph(
+                batch_desc,
+                live_B=input_batch.num_reqs,
+                attn_metadata=attn_metadata,
+                dummy_run=dummy_run,
+            )
         else:
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(
