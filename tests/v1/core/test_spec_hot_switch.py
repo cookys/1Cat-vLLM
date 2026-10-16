@@ -820,22 +820,25 @@ DRAFT_BS = 16
 MAX_BLOCKS = 8
 
 
+_DEV = "cuda" if torch.cuda.is_available() else "cpu"
+
+
 def _gather(batch_to_req, src_rows, num_blocks, dst, num_reqs_padded):
-    """Run the real _gather_block_tables_kernel on CPU tensors (one group)."""
+    """Run the real _gather_block_tables_kernel on cuda tensors (cpu only if no GPU) (one group)."""
     from vllm.v1.worker.gpu.block_table import _gather_block_tables_kernel
 
-    src = torch.zeros(4, MAX_BLOCKS, dtype=torch.int32)
+    src = torch.zeros(4, MAX_BLOCKS, dtype=torch.int32, device=_DEV)
     for r, ids in src_rows.items():
-        src[r, : len(ids)] = torch.tensor(ids, dtype=torch.int32)
-    nb = torch.zeros(1, 4, dtype=torch.int32)
+        src[r, : len(ids)] = torch.tensor(ids, dtype=torch.int32, device=_DEV)
+    nb = torch.zeros(1, 4, dtype=torch.int32, device=_DEV)
     for r, n in num_blocks.items():
         nb[0, r] = n
-    ptr = lambda t: torch.tensor([t.data_ptr()], dtype=torch.uint64)
+    ptr = lambda t: torch.tensor([t.data_ptr()], dtype=torch.uint64, device=_DEV)
     _gather_block_tables_kernel[(1, num_reqs_padded)](
-        torch.tensor(batch_to_req, dtype=torch.int32),
+        torch.tensor(batch_to_req, dtype=torch.int32, device=_DEV),
         ptr(src),
         ptr(dst),
-        torch.tensor([src.stride(0)], dtype=torch.int64),
+        torch.tensor([src.stride(0)], dtype=torch.int64, device=_DEV),
         nb,
         nb.stride(0),
         len(batch_to_req),
@@ -844,7 +847,7 @@ def _gather(batch_to_req, src_rows, num_blocks, dst, num_reqs_padded):
 
 
 def _dflash_slots(table, positions_per_req):
-    """Run the real _prepare_dflash_inputs_kernel; return (ctx, query) slots."""
+    """Run the real _prepare_dflash_inputs_kernel on cuda tensors (cpu only if no GPU); return (ctx, query) slots on CPU."""
     from vllm.v1.attention.backends.utils import PAD_SLOT_ID
     from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
         _prepare_dflash_inputs_kernel,
@@ -856,27 +859,29 @@ def _dflash_slots(table, positions_per_req):
     for p in positions_per_req:
         qsl.append(qsl[-1] + len(p))
     total = qsl[-1]
-    pos = torch.tensor([x for p in positions_per_req for x in p], dtype=torch.int64)
-    i32 = lambda n, v=0: torch.full((n,), v, dtype=torch.int32)
-    out_ctx = torch.full((total,), 12345, dtype=torch.int64)
-    out_q = torch.full((64,), 12345, dtype=torch.int64)
-    zeros = lambda n: torch.zeros(n, dtype=torch.int64)
+    pos = torch.tensor(
+        [x for p in positions_per_req for x in p], dtype=torch.int64, device=_DEV
+    )
+    i32 = lambda n, v=0: torch.full((n,), v, dtype=torch.int32, device=_DEV)
+    out_ctx = torch.full((total,), 12345, dtype=torch.int64, device=_DEV)
+    out_q = torch.full((64,), 12345, dtype=torch.int64, device=_DEV)
+    zeros = lambda n: torch.zeros(n, dtype=torch.int64, device=_DEV)
     max_reqs = 4
     _prepare_dflash_inputs_kernel[(n_req, 1)](
         i32(64), zeros(64), i32(max_reqs + 1), i32(max_reqs), out_q,
         zeros(total), out_ctx,
         i32(64), zeros(64), i32(64),
-        torch.zeros(8), zeros(8),
-        pos, torch.tensor(qsl, dtype=torch.int32),
-        torch.arange(n_req, dtype=torch.int32),
+        torch.zeros(8, device=_DEV), zeros(8),
+        pos, torch.tensor(qsl, dtype=torch.int32, device=_DEV),
+        torch.arange(n_req, dtype=torch.int32, device=_DEV),
         i32(8, 1), i32(8, 1), i32(n_req, 1), i32(n_req, 0),
-        torch.zeros(8), zeros(8),
+        torch.zeros(8, device=_DEV), zeros(8),
         table, table.stride(0),
         0, DRAFT_BS, nq, nq - 1, max_reqs, 64, 4096, 0,
         SAMPLE_FROM_ANCHOR=False, PAD_SLOT_ID=PAD_SLOT_ID,
         CP_SIZE=1, CP_INTERLEAVE=1, BLOCK_SIZE=32,
     )
-    return out_ctx, out_q
+    return out_ctx.cpu(), out_q.cpu()
 
 
 def test_k0_row_in_mixed_batch_never_writes_draft_kv():
@@ -885,7 +890,7 @@ def test_k0_row_in_mixed_batch_never_writes_draft_kv():
     requests. Its stale pages 9,10 must not survive into the draft table."""
     from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
-    dst = torch.zeros(4, MAX_BLOCKS, dtype=torch.int32)
+    dst = torch.zeros(4, MAX_BLOCKS, dtype=torch.int32, device=_DEV)
     # step N-1: req0 [5,6], req1 [9,10], req2 [7,8]
     _gather(
         [0, 1, 2],
@@ -918,7 +923,7 @@ def test_k0_row_in_mixed_batch_never_writes_draft_kv():
 
 
 def test_all_live_rows_with_blocks_are_copied_unchanged():
-    dst = torch.full((4, MAX_BLOCKS), 99, dtype=torch.int32)
+    dst = torch.full((4, MAX_BLOCKS), 99, dtype=torch.int32, device=_DEV)
     _gather([1, 0], {0: [3], 1: [4, 5, 6]}, {0: 1, 1: 3}, dst, 3)
     assert dst[0, :3].tolist() == [4, 5, 6] and dst[0, 3] == 99  # tail untouched
     assert dst[1, :1].tolist() == [3]
