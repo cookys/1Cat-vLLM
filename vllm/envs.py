@@ -199,6 +199,7 @@ if TYPE_CHECKING:
     VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST: str | None = None
     VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS: bool = True
     VLLM_SM70_DFLASH2_Q1_BATCH_CUDAGRAPHS: bool = False
+    VLLM_SM70_DFLASH2_Q1_BATCH_LONG_GRAPHS: bool = False
     VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST: str | None = None
     VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM: bool = False
     VLLM_SM70_NVFP4_QPN2: bool = False
@@ -1967,6 +1968,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # descriptor set (and graph memory) identical to the base.
     "VLLM_SM70_DFLASH2_Q1_BATCH_CUDAGRAPHS": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_Q1_BATCH_CUDAGRAPHS", "0"))
+    ),
+    # plan 075 M-fix12 E: with the q1 batch graphs above, also capture a
+    # long-context variant of every request-major q1 batch graph whose decode
+    # partition size matches the eager route (1024 from 32768 tokens). Needs
+    # VLLM_SM70_DFLASH2_Q1_BATCH_CUDAGRAPHS=1. Default-off keeps the set as is.
+    "VLLM_SM70_DFLASH2_Q1_BATCH_LONG_GRAPHS": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_Q1_BATCH_LONG_GRAPHS", "0"))
     ),
     "VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST": lambda: os.getenv(
         "VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST", None

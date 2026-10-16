@@ -152,6 +152,19 @@ class BatchExecutionDescriptor:
     num_reqs: int | None  # None means no request padding is needed (PIECEWISE graphs)
     uniform_token_count: int | None = None
     attention_context_bucket: int | None = None
+    # Capture-time sequence length of the dummy requests. Only the M-fix12 E
+    # q1 batch long variants set it: the decode partition size is baked into
+    # the graph from this length, so it must sit on the eager side of the
+    # 32768-token switch.
+    decode_seq_hint: int | None = None
+
+
+# Eager decode switches the XQA partition size from 256 to 1024 at this
+# sequence length (flash_attn_interface._select_default_decode_partition_size,
+# flash_attn_v100._select_default_decode_partition_size). A captured graph keeps
+# the partition size it was captured with, so request-major q1 batches need a
+# separate graph above the switch to reduce in the same order as eager.
+SM70_Q1_BATCH_LONG_SEQ = 32768
 
 
 def _is_compatible(
@@ -512,6 +525,9 @@ class ModelCudaGraphManager(CudaGraphManager):
         self._long_attention_graphs: dict[
             BatchExecutionDescriptor, BatchExecutionDescriptor
         ] = {}
+        self._q1_batch_long_graphs: dict[
+            BatchExecutionDescriptor, BatchExecutionDescriptor
+        ] = {}
         from vllm.v1.attention.ops.sm70_e4m3_long import (
             long_attention_enabled,
             long_attention_graph_contract,
@@ -573,9 +589,59 @@ class ModelCudaGraphManager(CudaGraphManager):
                     scope="process",
                 )
 
+        self._init_q1_batch_long_graphs()
+
+    def _init_q1_batch_long_graphs(self) -> None:
+        """plan 075 M-fix12 E: long-context variants of the q1 batch graphs.
+
+        Every request-major q1 FULL graph (B >= 2) is captured once more with
+        dummy requests at ``SM70_Q1_BATCH_LONG_SEQ`` tokens, so the XQA decode
+        plan picks the 1024-token partition the eager route uses from that
+        length on. Variants are appended after the base graphs and never enter
+        ``_candidates``; ``select_attention_graph`` swaps them in at replay.
+        """
+        if not (
+            self._sm70_dflash2_q1_batch_graphs
+            and envs.VLLM_SM70_DFLASH2_Q1_BATCH_LONG_GRAPHS
+        ):
+            return
+        descs = self._capture_descs.get(CUDAGraphMode.FULL, [])
+        for desc in list(descs):
+            if (
+                desc.uniform_token_count == 1
+                and desc.num_reqs is not None
+                and desc.num_reqs >= 2
+                and desc.num_tokens == desc.num_reqs
+                and desc.decode_seq_hint is None
+            ):
+                variant = replace(desc, decode_seq_hint=SM70_Q1_BATCH_LONG_SEQ)
+                self._q1_batch_long_graphs[desc] = variant
+                descs.append(variant)
+        logger.info_once(
+            "SM70 DFlash2 q1 batch long-context graph variants: %d at seq=%d.",
+            len(self._q1_batch_long_graphs),
+            SM70_Q1_BATCH_LONG_SEQ,
+            scope="process",
+        )
+
     def select_attention_graph(
         self, desc: BatchExecutionDescriptor, cpu_upper_bounds: torch.Tensor
     ) -> BatchExecutionDescriptor:
+        q1_long = getattr(self, "_q1_batch_long_graphs", {}).get(desc)
+        if q1_long is not None:
+            # Same conservative contract as below: a missing or oversized CPU
+            # hint keeps the base graph (partition 256, full-context launch).
+            if (
+                q1_long not in self.graphs
+                or cpu_upper_bounds.device.type != "cpu"
+                or cpu_upper_bounds.ndim != 1
+                or desc.num_reqs is None
+                or not 0 < cpu_upper_bounds.numel() <= desc.num_reqs
+            ):
+                return desc
+            if int(cpu_upper_bounds.max()) >= SM70_Q1_BATCH_LONG_SEQ:
+                return q1_long
+            return desc
         variant = self._long_attention_graphs.get(desc)
         if variant is None or variant not in self.graphs:
             return desc
@@ -662,6 +728,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                 attn_groups,
                 kv_cache_config,
                 skip_attn=(desc.cg_mode == CUDAGraphMode.PIECEWISE),
+                decode_seq_hint=desc.decode_seq_hint,
             )
 
             def forward_fn(cg_mode: CUDAGraphMode) -> None:
@@ -751,8 +818,16 @@ def prepare_inputs_to_capture(
     attn_groups: list[list[AttentionGroup]],
     kv_cache_config: KVCacheConfig,
     skip_attn: bool = False,
+    decode_seq_hint: int | None = None,
 ) -> CapturedAttentionState:
     input_batch = InputBatch.make_dummy(num_reqs, num_tokens, input_buffers)
+    if decode_seq_hint is not None:
+        # query_start_loc was already built from the query lengths; only the
+        # context length the attention plan sees changes.
+        input_batch.seq_lens.fill_(decode_seq_hint)
+        input_batch.seq_lens_cpu_upper_bound = torch.full(
+            (num_reqs,), decode_seq_hint, dtype=torch.int32
+        )
     input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
     slot_mappings = block_tables.get_dummy_slot_mappings(num_tokens)
     slot_mappings_by_layer = build_slot_mappings_by_layer(
