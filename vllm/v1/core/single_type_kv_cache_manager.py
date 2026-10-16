@@ -790,10 +790,32 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             return 0
         return super().get_num_blocks_to_allocate(request_id, *args, **kwargs)
 
-    def allocate_new_computed_blocks(self, request_id: str, *args, **kwargs) -> None:
+    def allocate_new_computed_blocks(
+        self,
+        request_id: str,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
         if self._skip_k0(request_id):
             return None
-        return super().allocate_new_computed_blocks(request_id, *args, **kwargs)
+        fresh = request_id not in self.num_cached_block
+        super().allocate_new_computed_blocks(
+            request_id,
+            new_computed_blocks,
+            num_local_computed_tokens,
+            num_external_computed_tokens,
+        )
+        if fresh and self.is_draft_group and len(new_computed_blocks) == 0:
+            # plan 075 S2 C1 fix: this K>0 request hit the prefix cache without
+            # the draft group (nospec-era prefix or the N-W capped hit), so the
+            # draft pages covering tokens < hit were NOT written. Mark them as
+            # already cached so cache_blocks() never registers them under a hash:
+            # a draft hash entry must always mean "draft KV written".
+            total = num_local_computed_tokens + num_external_computed_tokens
+            self.num_cached_block[request_id] = max(
+                self.num_cached_block[request_id], total // self.block_size
+            )
 
     def allocate_new_blocks(
         self, request_id: str, *args, **kwargs

@@ -382,11 +382,17 @@ def test_get_computed_blocks_uses_skip_in_both_modes(
 
     cons = new_req("cons", total, consumer_spec_off)
     n_hit = prefill(mgr, cons, total)
-    assert n_hit == 8 * B  # cached in either mode, hit in either mode
+    # plan 075 S2 C1 fix: cached in either mode, hit in either mode. Only a K>0
+    # reader of a nospec-era prefix is capped at N - W (= 99 -> the Mamba state at
+    # 4 * B, this helper chunks 4 blocks) so the target rewrites its draft window;
+    # test_c1_draft_prefix_hit.py covers that path in detail.
+    capped = producer_spec_off and not consumer_spec_off
+    assert n_hit == (4 * B if capped else 8 * B)
     c = mgr.coordinator
     # main layers share the producer's blocks
-    assert [b.block_id for b in c.single_type_managers[0].req_to_blocks["cons"][:8]] == [
-        b.block_id for b in c.single_type_managers[0].req_to_blocks["prod"][:8]
+    n_shared = n_hit // B
+    assert [b.block_id for b in c.single_type_managers[0].req_to_blocks["cons"][:n_shared]] == [
+        b.block_id for b in c.single_type_managers[0].req_to_blocks["prod"][:n_shared]
     ]
     draft = c.single_type_managers[2]
     if consumer_spec_off:
