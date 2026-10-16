@@ -955,3 +955,37 @@ def test_replay_capacity_is_from_runtime_inputs(h):
     with pytest.raises(RuntimeError, match="key-mismatch"):
         m.run_fullgraph(desc, live_B=7, attn_metadata={"layer": c.metadata})
     assert h.state.replays == 0
+
+
+def test_replay_checks_active_units_before_launch(h):
+    m, desc, c = captured_v2_eight(h)
+    # The selected graph and independently recomputed key still match capture.
+    # Only the units of its live active-partitions buffer are inconsistent.
+    c.metadata.flash_v100_decode_active_partition_size = 256
+    with pytest.raises(RuntimeError, match="replay active-buffer unit mismatch"):
+        m.run_fullgraph(desc, live_B=7, attn_metadata={"layer": c.metadata})
+    assert h.state.replays == 0
+    assert not m._attn_route_replays
+    assert not any("phase=replay" in line for line in h.state.logs)
+
+
+def test_legacy_padded_replay_uses_graph_batch_in_lookup_key(h):
+    c = h.case(True, 8)
+    c.prepare()
+    w, fc = graph_wrapper(h, c)
+    fc.batch_descriptor = 8
+    w()
+    entry = w.concrete_cudagraph_entries[8]
+    c.prepare(253953, False)
+    c.metadata.num_actual_tokens = 7
+    c.metadata.seq_lens[-1] = 0
+    c.metadata.seq_lens_cpu[-1] = 0
+    fc.is_dummy_run = False
+    w()
+    assert h.state.replays == 1
+    assert entry.attn_route_replayed == {7}
+    replay = [line for line in h.state.logs if "phase=replay" in line]
+    assert len(replay) == 1
+    assert " graph_B=8 " in replay[0] and " live_B=7 " in replay[0]
+    assert "ws_key=[-1,8,6,256,1024,262144]" in replay[0]
+    assert f" graph_id={id(entry.cudagraph)} " in replay[0]
