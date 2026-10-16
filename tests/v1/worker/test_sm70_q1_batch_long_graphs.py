@@ -169,3 +169,47 @@ def test_dummy_capture_seq_len(monkeypatch):
         assert seen["ub"].tolist() == [want] * n
         # query lengths (and so query_start_loc) are unchanged by the hint
         assert seen["qsl"].tolist() == [0, 1, 2, 3, 4]
+
+
+def _decode_plan(seq_hint):
+    """The plan a q1 decode capture/replay gets for ``seq_hint`` (meta tensors)."""
+    from flash_attn_v100 import flash_attn_interface as fi
+
+    q = torch.empty(4, 6, 256, dtype=torch.float16, device="meta")
+    k_cache = torch.empty(2, 4096, 1, 144, dtype=torch.uint8, device="meta")
+    block_table = torch.empty(4, 64, dtype=torch.int32, device="meta")
+    active = torch.empty(1, dtype=torch.int32, device="meta")
+    # max_model_len 262144 = 64 blocks x 4096; the capture workspace envelope.
+    return fi._get_decode_plan(
+        q,
+        k_cache,
+        block_table,
+        max_seq_len_hint=seq_hint,
+        batch_size_hint=4,
+        workspace_seq_capacity_hint=262144,
+        active_num_partitions=active,
+    )
+
+
+@pytest.mark.parametrize(
+    "hint,partition_size,launch",
+    [
+        (1, 256, 1024),  # base q1 graph: captured with a 1-token dummy
+        (SM70_Q1_BATCH_LONG_SEQ - 1, 256, 1024),
+        (SM70_Q1_BATCH_LONG_SEQ, 1024, 256),  # long variant
+    ],
+)
+def test_decode_plan_at_capture_hint(hint, partition_size, launch):
+    plan = _decode_plan(hint)
+    assert plan.partition_size == partition_size
+    assert plan.launch_num_partitions == launch
+    assert plan.workspace_num_partitions == launch
+
+
+def test_decode_plan_long_variant_covers_254k():
+    plan = _decode_plan(254_000)
+    assert plan.partition_size == 1024
+    assert plan.actual_num_partitions <= 256
+    assert plan.launch_num_partitions == 256
+    # the variant's launch grid covers the full served window
+    assert plan.launch_num_partitions * plan.partition_size >= 262144
