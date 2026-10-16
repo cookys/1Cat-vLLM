@@ -2763,6 +2763,37 @@ def generate_scheduler_kv_cache_config(
     return cfg
 
 
+def get_kv_cache_group_capacity_rows(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> list[dict[str, int | str]]:
+    """Describe resolved group geometry without changing cache admission.
+
+    Counts are the specs' per-request startup bounds, not live allocation or
+    an async scheduling guarantee. Logical block-table length is not an
+    allocation count for aligned Mamba groups (it includes null placeholders).
+    Keep each group's own page units; heterogeneous layouts cannot safely sum
+    these into a common pool budget without checking their allocator layout.
+    """
+    rows: list[dict[str, int | str]] = []
+    for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+        spec = group.kv_cache_spec
+        page_bytes = spec.page_size_bytes
+        request_bytes = spec.max_memory_usage_bytes(vllm_config)
+        rows.append(
+            {
+                "group": group_id,
+                "kind": type(spec).__name__,
+                "layers": len(group.layer_names),
+                "block_tokens": spec.block_size,
+                "page_bytes": page_bytes,
+                "request_blocks": cdiv(request_bytes, page_bytes),
+                "mode": getattr(spec, "mamba_cache_mode", "none"),
+                "speculative_blocks": getattr(spec, "num_speculative_blocks", 0),
+            }
+        )
+    return rows
+
+
 def _report_kv_cache_config(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> None:
@@ -2777,6 +2808,16 @@ def _report_kv_cache_config(
     max_concurrency = get_max_concurrency_for_kv_cache_config(
         vllm_config, kv_cache_config
     )
+
+    for row in get_kv_cache_group_capacity_rows(vllm_config, kv_cache_config):
+        logger.info(
+            "KV_CAPACITY group=%s kind=%s layers=%s block_tokens=%s "
+            "page_bytes=%s request_blocks=%s mode=%s speculative_blocks=%s "
+            "pool_blocks=%s max_model_len=%s basis=spec-startup-bound",
+            row["group"], row["kind"], row["layers"], row["block_tokens"],
+            row["page_bytes"], row["request_blocks"], row["mode"],
+            row["speculative_blocks"], kv_cache_config.num_blocks, max_model_len,
+        )
 
     # GPU KV cache size in tokens = max_concurrency * max_model_len: the total
     # tokens of context the pool can hold at peak utilization. Sourcing this
