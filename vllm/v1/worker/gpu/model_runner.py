@@ -82,6 +82,7 @@ from vllm.v1.worker.gpu.buffer_utils import (
     async_copy_to_gpu,
     set_default_max_concurrency,
 )
+from vllm.v1.worker.gpu import mf12i_trace
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
@@ -1038,10 +1039,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         compilation_counter.num_gpu_runner_capture_triggers += 1
 
+        mf12i_trace.snap("cm:entry")
         start_time = time.perf_counter()
         gc.collect()
         torch.accelerator.empty_cache()
         start_free_gpu_memory = torch.cuda.mem_get_info()[0]
+        mf12i_trace.snap("cm:start")
 
         if self._ple_offload_connector is not None:
             self._ple_offload_connector.signal_dummy_outputs(self.max_num_tokens)
@@ -1050,6 +1053,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         if prepare_decode_graph_model is not None:
             prepare_decode_graph_model()
+        mf12i_trace.snap("cm:after_prepare_decode_graph_model")
         with self.maybe_setup_dummy_loras(self.lora_config):
             captured_attn_states = self.cudagraph_manager.capture(
                 self.model,
@@ -1062,16 +1066,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 has_lora=self.lora_config is not None,
                 use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
             )
+            mf12i_trace.snap("cm:after_main_capture")
             if self.speculator is not None:
                 if isinstance(self.speculator, DraftModelSpeculator):
                     self.speculator.capture()
                 else:
                     self.speculator.capture(captured_attn_states)
+                mf12i_trace.snap("cm:after_speculator_capture")
         if self._ple_offload_connector is not None:
             self._ple_offload_connector.release_outputs()
 
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.cuda.mem_get_info()[0]
+        mf12i_trace.snap("cm:end")
         elapsed_time = end_time - start_time
         cuda_graph_size = start_free_gpu_memory - end_free_gpu_memory
         # This usually takes 5~20 seconds.
