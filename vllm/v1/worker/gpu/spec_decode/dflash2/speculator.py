@@ -12,6 +12,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.worker.gpu import mf12i_trace
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
@@ -753,7 +754,9 @@ class DFlash2Speculator(DFlashSpeculator):
 
     def capture(self) -> None:
         self._require_drafter_resident("capture")
+        mf12i_trace.snap("dflash2:capture_begin")
         super().capture()
+        mf12i_trace.snap("dflash2:after_query_graphs")
         if (
             not (
                 envs.VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH
@@ -808,6 +811,7 @@ class DFlash2Speculator(DFlashSpeculator):
                     slots,
                 )
             self._context_kv_graphs[num_tokens] = graph
+            mf12i_trace.snap("dflash2:context_kv_graph", num_tokens=num_tokens)
             if not pipeline:
                 continue
             assert self._context_target_positions is not None
@@ -830,6 +834,7 @@ class DFlash2Speculator(DFlashSpeculator):
             pipeline,
         )
         self._capture_draft_metadata_graph(shapes)
+        mf12i_trace.snap("dflash2:after_draft_metadata_graph")
 
     def _capture_draft_metadata_graph(self, shapes: list[tuple[int, int]]) -> None:
         from vllm.v1.attention.backends.flash_attn_v100 import (

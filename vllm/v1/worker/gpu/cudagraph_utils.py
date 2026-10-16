@@ -30,6 +30,7 @@ from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.worker.gpu import mf12i_trace
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
@@ -422,11 +423,22 @@ class CudaGraphManager:
                     descs = tqdm(descs, desc=f"{progress_bar_desc} ({mode.name})")
                 with sm70_decode_graph_compilation(mode == CUDAGraphMode.FULL):
                     for desc in descs:
+                        _mf12i_f = dict(
+                            mgr=progress_bar_desc,
+                            mode=mode.name,
+                            desc=str(desc),
+                            num_tokens=desc.num_tokens,
+                            num_reqs=desc.num_reqs,
+                            ctx_bucket=desc.attention_context_bucket,
+                        )
+                        mf12i_trace.snap("desc:begin", **_mf12i_f)
                         # Prepare inputs and get forward function
                         forward_fn, attn_state = create_forward_fn(desc)
+                        mf12i_trace.snap("desc:inputs", **_mf12i_f)
 
                         # Warmup
                         forward_fn(CUDAGraphMode.NONE)
+                        mf12i_trace.snap("desc:warm", **_mf12i_f)
 
                         # Capture
                         logger.debug(
@@ -472,6 +484,7 @@ class CudaGraphManager:
                                 get_offloader().join_after_forward()
                             self.graphs[desc] = graph
                             compilation_counter.num_cudagraph_captured += 1
+                        mf12i_trace.snap("desc:end", **_mf12i_f)
         self._graphs_captured = True
         return captured_attn_states
 
