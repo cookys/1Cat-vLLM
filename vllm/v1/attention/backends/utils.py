@@ -931,6 +931,18 @@ def mamba_get_block_table_tensor(
         )
         # Use int32 for arithmetic to avoid dtype promotion overhead,
         # then convert to int64 for gather (which requires Long indices)
+        if kv_cache_spec.gdn_log_spec_tokens > 0:
+            # G-LOG: one state page per request. The table row has no spec
+            # columns, so gather the current page only and pad to the width the
+            # spec consumers index with (columns >= 1 are never state pages).
+            current = torch.gather(
+                block_table, 1, start_indices.unsqueeze(1).to(torch.int64)
+            )
+            return torch.nn.functional.pad(
+                current,
+                (0, kv_cache_spec.gdn_log_spec_tokens),
+                value=PAD_SLOT_ID,
+            )
         offsets = torch.arange(
             1 + kv_cache_spec.num_speculative_blocks,
             device=block_table.device,

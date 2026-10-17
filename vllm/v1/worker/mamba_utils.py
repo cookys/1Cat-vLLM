@@ -22,6 +22,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.gdn_log import GdnLogLayout, layout_from_mamba_spec
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
@@ -454,6 +455,11 @@ class MambaSpecDecodeGPUContext:
     # Flag to track if metadata has been populated
     is_initialized: bool = False
 
+    # plan 075 G-LOG: layout of the GDN pages and, per state tensor, 1 when it
+    # is a temporal state whose speculative history lives in update logs.
+    glog_layout: GdnLogLayout | None = None
+    state_glog_flags: torch.Tensor | None = None
+
     @classmethod
     def create(
         cls,
@@ -480,6 +486,7 @@ class MambaSpecDecodeGPUContext:
         )
 
         return cls(
+            state_glog_flags=torch.zeros(num_states, dtype=torch.int32, device=device),
             state_base_addrs=torch.zeros(num_states, dtype=torch.int64, device=device),
             state_block_strides=torch.zeros(
                 num_states, dtype=torch.int64, device=device
@@ -559,6 +566,17 @@ class MambaSpecDecodeGPUContext:
         idx = 0
         for group_local_idx, mamba_group_id in enumerate(self.mamba_group_ids):
             layer_names = kv_cache_config.kv_cache_groups[mamba_group_id].layer_names
+            group_spec = kv_cache_config.kv_cache_groups[mamba_group_id].kv_cache_spec
+            group_glog = (
+                isinstance(group_spec, MambaSpec) and group_spec.gdn_log_spec_tokens > 0
+            )
+            if group_glog:
+                group_layout = layout_from_mamba_spec(group_spec)
+                assert self.glog_layout in (None, group_layout), (
+                    "G-LOG needs one page layout across GDN groups, got "
+                    f"{self.glog_layout} and {group_layout}"
+                )
+                self.glog_layout = group_layout
             group_copy_funcs = _get_copy_funcs_for_group(
                 kv_cache_config, mamba_group_id, mamba_state_copy_funcs
             )
@@ -614,6 +632,10 @@ class MambaSpecDecodeGPUContext:
                         self.state_inner_sizes[idx] = (
                             state[0].numel() if state.dim() > 1 else 1
                         )
+                        if group_glog:
+                            assert state.dtype == torch.float32
+                            assert state.stride(0) * 4 == group_spec.page_size_bytes
+                            self.state_glog_flags[idx] = 1
 
                     self.state_group_indices[idx] = group_local_idx
                     idx += 1

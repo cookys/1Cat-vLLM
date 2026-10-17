@@ -16,6 +16,7 @@ from vllm.v1.attention.backend import (
     AttentionCGSupport,
     CommonAttentionMetadata,
 )
+from vllm.v1.gdn_log import layout_from_mamba_spec
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
@@ -369,6 +370,10 @@ def _reshape_kv_cache(
 
             elif isinstance(kv_cache_spec, MambaSpec):
                 has_mamba = True
+                if kv_cache_spec.gdn_log_spec_tokens > 0:
+                    # Final geometry is known here: the log banks and header
+                    # must fit the page that is actually being carved.
+                    layout_from_mamba_spec(kv_cache_spec)
                 state_tensors = []
                 storage_offset_bytes = 0
                 for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):

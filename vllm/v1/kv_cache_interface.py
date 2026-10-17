@@ -675,6 +675,12 @@ class MambaSpec(KVCacheSpec):
     num_speculative_blocks: int = 0
     # PLE short-conv state is replicated; GDN state is TP-sharded.
     tp_replicated: bool = False
+    # plan 075 G-LOG: speculative depth K served from update logs kept inside
+    # the one page of a request (0 = the classic 1 + K snapshot pages, i.e.
+    # ``num_speculative_blocks`` physical pages). When > 0,
+    # ``num_speculative_blocks`` is 0 by construction: K is a *semantic* depth
+    # for state-index widths, not a page count.
+    gdn_log_spec_tokens: int = 0
 
     @property
     def real_page_size_bytes(self) -> int:
@@ -849,6 +855,7 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
             return all(
                 isinstance(spec, MambaSpec)
                 and spec.num_speculative_blocks == one_spec.num_speculative_blocks
+                and spec.gdn_log_spec_tokens == one_spec.gdn_log_spec_tokens
                 for spec in kv_cache_specs.values()
             )
         else:
