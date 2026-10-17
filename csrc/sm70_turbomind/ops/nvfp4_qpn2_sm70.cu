@@ -37,7 +37,7 @@ namespace {
 constexpr int kPrepareThreads = 256;
 constexpr int kQpn2RowsPerCta = 8;
 constexpr int kQpn2MaxRows = 64;
-constexpr int kQpn2DispatchMaxRows = 32;
+constexpr int kQpn2DispatchMaxRows = 64;
 
 __device__ __forceinline__ int qpn2_col_from_lane(int lane) {
   return ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);
