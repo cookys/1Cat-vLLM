@@ -1,7 +1,9 @@
+from vllm.v1.core.sched.s1_mal_trace import trace_step as _s1_mal_trace_step
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
 import os
+import re
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -263,6 +265,17 @@ class Scheduler(SchedulerInterface):
         self.use_eagle = False
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
+        # plan 075 S1: engine-wide spec mode flag (True = draft/verify mode,
+        # the engine's configured behaviour). Only ever read when a new request
+        # is added (Request.spec_off is fixed then); flipping it does not touch
+        # requests that are already in the system. Meaningless (and inert) on
+        # an engine without speculative tokens.
+        self.spec_enabled = True
+        # plan 075 S2: drafter weights mapped on the workers, and the hot-switch
+        # state name (None = derived from spec_enabled / spec_inflight; the
+        # engine-core state machine overrides it).
+        self.drafter_resident = True
+        self.spec_state: str | None = None
         if speculative_config and speculative_config.use_eagle_kv_cache():
             self.use_eagle = True
 
@@ -282,7 +295,11 @@ class Scheduler(SchedulerInterface):
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
             prefix_cache_retention_interval=self.cache_config.prefix_cache_retention_interval,
+            draft_sliding_window_groups=self._has_draft_sliding_window_group(
+                speculative_config
+            ),
         )
+        self._log_and_check_draft_groups(vllm_config, speculative_config)
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None:
@@ -770,7 +787,7 @@ class Scheduler(SchedulerInterface):
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
-                        num_lookahead_tokens=self.num_lookahead_tokens,
+                        num_lookahead_tokens=self._lookahead_tokens_for(request),
                     )
 
                     if new_blocks is not None:
@@ -1098,7 +1115,7 @@ class Scheduler(SchedulerInterface):
                 # of local and remote blocks.
                 limit_lookahead_tokens = load_kv_async and self.use_eagle
                 effective_lookahead_tokens = (
-                    0 if limit_lookahead_tokens else self.num_lookahead_tokens
+                    0 if limit_lookahead_tokens else self._lookahead_tokens_for(request)
                 )
 
                 # Determine if we need to allocate cross-attention blocks.
@@ -1311,6 +1328,7 @@ class Scheduler(SchedulerInterface):
             scheduled_ddtree_payloads=scheduled_ddtree_payloads or None,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
+            skip_draft_propose=self._all_scheduled_spec_off(num_scheduled_tokens),
             preempted_req_ids={req.request_id for req in preempted_reqs},
             # finished_req_ids is an existing state in the scheduler,
             # instead of being newly scheduled in this step.
@@ -1741,6 +1759,7 @@ class Scheduler(SchedulerInterface):
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        _s1_mal_trace_step(self.requests, scheduler_output, model_runner_output)
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
@@ -1778,9 +1797,11 @@ class Scheduler(SchedulerInterface):
         routing_data = None
         routing_offsets: dict[str, int] = {}
         if model_runner_output.routed_experts is not None:
-            re = model_runner_output.routed_experts
-            self.routed_experts_mgr.store_batch(re.routing_data, re.slot_mapping)
-            routing_data = re.routing_data.astype(
+            routed = model_runner_output.routed_experts
+            self.routed_experts_mgr.store_batch(
+                routed.routing_data, routed.slot_mapping
+            )
+            routing_data = routed.routing_data.astype(
                 self.routed_experts_mgr.routed_experts_by_slot.dtype,
                 copy=False,
             )
@@ -2161,8 +2182,10 @@ class Scheduler(SchedulerInterface):
                 # The request may have been finished. Skip.
                 continue
 
-            if request.is_prefill_chunk:
-                # Ignore draft tokens for prefill chunks.
+            if request.is_prefill_chunk or request.spec_off:
+                # Ignore draft tokens for prefill chunks. plan 075 S1: a K=0
+                # request never carries draft tokens, whatever the worker
+                # returned for its row.
                 if request.spec_token_ids:
                     request.spec_token_ids = []
                 continue
@@ -2325,6 +2348,9 @@ class Scheduler(SchedulerInterface):
         else:
             if request.resumable:
                 request.streaming_queue = deque()
+            # plan 075 S1: fix K for the request's whole life from the mode
+            # in force right now.
+            request.spec_off = self.num_spec_tokens > 0 and not self.spec_enabled
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.connector is not None:
@@ -2425,6 +2451,189 @@ class Scheduler(SchedulerInterface):
 
     def set_pause_state(self, pause_state: PauseState) -> None:
         self._pause_state = pause_state
+
+    @staticmethod
+    def _has_draft_sliding_window_group(speculative_config) -> bool:
+        """plan 075 S1: DFlash drafters own the (only) sliding-window KV group."""
+        return bool(speculative_config and speculative_config.use_dflash_family())
+
+    # The DFlash drafter is built with start_layer_id = the target's layer count
+    # (qwen3_dflash.py: ``layers.{layer_idx + start_layer_id}``), so every
+    # drafter attention layer is named ``...layers.<i>...`` with i >= that count
+    # and every target layer has i < it.
+    _LAYER_IDX_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+
+    @classmethod
+    def _check_draft_group_layers(
+        cls, kv_cache_config, draft_group_ids, first_draft_layer_idx: int
+    ) -> None:
+        """plan 075 S1 (D1): every layer of a group marked draft is a drafter layer."""
+        for gid in sorted(draft_group_ids):
+            for name in kv_cache_config.kv_cache_groups[gid].layer_names:
+                m = cls._LAYER_IDX_RE.search(name)
+                # RuntimeError, not assert: this is the startup gate and must
+                # survive ``python -O``.
+                if m is None or int(m.group(1)) < first_draft_layer_idx:
+                    raise RuntimeError(
+                        f"plan075: KV group {gid} is marked as the draft group but "
+                        f"layer {name!r} is not a drafter layer (drafter layers "
+                        f"have layer index >= {first_draft_layer_idx})"
+                    )
+
+    def _log_and_check_draft_groups(self, vllm_config, speculative_config) -> None:
+        draft_ids = sorted(self.kv_cache_manager.coordinator.draft_group_ids)
+        if not draft_ids:
+            return
+        groups = self.kv_cache_config.kv_cache_groups
+        layers = [n for gid in draft_ids for n in groups[gid].layer_names]
+        logger.info_once(
+            "plan075 draft_groups=%s layers=%s", str(draft_ids), str(layers)
+        )
+        if (
+            speculative_config is not None
+            and speculative_config.use_dflash_family()
+            and vllm_config.parallel_config.pipeline_parallel_size == 1
+        ):
+            self._check_draft_group_layers(
+                self.kv_cache_config,
+                draft_ids,
+                vllm_config.model_config.get_num_layers(vllm_config.parallel_config),
+            )
+
+    def _all_scheduled_spec_off(self, num_scheduled_tokens: dict[str, int]) -> bool:
+        """plan 075 S1: True iff the step has rows and every one of them is K=0.
+
+        Only meaningful on a speculative engine (``num_spec_tokens > 0``); on a
+        plain engine there is no drafter to skip.
+        """
+        if self.num_spec_tokens <= 0 or not num_scheduled_tokens:
+            return False
+        return all(self.requests[rid].spec_off for rid in num_scheduled_tokens)
+
+    def _lookahead_tokens_for(self, request: Request) -> int:
+        """plan 075 S1: per-request lookahead; K=0 requests reserve none."""
+        return 0 if request.spec_off else self.num_lookahead_tokens
+
+    def set_spec_enabled(self, enabled: bool) -> bool:
+        """plan 075 S1: flip the engine spec mode for requests added from now on.
+
+        Returns the previous value. Only affects ``Request.spec_off`` of
+        requests added afterwards; requests already in the system keep the K
+        they were added with. Re-sending the current mode is a no-op.
+        """
+        if enabled and self.num_spec_tokens <= 0:
+            raise ValueError(
+                "cannot enable speculative decoding: this engine was started "
+                "without speculative tokens"
+            )
+        prev = self.num_spec_tokens > 0 and self.spec_enabled
+        self.spec_enabled = bool(enabled)
+        return prev
+
+    def count_spec_inflight(self) -> int:
+        """plan 075 S2 F6: requests anywhere in the system that still run K>0.
+
+        Counts running + waiting + skipped_waiting. ``Request.spec_off`` is
+        fixed at add_request and a preempted request keeps it, so a K=7 request
+        that was preempted back to ``waiting`` still counts. Zero on an engine
+        without speculative tokens.
+        """
+        if self.num_spec_tokens <= 0:
+            return 0
+        return sum(
+            1
+            for queue in (self.running, self.waiting, self.skipped_waiting)
+            for r in queue
+            if not r.spec_off
+        )
+
+    def set_drafter_resident(self, resident: bool) -> None:
+        """plan 075 S2: record whether the drafter weights are mapped on the
+        workers (the engine core flips it around ``sleep_tags``/``wake_tags``).
+        """
+        self.drafter_resident = bool(resident)
+
+    def get_spec_mode_info(self) -> dict[str, int | bool | str]:
+        """plan 075 S1/S2: read-only view of the mode, of running requests by K
+        and of how many K>0 requests remain anywhere in the system."""
+        spec_capable = self.num_spec_tokens > 0
+        running_nospec = sum(1 for r in self.running if r.spec_off or not spec_capable)
+        spec_inflight = self.count_spec_inflight()
+        spec_enabled = spec_capable and self.spec_enabled
+        if self.spec_state is not None:
+            state = self.spec_state
+        elif spec_enabled:
+            state = "DFLASH2"
+        else:
+            state = "NOSPEC_DRAINING" if spec_inflight > 0 else "NOSPEC"
+        return {
+            "spec_enabled": spec_enabled,
+            "running_spec": len(self.running) - running_nospec,
+            "running_nospec": running_nospec,
+            "spec_inflight": spec_inflight,
+            "drafter_resident": self.drafter_resident,
+            "state": state,
+        }
+
+    # ---- plan 075 S2: elastic KV pool ----------------------------------
+
+    def kv_pool_spec_blocks(self) -> int:
+        """N_spec: the pool size the scheduler started with (never shrinks
+        below it)."""
+        return self.kv_cache_config.num_blocks
+
+    def kv_pool_blocks(self) -> int:
+        return self.kv_cache_manager.block_pool.num_gpu_blocks
+
+    def grow_kv_pool(self, n_blocks_total: int) -> int:
+        """Grow the block pool to ``n_blocks_total``; the workers must have
+        mapped the memory already (F10). Returns the blocks added."""
+        cap = self.kv_pool_spec_blocks() + self.kv_cache_config.elastic_tail_blocks
+        if n_blocks_total > cap:
+            raise ValueError(f"grow_kv_pool({n_blocks_total}) exceeds N_spec + tail")
+        return self.kv_cache_manager.block_pool.grow(n_blocks_total)
+
+    def shrink_kv_pool(self, n_blocks_total: int) -> int:
+        """Shrink the block pool to ``n_blocks_total`` (>= N_spec). Returns 0
+        on success, else the number of requests-held tail blocks (no change)."""
+        if n_blocks_total < self.kv_pool_spec_blocks():
+            raise ValueError(f"shrink_kv_pool({n_blocks_total}) is below N_spec")
+        return self.kv_cache_manager.block_pool.shrink_to(n_blocks_total)
+
+    def set_kv_fence(self, max_block_id: int | None) -> None:
+        """F13: ``max_block_id`` = N_spec - 1 stops handing out tail blocks
+        (no drain, no preemption); ``None`` lifts the fence."""
+        self.kv_cache_manager.block_pool.set_max_block_id(max_block_id)
+
+    def count_tail_holder_reqs(self) -> int:
+        """Requests that hold at least one block id >= N_spec (D8). Scans
+        ``req_to_blocks``, so only call it while fenced or shrinking."""
+        spec = self.kv_pool_spec_blocks()
+        reqs: set[str] = set()
+        for mgr in self.kv_cache_manager.coordinator.single_type_managers:
+            for req_id, blocks in mgr.req_to_blocks.items():
+                if any(b.block_id >= spec and b.ref_cnt > 0 for b in blocks):
+                    reqs.add(req_id)
+        return len(reqs)
+
+    def get_kv_pool_info(self) -> dict[str, int | None]:
+        pool = self.kv_cache_manager.block_pool
+        spec = self.kv_pool_spec_blocks()
+        return {
+            "pool_blocks": pool.num_gpu_blocks,
+            "spec_blocks": spec,
+            "tail_blocks_max": self.kv_cache_config.elastic_tail_blocks,
+            "fence_max_block_id": pool.max_block_id,
+            "tail_holder_blocks": pool.count_blocks_in_use_above(spec),
+            # D8: requests holding tail blocks; scanned only while fenced
+            "tail_holder_reqs": (
+                self.count_tail_holder_reqs() if pool.max_block_id is not None else None
+            ),
+            "spec_blocks_lost_to_alignment": (
+                self.kv_cache_config.elastic_spec_blocks_lost
+            ),
+            "free_blocks": pool.get_num_free_blocks(),
+        }
 
     def get_num_unfinished_requests(self) -> int:
         if self._pause_state == PauseState.PAUSED_ALL:

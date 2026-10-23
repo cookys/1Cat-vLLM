@@ -1,0 +1,22 @@
+[
+  "/usr/bin/g++-14",
+  "-shared",
+  "/data/bench/explore/d1/s1-v4-A5/build/flash_decode_paged.o",
+  "/data/bench/explore/pv-hmma/harness/native-build-base/temp/kernel/fused_mha_api.o",
+  "/data/bench/explore/pv-hmma/harness/native-build-base/temp/kernel/fused_mha_forward.o",
+  "/data/bench/explore/pv-hmma/harness/native-build-base/temp/kernel/fused_mha_forward_paged.o",
+  "/data/bench/explore/pv-hmma/harness/native-build-base/temp/kernel/fp8_kv_bridge.o",
+  "/data/bench/explore/pv-hmma/harness/native-build-base/temp/kernel/flash_decode_turboquant.o",
+  "/data/bench/explore/pv-hmma/harness/native-build-base/temp/kernel/fused_mha_backward.o",
+  "-L/data/venvs/1cat-main-integp7pr-p8-gvB-integ/lib/python3.12/site-packages/torch/lib",
+  "-L/usr/local/cuda-12.9/lib64",
+  "-lc10",
+  "-ltorch",
+  "-ltorch_cpu",
+  "-ltorch_python",
+  "-lcudart",
+  "-lc10_cuda",
+  "-ltorch_cuda",
+  "-o",
+  "/data/bench/explore/d1/s1-v4-A5/build/lib/flash_attn_v100_cuda.cpython-312-x86_64-linux-gnu.so"
+]

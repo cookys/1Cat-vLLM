@@ -1246,7 +1246,9 @@ def flash_attn_grouped_verify_paged(
     seq_lens = maybe_contiguous(seq_lens)
     out = maybe_contiguous(out)
     workspace = _get_grouped_verify_workspace(q, int(block_table.shape[0]))
-    return flash_attn_v100_cuda.grouped_verify_paged_fwd(
+    from .team_serving import select_native
+    native = select_native(flash_attn_v100_cuda, q, k_cache, v_cache, block_table, seq_lens, kv_cache_dtype, one_pass, _cuda_graph_capture_active())
+    return native.grouped_verify_paged_fwd(
         q,
         k_cache,
         v_cache,

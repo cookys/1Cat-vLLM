@@ -1,0 +1,236 @@
+--- a/kernel/s1_verify.cuh
++++ b/kernel/s1_verify.cuh
+@@ -40,22 +40,31 @@
+   return end<length?end:length;
+ }
+ 
++#include "s1_v4_address.cuh"
++
+ // Publish QK only after every warp has finished reading aliased K.
+-__device__ __forceinline__ void qk_group(half* q,half* k,float* scores,float scale) {
++__device__ __forceinline__ void qk_group(unsigned qbase,unsigned kbase,float* scores,float scale) {
+   int w=threadIdx.x>>5;
+   Acc x0,x1;
+   if(w<6) {
+     volta::fill_fragment(x0,0.f);volta::fill_fragment(x1,0.f);
+     int m=w>>1,n=(w&1)*32;
+-    AFrag a;BCFrag b;
+-    #pragma unroll
+-    for(int d=0;d<256;d+=16) {
+-      a1::a1_load(a,q,m*16,d,256);
+-      a1::a1_load(b,k,n,d,256);
+-      volta::mma_sync(x0,a,b,x0);
+-      a1::a1_load(b,k,n+16,d,256);
+-      volta::mma_sync(x1,a,b,x1);
+-    }
++    v4_qk_step<0>(x0,x1,qbase,kbase);
++    v4_qk_step<16>(x0,x1,qbase,kbase);
++    v4_qk_step<32>(x0,x1,qbase,kbase);
++    v4_qk_step<48>(x0,x1,qbase,kbase);
++    v4_qk_step<64>(x0,x1,qbase,kbase);
++    v4_qk_step<80>(x0,x1,qbase,kbase);
++    v4_qk_step<96>(x0,x1,qbase,kbase);
++    v4_qk_step<112>(x0,x1,qbase,kbase);
++    v4_qk_step<128>(x0,x1,qbase,kbase);
++    v4_qk_step<144>(x0,x1,qbase,kbase);
++    v4_qk_step<160>(x0,x1,qbase,kbase);
++    v4_qk_step<176>(x0,x1,qbase,kbase);
++    v4_qk_step<192>(x0,x1,qbase,kbase);
++    v4_qk_step<208>(x0,x1,qbase,kbase);
++    v4_qk_step<224>(x0,x1,qbase,kbase);
++    v4_qk_step<240>(x0,x1,qbase,kbase);
+     #pragma unroll
+     for(int j=0;j<8;++j){x0.x[j]*=scale;x1.x[j]*=scale;}
+   }
+@@ -65,6 +74,33 @@
+     volta::store_matrix_sync(scores+m*16*ScoreStride+n,x0,ScoreStride,volta::mem_row_major);
+     volta::store_matrix_sync(scores+m*16*ScoreStride+n+16,x1,ScoreStride,volta::mem_row_major);
+   }
++}
++
++template<bool Full>
++__device__ __forceinline__ void v4_softmax_row(Smem& sm,float* scores,half* probs,int t,int valid,int length,int w,int lane,int row) {
++      bool v0=Full || (lane<valid && t+lane<=max(0,length-8)+row/6);
++      bool v1=Full || (lane+32<valid && t+lane+32<=max(0,length-8)+row/6);
++      float s0=v0?scores[row*ScoreStride+lane]:kXQANegInf;
++      float s1=v1?scores[row*ScoreStride+lane+32]:kXQANegInf;
++      float mx=warp_reduce_max(fmaxf(s0,s1));mx=__shfl_sync(0xffffffffu,mx,0);
++      float old=sm.row_max[row],nm=fmaxf(old,mx);
++      float p0=v0?__expf(fmaxf(s0-nm,-80.f)):0.f;
++      float p1=v1?__expf(fmaxf(s1-nm,-80.f)):0.f;
++      float sum=warp_reduce_sum(p0+p1);sum=__shfl_sync(0xffffffffu,sum,0);
++      float a=sum>0.f?__expf(fmaxf(old-nm,-80.f)):1.f;
++      probs[a1::a1_offset(row,lane,PStride)]=__float2half_rn(p0);
++      probs[a1::a1_offset(row,lane+32,PStride)]=__float2half_rn(p1);
++      if(lane==0) {
++        if(sum>0.f){sm.row_sum[row]=sm.row_sum[row]*a+sum;sm.row_max[row]=nm;}
++        sm.row_scale[row]=a;
++      }
++
++}
++template<bool Full>
++__device__ __forceinline__ void v4_softmax(Smem& sm,float* scores,half* probs,int t,int valid,int length,int w,int lane) {
++  #pragma unroll 1
++  for(int row=w;row<Rows;row+=16)
++    v4_softmax_row<Full>(sm,scores,probs,t,valid,length,w,lane,row);
+ }
+ 
+ // Same native launch argument ABI as the old partial kernel. Dispatch checks
+@@ -104,11 +140,22 @@
+   Acc output[3];
+   #pragma unroll
+   for(int m=0;m<3;++m)volta::fill_fragment(output[m],0.f);
++  const unsigned q_shared=static_cast<unsigned>(__cvta_generic_to_shared(sq));
++  const unsigned k_shared=static_cast<unsigned>(__cvta_generic_to_shared(sk));
++  const unsigned p_shared=static_cast<unsigned>(__cvta_generic_to_shared(probs));
++  const unsigned v_shared=static_cast<unsigned>(__cvta_generic_to_shared(sv));
++  const unsigned qk_coordinates=v4_qk_coordinates(w,lane);
++  const unsigned pv_coordinates=v4_pv_coordinates(w,lane);
+   for(int t=start;t<end;t+=N) {
+     int valid=min(N,end-t),vp=__ldg(pages+(t>>12));
+     // Six QK warps run concurrently with ten V producer warps.
+     if(w<6) {
+-      qk_group(sq,sk,scores,qscale);
++      // Keep derived XOR/immediate addresses phase-local; otherwise ptxas
++      // hoists every K-step address across the loop and spills them.
++      unsigned coordinates=qk_coordinates;
++      asm volatile("" : "+r"(coordinates));
++      unsigned qb=q_shared+(coordinates&65535u),kb=k_shared+(coordinates>>16);
++      qk_group(qb,kb,scores,qscale);
+     } else {
+       const int x=tid-192, x1=x+320;
+       const int r0=(x>>5)*4+(x&3), u0=(x>>2)&7;
+@@ -124,25 +171,11 @@
+       if(x<192)a1::raw_store(sv,vr1,r1,u1);
+     }
+     __syncthreads(); // 2: all scores AND V ready; separates named generations.
+-    #pragma unroll
+-    for(int row=w;row<Rows;row+=16) {
+-      bool v0=lane<valid && t+lane<=max(0,length-8)+row/6;
+-      bool v1=lane+32<valid && t+lane+32<=max(0,length-8)+row/6;
+-      float s0=v0?scores[row*ScoreStride+lane]:kXQANegInf;
+-      float s1=v1?scores[row*ScoreStride+lane+32]:kXQANegInf;
+-      float mx=warp_reduce_max(fmaxf(s0,s1));mx=__shfl_sync(0xffffffffu,mx,0);
+-      float old=sm.row_max[row],nm=fmaxf(old,mx);
+-      float p0=v0?__expf(fmaxf(s0-nm,-80.f)):0.f;
+-      float p1=v1?__expf(fmaxf(s1-nm,-80.f)):0.f;
+-      float sum=warp_reduce_sum(p0+p1);sum=__shfl_sync(0xffffffffu,sum,0);
+-      float a=sum>0.f?__expf(fmaxf(old-nm,-80.f)):1.f;
+-      probs[a1::a1_offset(row,lane,PStride)]=__float2half_rn(p0);
+-      probs[a1::a1_offset(row,lane+32,PStride)]=__float2half_rn(p1);
+-      if(lane==0) {
+-        if(sum>0.f){sm.row_sum[row]=sm.row_sum[row]*a+sum;sm.row_max[row]=nm;}
+-        sm.row_scale[row]=a;
+-      }
+-    }
++    // Only interior complete tiles omit validity/causal guards. Last two tiles retain them.
++    if(valid==N && t+N-1<=max(0,length-8))
++      v4_softmax<true>(sm,scores,probs,t,valid,length,w,lane);
++    else
++      v4_softmax<false>(sm,scores,probs,t,valid,length,w,lane);
+     __syncthreads(); // 3: P and scale ready; V published at barrier 2. Scores dead.
+     int next=t+N,nvalid=max(0,min(N,end-next));
+     int np=nvalid?__ldg(pages+(next>>12)):0;
+@@ -151,15 +184,14 @@
+     #pragma unroll
+     for(int m=0;m<3;++m)a1::grouped_verify_scale_output_fragment(output[m],sm.row_scale,m*16);
+     // V fragment reused across all three M16 tiles (A+A1B reloaded it 3x).
+-    #pragma unroll
+-    for(int off=0;off<N;off+=16) {
+-      BRFrag v;AFrag p;a1::a1_load(v,sv,off,w*16,256);
+-      #pragma unroll
+-      for(int m=0;m<3;++m) {
+-        a1::a1_load(p,probs,m*16,off,PStride);
+-        volta::mma_sync(output[m],p,v,output[m]);
+-      }
+-    }
++    unsigned coordinates=pv_coordinates;
++    asm volatile("" : "+r"(coordinates));
++    unsigned pb=p_shared+(coordinates&65535u),vb=v_shared+(coordinates>>16);
++    const unsigned vx=vb^64;
++    v4_pv_step<0>(output,pb,vb,vx);
++    v4_pv_step<16>(output,pb,vb,vx);
++    v4_pv_step<32>(output,pb,vb,vx);
++    v4_pv_step<48>(output,pb,vb,vx);
+     // P is independent: each warp may store Knext after its own PV.
+     if(nvalid)a1::raw_store(sk,nr,r,u);
+     __syncthreads(); // 4: Knext-ready AND PV-dead; also protects final epilogue.
+--- a/kernel/s1_v4_address.cuh
++++ b/kernel/s1_v4_address.cuh
+@@ -0,0 +1,76 @@
++// S1-v4-A: byte-address algebra only. Physical layout and WMMA fragments unchanged.
++__host__ __device__ constexpr unsigned v4_mask(int row) {
++  return ((row&3)|((row>>1)&4))^((row&1)<<2);
++}
++__host__ __device__ constexpr unsigned v4_byte_offset(int row,int col,int stride) {
++  return unsigned(row*stride*2)+((unsigned(col)*2)^(v4_mask(row)*16));
++}
++__host__ __device__ constexpr int v4_a_row(int lane) {
++  return (lane&3)+((lane>>4)&1)*4+((lane>>2)&1)*8;
++}
++__host__ __device__ constexpr int v4_bc_row(int lane) {
++  return (lane&3)+((lane>>4)&1)*4+((lane>>3)&1)*8;
++}
++__host__ __device__ constexpr int v4_v_col(int lane,int warp) {
++  return warp*16+((lane>>3)&1)*8+((lane>>4)&1)*4;
++}
++// Two packed relative byte coordinates replace four live base registers.
++// Every component is <65536 (host-exhaustive contract); shared base is added
++// only in the phase, so no assumption about the dynamic shared base address.
++__host__ __device__ constexpr unsigned v4_qk_coordinates(int warp,int lane) {
++  return v4_byte_offset((warp>>1)*16+v4_a_row(lane),0,256)
++       | (v4_byte_offset((warp&1)*32+v4_bc_row(lane),0,256)<<16);
++}
++__host__ __device__ constexpr unsigned v4_pv_coordinates(int warp,int lane) {
++  return v4_byte_offset(v4_a_row(lane),0,64)
++       | (v4_byte_offset(lane&3,v4_v_col(lane,warp),256)<<16);
++}
++template<int Offset>
++__device__ __forceinline__ uint4 v4_lds128(unsigned address) {
++  uint4 x;
++  asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4+%5];"
++    : "=r"(x.x),"=r"(x.y),"=r"(x.z),"=r"(x.w):"r"(address),"n"(Offset):"memory");
++  return x;
++}
++template<int Offset>
++__device__ __forceinline__ uint2 v4_lds64(unsigned address) {
++  uint2 x;
++  asm volatile("ld.shared.v2.u32 {%0,%1}, [%2+%3];"
++    : "=r"(x.x),"=r"(x.y):"r"(address),"n"(Offset):"memory");
++  return x;
++}
++template<class F,int O>
++__device__ __forceinline__ void v4_load_pair(F& f,unsigned a,unsigned b) {
++  uint4 x=v4_lds128<O>(a),y=v4_lds128<O>(b);
++  f.x[0]=x.x;f.x[1]=x.y;f.x[2]=x.z;f.x[3]=x.w;
++  f.x[4]=y.x;f.x[5]=y.y;f.x[6]=y.z;f.x[7]=y.w;
++}
++template<int K>
++__device__ __forceinline__ void v4_qk_step(Acc& x0,Acc& x1,unsigned qbase,unsigned kbase) {
++  constexpr int low=(K%64)*2, high=(K/64)*128;
++  unsigned qa=qbase^low,qb=qbase^(low+16);
++  unsigned ka=kbase^low,kb=kbase^(low+16);
++  AFrag a;BCFrag b;
++  v4_load_pair<AFrag,high>(a,qa,qb);
++  v4_load_pair<BCFrag,high>(b,ka,kb);
++  volta::mma_sync(x0,a,b,x0);
++  // K row+16 has identical swizzle; use a single immediate, no second address chain.
++  v4_load_pair<BCFrag,high+16*256*2>(b,ka,kb);
++  volta::mma_sync(x1,a,b,x1);
++}
++template<int K,int M>
++__device__ __forceinline__ void v4_pv_m(Acc& out,const BRFrag& v,unsigned pa,unsigned pb) {
++  AFrag p;v4_load_pair<AFrag,M*16*64*2>(p,pa,pb);volta::mma_sync(out,p,v,out);
++}
++template<int K>
++__device__ __forceinline__ void v4_pv_step(Acc (&out)[3],unsigned pbase,unsigned vbase,unsigned vx64) {
++  BRFrag v;
++  uint2 v0=v4_lds64<K*256*2>(vbase);
++  uint2 v1=v4_lds64<(K+4)*256*2>(vbase);
++  uint2 v2=v4_lds64<(K+8)*256*2>(vx64);
++  uint2 v3=v4_lds64<(K+12)*256*2>(vx64);
++  v.x[0]=v0.x;v.x[1]=v0.y;v.x[2]=v1.x;v.x[3]=v1.y;
++  v.x[4]=v2.x;v.x[5]=v2.y;v.x[6]=v3.x;v.x[7]=v3.y;
++  unsigned pa=pbase^(K*2),pb=pbase^((K+8)*2);
++  v4_pv_m<K,0>(out[0],v,pa,pb);v4_pv_m<K,1>(out[1],v,pa,pb);v4_pv_m<K,2>(out[2],v,pa,pb);
++}

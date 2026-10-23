@@ -287,6 +287,8 @@ class CudaGraphManager:
                     if query_len not in self._capture_sizes:
                         self._capture_sizes.append(query_len)
                 self._capture_sizes.sort()
+        if __import__("os").getenv("VLLM_TEAM_MIXED") == "1" and self.decode_query_len == 8 and self.max_num_reqs == 20:
+            self._capture_sizes = sorted(set(self._capture_sizes) | {64, 80, 96, 160})
         self._init_candidates()
 
     def _init_candidates(self) -> None:
@@ -437,6 +439,11 @@ class CudaGraphManager:
                             # Sync offloader's copy stream before capture.
                             # Finish any pre-capture offloader prefetches.
                             get_offloader().sync_prev_onload()
+                            if desc.num_reqs is not None and desc.num_reqs <= 4 and desc.num_reqs in (1, 2, 4):
+                                from flash_attn_v100 import team_route_smallb
+                                team_route_smallb.capture_begin(graph, desc.num_reqs)
+                            from flash_attn_v100 import team_route
+                            team_route.capture_begin(graph)
                             with torch.cuda.graph(graph, self.pool):
                                 forward_fn(CUDAGraphMode.NONE)
                                 # Join offloader's copy stream after forward to avoid
@@ -444,6 +451,9 @@ class CudaGraphManager:
                                 # forks copy_stream, but wait_prefetch only happens in
                                 # the next forward pass.
                                 get_offloader().join_after_forward()
+                            team_route.capture_end(graph)
+                            if desc.num_reqs is not None and desc.num_reqs <= 4 and desc.num_reqs in (1, 2, 4):
+                                team_route_smallb.capture_end(graph)
                             self.graphs[desc] = graph
                             compilation_counter.num_cudagraph_captured += 1
         self._graphs_captured = True
@@ -456,6 +466,7 @@ class CudaGraphManager:
         uniform_token_count: int | None,
     ) -> BatchExecutionDescriptor:
         """Find matching cudagraph descriptor from priority-ordered candidates."""
+        self._team_live_B = num_reqs
         if self._graphs_captured and 0 < num_tokens < len(self._candidates):
             for desc in self._candidates[num_tokens]:
                 if _is_compatible(desc, num_reqs, num_tokens, uniform_token_count):
@@ -478,6 +489,13 @@ class CudaGraphManager:
         # while those copies are still in flight.
         get_offloader().sync_prev_onload()
         self.graphs[desc].replay()
+        if isinstance(self, ModelCudaGraphManager):
+            from flash_attn_v100 import team_route
+            _team_live_B = getattr(self, "_team_live_B", None)
+            team_route.replay(self.graphs[desc], _team_live_B, desc.num_reqs)
+            if _team_live_B is not None and _team_live_B <= 4 and _team_live_B in (1, 2, 4):
+                from flash_attn_v100 import team_route_smallb
+                team_route_smallb.replay(self.graphs[desc], _team_live_B, desc.num_reqs)
 
 
 class ModelCudaGraphManager(CudaGraphManager):

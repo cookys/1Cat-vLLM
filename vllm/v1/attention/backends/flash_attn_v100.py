@@ -6387,7 +6387,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         batched_request_shape = bool(
             self.use_dflash2_batched_grouped_verify
             and self.dflash2_grouped_verify_request_major_abi_version >= 1
-            and num_reqs in (2, 4, 8)
+            and (num_reqs in (2, 4, 8) or (__import__("os").getenv("VLLM_TEAM_MIXED") == "1" and 2 <= num_reqs <= 20))
             and max_query_len == 8
             and num_query_tokens == num_reqs * 8
         )
