@@ -292,6 +292,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
 
     def capture(self) -> None:
+        self._require_drafter_resident("capture")
         logger.info("Capturing model for %s speculator...", self._speculator_name)
         # Padded sample rows must not scatter into a live request during capture.
         self.sample_indices.zero_()
@@ -403,6 +404,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     ) -> torch.Tensor:
+        self._require_drafter_resident("_run_model")
         batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
         with set_forward_context(
             attn_metadata,
@@ -557,6 +559,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_sampled_tokens_cpu: np.ndarray | None = None,
         all_token_ids_cpu: np.ndarray | None = None,
     ) -> torch.Tensor:
+        self._require_drafter_resident("propose")
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
         num_query_tokens = num_reqs * self.num_query_per_req
@@ -806,6 +809,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         positions: torch.Tensor,
         slots: torch.Tensor | list[torch.Tensor | None] | None,
     ) -> None:
+        self._require_drafter_resident("_precompute_context_kv")
         self.model.precompute_and_store_context_kv(hidden_states, positions, slots)
 
     def _get_prepared_context_hidden(

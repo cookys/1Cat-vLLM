@@ -76,6 +76,7 @@ from vllm.v1.attention.backends.gdn_attn import (
     get_registered_gdn_spec_metadata_tensors,
 )
 from vllm.v1.attention.backends.utils import compute_causal_conv1d_metadata
+from vllm.v1.gdn_log import GdnLogLayout, gdn_log_active, layout_from_mamba_spec
 from vllm.v1.worker.gpu.spec_decode import uses_dflash_selector_engine
 
 # Optional ROCm AITER Triton kernels for the GDN decode fast-path.
@@ -2458,6 +2459,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
         )
+        # plan 075 G-LOG: the spec pages hold one snapshot plus update logs, so
+        # the only verifier that can serve them is the packed one.
+        self.gdn_log_enabled = gdn_log_active(vllm_config)
+        self._gdn_log_vllm_config = vllm_config
+        self._gdn_log_layout_cache = None
+        if self.gdn_log_enabled and not self.enable_sm70_dflash2_fused_gdn_verify:
+            raise ValueError(
+                "VLLM_DFLASH2_GDN_LOG=1 needs the packed DFlash2 GDN verifier "
+                "(VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY=1 on sm_70)"
+            )
         self.enable_sm70_dflash2_tp2_gdn_bv2 = bool(
             self.enable_sm70_dflash2_fused_gdn_verify
             and self.tp_size == 2
@@ -5209,6 +5220,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             kv_cache=kv_cache,
         )
 
+    @property
+    def gdn_log_layout(self) -> GdnLogLayout | None:
+        if not self.gdn_log_enabled:
+            return None
+        if self._gdn_log_layout_cache is None:
+            self._gdn_log_layout_cache = layout_from_mamba_spec(
+                self.get_kv_cache_spec(self._gdn_log_vllm_config)
+            )
+        return self._gdn_log_layout_cache
+
     def _can_use_dflash2_packed_gdn_verify(
         self,
         *,
@@ -5219,13 +5240,20 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         ssm_state: torch.Tensor,
         attn_metadata: GDNAttentionMetadata,
     ) -> bool:
-        return bool(
+        can_use = bool(
             self.enable_sm70_dflash2_fused_gdn_verify
             and mixed_qkv is not None
             and attn_metadata.spec_sequence_masks is not None
             and attn_metadata.num_spec_decodes > 0
-            and attn_metadata.num_prefills == 0
-            and attn_metadata.num_decodes == 0
+            # G-LOG has no other verifier, so it also serves the spec rows of
+            # mixed batches (their inputs are gathered contiguous tensors).
+            and (
+                self.gdn_log_enabled
+                or (
+                    attn_metadata.num_prefills == 0
+                    and attn_metadata.num_decodes == 0
+                )
+            )
             and attn_metadata.ddtree_parent_ids is None
             and attn_metadata.spec_query_start_loc is not None
             and attn_metadata.spec_state_indices_tensor is not None
@@ -5246,6 +5274,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and b.is_contiguous()
             and core_attn_out.is_contiguous()
         )
+        if (
+            self.gdn_log_enabled
+            and not can_use
+            and attn_metadata.num_spec_decodes > 0
+        ):
+            # The page holds no per-step snapshots: there is no other verifier
+            # to fall back to, and silently running one would read garbage.
+            raise RuntimeError(
+                "G-LOG: speculative GDN rows reached a route other than the "
+                "packed DFlash2 verifier (DDTree, mixed batch or unsupported "
+                "dtype/stride); refusing to continue"
+            )
+        return can_use
 
     def _forward_dflash2_packed_gdn_verify(
         self,
@@ -5294,6 +5335,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             match_recurrent_schedule=True,
             match_recurrent_numerics=True,
             sm70_tp2_q8_bv2=getattr(self, "enable_sm70_dflash2_tp2_gdn_bv2", False),
+            gdn_log=self.gdn_log_layout,
         )
         return out.transpose(0, 1)
 
@@ -5797,11 +5839,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 assert spec_query_start_loc is not None
                 assert spec_state_indices_tensor is not None
                 assert spec_state_slot_selectors is not None
+                if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
+                    packed_out = core_attn_out
+                else:
+                    # Mixed batch (G-LOG only): spec rows get their own buffer.
+                    packed_out = core_attn_out.new_empty(
+                        (mixed_qkv_spec.shape[0], *core_attn_out.shape[1:])
+                    )
                 core_attn_out_spec = self._forward_dflash2_packed_gdn_verify(
                     mixed_qkv=mixed_qkv_spec,
                     a=a_spec,
                     b=b_spec,
-                    core_attn_out=core_attn_out,
+                    core_attn_out=packed_out,
                     ssm_state=ssm_state,
                     spec_query_start_loc=spec_query_start_loc,
                     spec_state_indices_tensor=spec_state_indices_tensor,

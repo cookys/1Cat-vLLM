@@ -119,6 +119,8 @@ class SchedulerOffloadConfig(NamedTuple):
     offload_prompt_only: bool
     # Worker/state arrays retain original group indices, including scratch.
     num_kv_cache_groups: int
+    retention_interval: int | None = None
+    alignment_tokens: int | None = None
 
     @classmethod
     def from_spec(cls, spec: OffloadingSpec) -> "SchedulerOffloadConfig":
@@ -223,6 +225,8 @@ class SchedulerOffloadConfig(NamedTuple):
             block_size_factor=spec.block_size_factor,
             offload_prompt_only=spec.offload_prompt_only,
             num_kv_cache_groups=len(spec.kv_cache_config.kv_cache_groups),
+            retention_interval=retention_interval,
+            alignment_tokens=alignment_tokens,
         )
 
 
@@ -851,6 +855,39 @@ class OffloadingConnectorScheduler:
 
                 alignment_block_count = group_config.alignment_block_count
                 tail = group_config.sliding_window_size_in_blocks
+                sparse_sw_blocks: set[int] | None = None
+                if (
+                    alignment_block_count is not None
+                    and tail is not None
+                    and self.config.retention_interval is not None
+                    and self.config.alignment_tokens is not None
+                ):
+                    sparse_sw_blocks = set()
+                    off_bs = group_config.offloaded_block_size
+                    align_tok = self.config.alignment_tokens
+                    ret_int = self.config.retention_interval
+                    if ret_int and ret_int > align_tok:
+                        per_ret = ret_int // off_bs
+                        if per_ret > tail:
+                            edge = per_ret
+                            while edge - tail < num_blocks:
+                                for b in range(edge - tail, edge):
+                                    sparse_sw_blocks.add(b)
+                                edge += per_ret
+                    prompt_tok = getattr(req, "num_prompt_tokens", req.num_tokens)
+                    for boundary in (
+                        max(prompt_tok - 1, 0),
+                        prompt_tok,
+                        max(req.num_tokens - 1, 0),
+                        req.num_tokens,
+                        getattr(req, "shared_prefix_boundary", 0),
+                    ):
+                        aligned = boundary // align_tok * align_tok
+                        if aligned <= 0:
+                            continue
+                        right_edge = aligned // off_bs
+                        for b in range(max(right_edge - tail, 0), right_edge):
+                            sparse_sw_blocks.add(b)
 
                 for key_idx, (offload_key, block_id) in enumerate(
                     zip(offload_keys, offload_block_ids)
@@ -860,14 +897,18 @@ class OffloadingConnectorScheduler:
                     # Skip SWA blocks that can never serve a load hit:
                     # within each full-attention alignment segment, only the
                     # trailing `tail` blocks are reachable by
-                    # _sliding_window_lookup. For DeepSeek V4 with 100K
-                    # tokens this reduces SWA stores by ~78%.
+                    # _sliding_window_lookup. When sparse retention is enabled,
+                    # only retain the `tail` blocks at retained boundaries.
                     if alignment_block_count is not None:
                         assert tail is not None
                         abs_block_idx = start_block_idx + key_idx
-                        pos_in_segment = abs_block_idx % alignment_block_count
-                        if pos_in_segment < alignment_block_count - tail:
-                            continue
+                        if sparse_sw_blocks is not None:
+                            if abs_block_idx not in sparse_sw_blocks:
+                                continue
+                        else:
+                            pos_in_segment = abs_block_idx % alignment_block_count
+                            if pos_in_segment < alignment_block_count - tail:
+                                continue
                     new_offload_keys.append(offload_key)
 
             if not new_offload_keys:

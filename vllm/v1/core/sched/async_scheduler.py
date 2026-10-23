@@ -47,8 +47,10 @@ class AsyncScheduler(Scheduler):
             request.num_output_placeholders += 1 + cur_num_spec_tokens
             # Add placeholders for the new draft/spec tokens.
             # We will update the actual spec token ids in the worker process.
+            # plan 075 S1: K=0 requests never get draft placeholders.
             if (
-                request.num_computed_tokens + self.num_spec_tokens
+                not request.spec_off
+                and request.num_computed_tokens + self.num_spec_tokens
                 <= self._drafter_max_model_len
             ):
                 request.spec_token_ids = list(self._spec_token_placeholders)

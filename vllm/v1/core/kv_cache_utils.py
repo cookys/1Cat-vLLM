@@ -2572,6 +2572,100 @@ def get_kv_cache_groups(
     return groups
 
 
+def elastic_tail_layout(
+    page_sizes: Sequence[int], draft_bytes: int, granularity: int
+) -> tuple[int, int]:
+    """plan 075 S2 (A2-3): size the elastic KV tail of one rank.
+
+    ``page_sizes`` holds the per-block bytes of every KV tensor (a block id
+    addresses one page in each of them). The tail may hold as many blocks as
+    the released drafter weights pay for:
+    ``floor(draft_bytes / sum(page_sizes))`` rounded down to a multiple of the
+    boundary, where boundary = lcm over tensors of lcm(page, granularity) /
+    page blocks (16 for a 1.125 MiB page and 2 MiB granularity).
+
+    Returns ``(boundary_blocks, tail_blocks)``.
+    """
+    boundary_blocks = 1
+    for page in page_sizes:
+        boundary_blocks = math.lcm(boundary_blocks, math.lcm(page, granularity) // page)
+    total_page = sum(page_sizes)
+    raw = draft_bytes // total_page if total_page > 0 else 0
+    return boundary_blocks, raw // boundary_blocks * boundary_blocks
+
+
+def apply_elastic_kv_tail(
+    kv_cache_configs: list[KVCacheConfig],
+    draft_weights_bytes: Sequence[int],
+    granularity: int,
+    max_model_len: int | None = None,
+    block_size: int | None = None,
+) -> int:
+    """plan 075 S2 (A2-3): turn per-rank KV configs elastic, in place.
+
+    * ``num_blocks`` (N_spec) is rounded down to a boundary multiple so the
+      always-mapped part ends on a chunk edge, and tensor ``size`` shrinks
+      proportionally;
+    * every tensor gets ``max_size = page * (N_spec + N_tail_max)``, with
+      N_tail_max the smallest tail any rank can pay for (all ranks must agree
+      because the scheduler pool is global);
+    * the scheduler config derived afterwards keeps ``num_blocks = N_spec``.
+
+    With ``max_model_len`` and ``block_size`` given, ``N_spec * block_size``
+    must still hold one ``max_model_len`` request after the alignment, else
+    ``ValueError`` (M3-fix-5: the loss must not silently break the length the
+    server was started with).
+
+    Returns N_tail_max (0 = leave the configs untouched / not elastic).
+    """
+    assert len(kv_cache_configs) == len(draft_weights_bytes)
+    rank_pages: list[list[int]] = []
+    boundary_blocks = 1
+    for cfg in kv_cache_configs:
+        if cfg.num_blocks <= 0 or not cfg.kv_cache_tensors:
+            return 0
+        pages = []
+        for t in cfg.kv_cache_tensors:
+            assert t.size % cfg.num_blocks == 0, "KV tensor is not page * num_blocks"
+            pages.append(t.size // cfg.num_blocks)
+        rank_pages.append(pages)
+        boundary_blocks = math.lcm(
+            boundary_blocks, elastic_tail_layout(pages, 0, granularity)[0]
+        )
+    # Every rank must agree (the scheduler pool is global): take the tail the
+    # poorest rank can pay for, aligned to the common boundary.
+    tail = min(
+        (draft // sum(pages)) // boundary_blocks * boundary_blocks
+        for pages, draft in zip(rank_pages, draft_weights_bytes)
+    )
+    n_spec_old = kv_cache_configs[0].num_blocks
+    assert all(c.num_blocks == n_spec_old for c in kv_cache_configs)
+    n_spec = n_spec_old // boundary_blocks * boundary_blocks
+    if tail <= 0 or n_spec <= 0:
+        return 0
+    if (
+        max_model_len is not None
+        and block_size is not None
+        and n_spec * block_size < max_model_len
+    ):
+        raise ValueError(
+            f"--spec-hot-switch-elastic: aligning N_spec down to the boundary "
+            f"({boundary_blocks} blocks) leaves {n_spec} blocks (before: "
+            f"{n_spec_old}) x block_size {block_size} = {n_spec * block_size} "
+            f"tokens, below max_model_len {max_model_len}; lower max_model_len "
+            f"or raise gpu_memory_utilization"
+        )
+    for cfg, pages in zip(kv_cache_configs, rank_pages):
+        cfg.num_blocks = n_spec
+        for t, page in zip(cfg.kv_cache_tensors, pages):
+            t.size = page * n_spec
+            t.max_size = page * (n_spec + tail)
+        cfg.elastic_tail_blocks = tail
+        cfg.elastic_boundary_blocks = boundary_blocks
+        cfg.elastic_spec_blocks_lost = n_spec_old - n_spec
+    return tail
+
+
 def generate_scheduler_kv_cache_config(
     kv_cache_configs: list[KVCacheConfig],
 ) -> KVCacheConfig:

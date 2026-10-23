@@ -195,6 +195,7 @@ def _dflash2_gdn_group_metadata_kernel(
     USE_STATE_START: tl.constexpr,
     USE_SEQ_LEN_START: tl.constexpr,
     MAMBA_BLOCK_SIZE: tl.constexpr,
+    LOG_ONLY_COL0: tl.constexpr = False,
 ):
     """Write every GDN group's state IDs and the shared graph metadata."""
     group_id = tl.program_id(0)
@@ -226,6 +227,11 @@ def _dflash2_gdn_group_metadata_kernel(
         seq_len = tl.load(seq_lens + rows, mask=live_state_mask, other=0)
         state_columns = columns + tl.maximum((seq_len - 1) // MAMBA_BLOCK_SIZE, 0)
         live_state_mask &= state_columns < block_table_stride
+    if LOG_ONLY_COL0:
+        # G-LOG: a request owns one page per layer. Columns >= 1 of the table
+        # row are not state pages (whatever follows is unallocated), so they
+        # must read as PAD rather than as foreign block ids.
+        live_state_mask &= columns == 0
     state_ids = tl.load(
         block_table + rows * block_table_stride + state_columns,
         mask=live_state_mask,
@@ -2354,6 +2360,7 @@ def prepare_dflash2_gdn_group_metadata(
     ):
         return None
     width = first_builder.num_spec_state_tokens + 1
+    glog_pages = first_builder.kv_cache_spec.gdn_log_spec_tokens > 0
     common_buffers = first_builder._ddtree_fast_common_buffers
     if common_buffers is None:
         return None
@@ -2391,7 +2398,7 @@ def prepare_dflash2_gdn_group_metadata(
             or block_table.dtype != torch.int32
             or block_table.ndim != 2
             or block_table.shape[0] < num_spec_decodes
-            or block_table.shape[1] < width
+            or block_table.shape[1] < (1 if glog_pages else width)
             or not block_table.is_contiguous()
             or state_output.device != num_accepted_tokens.device
             or state_output.dtype != torch.int32
@@ -2429,6 +2436,7 @@ def prepare_dflash2_gdn_group_metadata(
         tuple(table.stride(0) for table in input_tables),
         use_state_start,
         use_seq_len_start,
+        glog_pages,
         first_builder.kv_cache_spec.block_size,
         common_buffers.spec_sequence_masks.data_ptr(),
         common_buffers.spec_token_indx.data_ptr(),
@@ -2483,6 +2491,7 @@ def prepare_dflash2_gdn_group_metadata(
         USE_SEQ_LEN_START=use_seq_len_start,
         MAMBA_BLOCK_SIZE=first_builder.kv_cache_spec.block_size,
         num_warps=1,
+        **({"LOG_ONLY_COL0": True} if glog_pages else {}),
     )
     common_buffers.initialized_key = (
         num_actual_tokens,

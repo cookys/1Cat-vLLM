@@ -552,6 +552,7 @@ class EngineArgs:
     offload_params: set[str] = get_field(PrefetchOffloadConfig, "offload_params")
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
+    spec_hot_switch_elastic: bool = CacheConfig.spec_hot_switch_elastic
     max_num_batched_tokens: int | None = None
     max_num_partial_prefills: int = SchedulerConfig.max_num_partial_prefills
     max_long_partial_prefills: int = SchedulerConfig.max_long_partial_prefills
@@ -1165,6 +1166,9 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--kv-cache-memory-bytes", **cache_kwargs["kv_cache_memory_bytes"]
+        )
+        cache_group.add_argument(
+            "--spec-hot-switch-elastic", **cache_kwargs["spec_hot_switch_elastic"]
         )
         cache_group.add_argument("--kv-cache-dtype", **cache_kwargs["cache_dtype"])
         cache_group.add_argument(
@@ -2007,10 +2011,47 @@ class EngineArgs:
             "enable_prefix_caching must be set by this point"
         )
 
+        if self.spec_hot_switch_elastic and not model_config.enable_cumem_allocator:
+            raise ValueError(
+                "--spec-hot-switch-elastic requires --enable-cumem-allocator "
+                "(the drafter weights are released through the cumem pool)"
+            )
+
+        # plan 075 S2 (D2): with the drafter weights released, the DP dummy-run
+        # propose would hit the drafter_resident gate (RuntimeError). Refuse at
+        # startup instead of skipping the dummy propose: hot switch is TP-only.
+        draft_pool_active = bool(
+            model_config.enable_cumem_allocator
+            and isinstance(self.speculative_config, dict)
+            and self.speculative_config.get("method") == "dflash"
+        )
+        if (
+            self.spec_hot_switch_elastic or draft_pool_active
+        ) and self.data_parallel_size > 1:
+            raise ValueError(
+                "--spec-hot-switch-elastic / the draft_weights cumem pool "
+                "(--enable-cumem-allocator with a dflash speculator) is not "
+                "supported with data parallelism (data_parallel_size > 1): "
+                "the DP dummy-run propose needs the drafter resident"
+            )
+
+        # plan 075 S2 (A2-6): KV connectors / CPU offloading register the KV
+        # tensors with the pool size they saw at startup (N_spec); a tail that
+        # grows later would be invisible to them.
+        if self.spec_hot_switch_elastic and (
+            self.kv_transfer_config is not None or self.kv_offloading_size
+        ):
+            raise ValueError(
+                "--spec-hot-switch-elastic cannot be combined with "
+                "--kv-transfer-config or --kv-offloading-size: they register "
+                "the startup KV pool size"
+            )
+
         cache_config = CacheConfig(
             block_size=self.block_size,  # type: ignore[arg-type]
             gpu_memory_utilization=self.gpu_memory_utilization,
             kv_cache_memory_bytes=self.kv_cache_memory_bytes,
+            spec_hot_switch_elastic=self.spec_hot_switch_elastic,
             cache_dtype=resolved_cache_dtype,  # type: ignore[arg-type]
             is_attention_free=model_config.is_attention_free,
             num_gpu_blocks_override=self.num_gpu_blocks_override,

@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
 
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
@@ -29,6 +30,8 @@ from vllm.v1.kv_cache_interface import (
     TQFullAttentionSpec,
 )
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -98,6 +101,26 @@ class SingleTypeKVCacheManager(ABC):
         # aligned segment (SWA). Initialized lazily by the coordinator after
         # determining the attention groups.
         self.use_eagle = False
+
+        # plan 075 S1: requests that run with K=0 (no draft tokens). Filled by
+        # ``register_request_spec`` (called by KVCacheManager before it touches
+        # the request), cleared in ``free``. A request's entry never changes
+        # while it is alive.
+        self._spec_off_reqs: set[str] = set()
+        # plan 075 S1: set by the coordinator for the EAGLE/DFlash draft
+        # sliding-window group. Managers that implement the K=0 early-out only
+        # act on it when this is True.
+        self.is_draft_group = False
+
+    def register_request_spec(self, request_id: str, spec_off: bool) -> None:
+        """plan 075 S1: record whether this request runs with K=0."""
+        if spec_off:
+            self._spec_off_reqs.add(request_id)
+        else:
+            self._spec_off_reqs.discard(request_id)
+
+    def is_spec_off(self, request_id: str) -> bool:
+        return request_id in self._spec_off_reqs
 
     def take_pending_boundary_state_offloads(
         self,
@@ -395,6 +418,7 @@ class SingleTypeKVCacheManager(ABC):
 
         self.block_pool.free_blocks(ordered_blocks)
         self.num_cached_block.pop(request_id, None)
+        self._spec_off_reqs.discard(request_id)
 
     @abstractmethod
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
@@ -754,6 +778,100 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         super().__init__(kv_cache_spec, **kwargs)
         self.sliding_window = kv_cache_spec.sliding_window
 
+    # plan 075 S1: K=0 requests do not use the draft group, so on the draft
+    # group (``is_draft_group``) the five request-facing entry points below
+    # do nothing for them: no pages reserved, none allocated, nothing cached
+    # or freed. The block table row of such a request is simply empty.
+    def _skip_k0(self, request_id: str) -> bool:
+        return self.is_draft_group and request_id in self._spec_off_reqs
+
+    def get_num_blocks_to_allocate(self, request_id: str, *args, **kwargs) -> int:
+        if self._skip_k0(request_id):
+            return 0
+        return super().get_num_blocks_to_allocate(request_id, *args, **kwargs)
+
+    def allocate_new_computed_blocks(
+        self,
+        request_id: str,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        if self._skip_k0(request_id):
+            return None
+        fresh = request_id not in self.num_cached_block
+        super().allocate_new_computed_blocks(
+            request_id,
+            new_computed_blocks,
+            num_local_computed_tokens,
+            num_external_computed_tokens,
+        )
+        if fresh and self.is_draft_group and len(new_computed_blocks) == 0:
+            # plan 075 S2 C1 fix: this K>0 request hit the prefix cache without
+            # the draft group (nospec-era prefix or the N-W capped hit), so the
+            # draft pages covering tokens < hit were NOT written. Mark them as
+            # already cached so cache_blocks() never registers them under a hash:
+            # a draft hash entry must always mean "draft KV written".
+            total = num_local_computed_tokens + num_external_computed_tokens
+            self.num_cached_block[request_id] = max(
+                self.num_cached_block[request_id], total // self.block_size
+            )
+
+    def allocate_new_blocks(
+        self, request_id: str, *args, **kwargs
+    ) -> list[KVCacheBlock]:
+        if self._skip_k0(request_id):
+            return []
+        return super().allocate_new_blocks(request_id, *args, **kwargs)
+
+    def cache_blocks(
+        self,
+        request: Request,
+        num_tokens: int,
+        alignment_tokens: int | None = None,
+        *,
+        retention_interval: int | None = None,
+        replay_boundaries: Sequence[int] = (),
+    ) -> None:
+        if self._skip_k0(request.request_id):
+            return None
+        num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
+        num_full_blocks = num_tokens // self.block_size
+        if num_cached_blocks >= num_full_blocks:
+            return None
+        boundaries = list(replay_boundaries)
+        if boundary := getattr(request, "shared_prefix_boundary", 0):
+            boundaries.append(boundary)
+        if retention_interval is None and (
+            alignment_tokens is None or alignment_tokens <= self.block_size
+        ):
+            block_mask = None
+        else:
+            block_mask = self.reachable_block_mask(
+                num_cached_blocks,
+                num_full_blocks,
+                alignment_tokens or self.block_size,
+                self.kv_cache_spec,
+                self.use_eagle,
+                retention_interval=retention_interval,
+                reachable_boundaries=boundaries,
+            )
+        self.block_pool.cache_full_blocks(
+            request=request,
+            blocks=self.req_to_blocks[request.request_id],
+            num_cached_blocks=num_cached_blocks,
+            num_full_blocks=num_full_blocks,
+            block_size=self.block_size,
+            kv_cache_group_id=self.kv_cache_group_id,
+            block_mask=block_mask,
+        )
+        self.num_cached_block[request.request_id] = num_full_blocks
+
+    def remove_skipped_blocks(self, request_id: str, *args, **kwargs) -> None:
+        if self._skip_k0(request_id):
+            return None
+        return super().remove_skipped_blocks(request_id, *args, **kwargs)
+
     @classmethod
     def _contiguous_blocks_for_hit(
         cls, window_size: int, block_size: int, use_eagle: bool
@@ -862,22 +980,51 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         alignment_tokens: int,
         kv_cache_spec: KVCacheSpec,
         use_eagle: bool,
+        retention_interval: int | None = None,
+        reachable_boundaries: Sequence[int] = (),
     ) -> list[bool] | None:
-        assert alignment_tokens > kv_cache_spec.block_size
         assert isinstance(kv_cache_spec, SlidingWindowSpec)
-        per_segment = alignment_tokens // kv_cache_spec.block_size
+        block_size = kv_cache_spec.block_size
         need = cls._contiguous_blocks_for_hit(
             window_size=kv_cache_spec.sliding_window,
-            block_size=kv_cache_spec.block_size,
+            block_size=block_size,
             use_eagle=use_eagle,
         )
+        shift = 1 if use_eagle else 0
+        if retention_interval is not None and alignment_tokens % block_size == 0:
+            mask = [False] * (num_blocks - start_block)
+            if retention_interval:
+                if retention_interval <= alignment_tokens and alignment_tokens <= block_size:
+                    return None
+                per_ret = retention_interval // block_size
+                if per_ret <= need:
+                    return None
+                first_edge = (
+                    max(start_block - shift + 1, per_ret) // per_ret * per_ret + shift
+                )
+                while first_edge - need < num_blocks:
+                    for b in range(max(first_edge - need, start_block), min(first_edge, num_blocks)):
+                        if b >= shift:
+                            mask[b - start_block] = True
+                    first_edge += per_ret
+            for boundary in reachable_boundaries:
+                aligned = boundary // alignment_tokens * alignment_tokens
+                if aligned <= 0:
+                    continue
+                right_edge = aligned // block_size + shift
+                for b in range(max(right_edge - need, start_block), min(right_edge, num_blocks)):
+                    if b >= shift:
+                        mask[b - start_block] = True
+            return mask
+        if alignment_tokens <= block_size:
+            return None
+        per_segment = alignment_tokens // block_size
         if need >= per_segment:
             return None
         # The matched run's right edge sits on the aligned boundary block when
         # EAGLE peeks one block past it (shift=1), otherwise on the last block
         # before the boundary (shift=0). A block is reachable iff it falls in
         # the ``need``-wide run ending at some boundary's right edge.
-        shift = 1 if use_eagle else 0
         return [
             i >= shift and (i - shift) % per_segment >= per_segment - need
             for i in range(start_block, num_blocks)
@@ -1177,12 +1324,24 @@ class MambaManager(SingleTypeKVCacheManager):
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
+        # Times align mode saw a required block count below what a request
+        # already holds (tolerated, nothing allocated).
+        self.num_align_shrink_events: int = 0
         if self.mamba_cache_mode == "align":
             # Mapping from request ID to the index of the block
             # allocated in the previous step
             self.last_state_block_idx: dict[str, int] = {}
             # The set of the requests that have been allocated blocks
             self._allocated_block_reqs: set[str] = set()
+
+    def _nspec(self, request_id: str) -> int:
+        """plan 075 S1: speculative blocks this request carries.
+
+        K=0 requests (registered via ``register_request_spec``) carry none; the
+        value is fixed for the request's life, so its block-table layout never
+        shifts under it.
+        """
+        return 0 if request_id in self._spec_off_reqs else self.num_speculative_blocks
 
     @classmethod
     def find_longest_cache_hit(
@@ -1285,6 +1444,7 @@ class MambaManager(SingleTypeKVCacheManager):
         apply_admission_cap: bool = False,
     ) -> int:
         assert isinstance(self.kv_cache_spec, MambaSpec)
+        nspec = self._nspec(request_id)
         if (
             len(new_computed_blocks) > 0
             and new_computed_blocks[-1].block_hash in self.cached_blocks_this_step
@@ -1297,9 +1457,9 @@ class MambaManager(SingleTypeKVCacheManager):
         if self.mamba_cache_mode != "align":
             # Allocate extra `num_speculative_blocks` blocks for
             # speculative decoding (MTP/EAGLE) with linear attention.
-            if self.num_speculative_blocks > 0:
+            if nspec > 0:
                 num_tokens += (
-                    self.kv_cache_spec.block_size * self.num_speculative_blocks
+                    self.kv_cache_spec.block_size * nspec
                 )
             return super().get_num_blocks_to_allocate(
                 request_id,
@@ -1320,7 +1480,7 @@ class MambaManager(SingleTypeKVCacheManager):
             # NOTE(tdouble): this is an over-estimate of how many blocks we need because
             # num_tokens can include draft tokens that will later be rejected.
             num_required_blocks = (
-                cdiv(num_tokens, self.block_size) + self.num_speculative_blocks
+                cdiv(num_tokens, self.block_size) + nspec
             )
             num_new_blocks = (
                 num_required_blocks
@@ -1335,7 +1495,10 @@ class MambaManager(SingleTypeKVCacheManager):
                 else:
                     # First prefill. Allocate 1 block for running state and the
                     # speculative blocks.
-                    num_new_blocks = 1 + self.num_speculative_blocks
+                    num_new_blocks = 1 + nspec
+            # F1: the requirement may shrink below the blocks already held
+            # (async skipped step); never report a negative allocation need.
+            num_new_blocks = max(num_new_blocks, 0)
 
             num_evictable_computed_blocks = self._get_num_evictable_blocks(
                 new_computed_blocks
@@ -1346,11 +1509,12 @@ class MambaManager(SingleTypeKVCacheManager):
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
     ) -> list[KVCacheBlock]:
         assert isinstance(self.kv_cache_spec, MambaSpec)
+        nspec = self._nspec(request_id)
         if self.mamba_cache_mode != "align":
             # Allocate extra `num_speculative_blocks` blocks for
             # speculative decoding (MTP/EAGLE) with linear attention.
-            if self.num_speculative_blocks > 0:
-                num_tokens += self.block_size * self.num_speculative_blocks
+            if nspec > 0:
+                num_tokens += self.block_size * nspec
             return super().allocate_new_blocks(
                 request_id, num_tokens, num_tokens_main_model
             )
@@ -1365,15 +1529,30 @@ class MambaManager(SingleTypeKVCacheManager):
             # NOTE(tdouble): this is an over-estimate of how many blocks we need because
             # num_tokens can include draft tokens that will later be rejected.
             num_required_blocks = (
-                cdiv(num_tokens, self.block_size) + self.num_speculative_blocks
+                cdiv(num_tokens, self.block_size) + nspec
             )
-            if num_required_blocks == len(req_blocks):
+            if num_required_blocks <= len(req_blocks):
+                if num_required_blocks < len(req_blocks):
+                    # Async scheduling can re-present a request (e.g. after a
+                    # skipped step) with fewer placeholder tokens than before,
+                    # so the requirement shrinks below what is already held.
+                    # Keep the extra block and allocate nothing.
+                    self.num_align_shrink_events += 1
+                    logger.warning(
+                        "MAMBA_ALIGN_SHRINK (tolerated) request_id=%s "
+                        "num_tokens=%d num_tokens_main_model=%d block_size=%d "
+                        "num_speculative_blocks=%d len_req_blocks=%d "
+                        "num_required_blocks=%d",
+                        request_id,
+                        num_tokens,
+                        num_tokens_main_model,
+                        self.block_size,
+                        nspec,
+                        len(req_blocks),
+                        num_required_blocks,
+                    )
                 return []
             else:
-                assert num_required_blocks > len(req_blocks), (
-                    "num_required_blocks "
-                    f"{num_required_blocks} < len(req_blocks) {len(req_blocks)}"
-                )
                 prev_block_len = len(req_blocks)
                 blocks_allocated = request_id in self._allocated_block_reqs
                 # Record the last state block
@@ -1381,7 +1560,7 @@ class MambaManager(SingleTypeKVCacheManager):
                     # We always save the running state at the last
                     # (1 + num_speculative_blocks) block
                     self.last_state_block_idx[request_id] = (
-                        prev_block_len - 1 - self.num_speculative_blocks
+                        prev_block_len - 1 - nspec
                     )
                 elif prev_block_len > 0:
                     # When a new request hits the prefix cache, the last block
@@ -1389,7 +1568,7 @@ class MambaManager(SingleTypeKVCacheManager):
                     self.last_state_block_idx[request_id] = prev_block_len - 1
 
                 num_skipped_blocks = (
-                    num_required_blocks - self.num_speculative_blocks - 1
+                    num_required_blocks - nspec - 1
                 )
                 # null blocks
                 if prev_block_len < num_skipped_blocks:
@@ -1403,7 +1582,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 if blocks_allocated:
                     # reuse previous speculative blocks in this step
                     for block_idx in range(
-                        prev_block_len - self.num_speculative_blocks, prev_block_len
+                        prev_block_len - nspec, prev_block_len
                     ):
                         if block_idx < num_skipped_blocks:
                             req_blocks.append(req_blocks[block_idx])
@@ -1414,7 +1593,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 if blocks_allocated:
                     assert num_new_blocks <= 1
                 else:
-                    assert num_new_blocks <= self.num_speculative_blocks + 1
+                    assert num_new_blocks <= nspec + 1
                 new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
                 req_blocks.extend(new_blocks)
                 self._allocated_block_reqs.add(request_id)

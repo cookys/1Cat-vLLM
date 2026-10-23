@@ -45,6 +45,7 @@ from vllm.v1.worker.gpu.attn_utils import (
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mamba_align import (
     preprocess_mamba_align_fused_kernel,
+    run_glog_epoch_flip,
     run_mamba_align_postprocess,
     run_mamba_align_precopy,
 )
@@ -555,6 +556,20 @@ class MambaHybridModelState(DefaultModelState):
                 self.num_accepted_tokens_gpu,
                 self._mamba_state_idx_gpu,
                 num_computed_tokens,
+                idx_mapping,
+            )
+        if (
+            self._align_mode
+            and self._mamba_ctx is not None
+            and self._mamba_ctx.glog_layout is not None
+            and idx_mapping.shape[0] > 0
+        ):
+            # G-LOG: publish this step's update logs. Separate launch, after
+            # every kernel that reads or writes the page this step.
+            run_glog_epoch_flip(
+                self._mamba_ctx,
+                idx_mapping.shape[0],
+                self._mamba_state_idx_gpu,
                 idx_mapping,
             )
 

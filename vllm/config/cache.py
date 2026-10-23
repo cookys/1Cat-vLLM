@@ -182,6 +182,12 @@ class CacheConfig:
     gpu_memory_utilization. Note that kv_cache_memory_bytes
     (when not-None) ignores gpu_memory_utilization"""
 
+    spec_hot_switch_elastic: bool = False
+    """plan 075 S2: let the KV block pool grow into the memory a released
+    drafter frees (nospec mode) and shrink back before the drafter returns.
+    Needs --enable-cumem-allocator (the drafter weights live in the
+    ``draft_weights`` cumem tag). Off = S1 behaviour: fixed-size pool."""
+
     kv_offloading_size: float | None = None
     """Size of the KV cache offloading buffer in GiB. When TP > 1, this is
     the total buffer size summed across all TP ranks. By default, this is set
@@ -208,6 +214,7 @@ class CacheConfig:
         ignored_factors = {
             # Runtime/derived knobs that don't affect compiled graph shape
             "gpu_memory_utilization",
+            "spec_hot_switch_elastic",
             "is_attention_free",
             "num_gpu_blocks_override",
             "enable_prefix_caching",

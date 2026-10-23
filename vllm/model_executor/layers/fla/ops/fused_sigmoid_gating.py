@@ -12,6 +12,7 @@ import os
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.v1.gdn_log import HDR_WORD_EPOCH, LOG_STEPS, GdnLogLayout
 
 from .op import exp
 
@@ -177,6 +178,14 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     QUANTIZE_BETA: tl.constexpr,
     QUANTIZE_STATE_EACH_STEP: tl.constexpr,
     MATCH_RECURRENT_NUMERICS: tl.constexpr,
+    # plan 075 G-LOG (see vllm/v1/gdn_log.py). All offsets are FP32 words from
+    # the start of the page's SSM state.
+    GDN_LOG: tl.constexpr = False,
+    LOG_BANK0: tl.constexpr = 0,
+    LOG_BANK_STRIDE: tl.constexpr = 0,
+    LOG_STEP_STRIDE: tl.constexpr = 0,
+    LOG_EPOCH: tl.constexpr = 0,
+    LOG_STEPS: tl.constexpr = 8,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -224,7 +233,34 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     mask_h = mask_v[:, None] & mask_k[None, :]
 
     b_h = tl.zeros([BV, BK], dtype=tl.float32)
-    if USE_INITIAL_STATE:
+    if GDN_LOG:
+        # One page per request: column 0 of the state indices is the page and
+        # holds H1 (or the canonical state). The previous round left its steps
+        # 1..K in the bank opposite to the one this round writes; replay the
+        # accepted prefix of them onto H1 with the verifier's own FP32 ops.
+        # Columns >= 1 are PAD and are never read.
+        log_page_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq).to(
+            tl.int64
+        )
+        if log_page_idx < 0:
+            return
+        log_page = h0 + log_page_idx * stride_init_state_token
+        log_epoch = tl.load((log_page + LOG_EPOCH).to(tl.pointer_type(tl.int32)))
+        log_bank_w = log_epoch & 1
+        log_w = log_page + LOG_BANK0 + log_bank_w * LOG_BANK_STRIDE
+        log_r = log_page + LOG_BANK0 + (1 - log_bank_w) * LOG_BANK_STRIDE
+        p_h0 = log_page + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+        b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+        n_replay = tl.load(num_accepted_tokens + i_n).to(tl.int32) - 1
+        n_replay = tl.minimum(tl.maximum(n_replay, 0), LOG_STEPS - 1)
+        for s in range(1, n_replay + 1):
+            r_rec = log_r + s * LOG_STEP_STRIDE + i_hv * (1 + K + V)
+            r_decay = tl.load(r_rec)
+            r_key = tl.load(r_rec + 1 + o_k, mask=mask_k, other=0)
+            r_delta = tl.load(r_rec + 1 + K + o_v, mask=mask_v, other=0)
+            b_h *= r_decay
+            b_h += r_delta[:, None] * r_key[None, :]
+    if USE_INITIAL_STATE and not GDN_LOG:
         if IS_CONTINUOUS_BATCHING:
             if IS_SPEC_DECODING:
                 i_t = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
@@ -308,7 +344,13 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         b_q = b_q * scale
         # [BV, BK]
         if not IS_KDA:
-            if MATCH_RECURRENT_NUMERICS:
+            if GDN_LOG:
+                if MATCH_RECURRENT_NUMERICS:
+                    b_decay = exp(b_g)
+                else:
+                    b_decay = tl.exp(b_g)
+                b_h *= b_decay
+            elif MATCH_RECURRENT_NUMERICS:
                 b_h *= exp(b_g)
             else:
                 b_h *= tl.exp(b_g)
@@ -324,7 +366,23 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
         # keep the states for multi-query tokens
-        if INPLACE_FINAL_STATE:
+        if GDN_LOG:
+            # Step 0 is the page state H1. Steps 1..K keep exactly what the
+            # update consumed: the decay, the normalised key and the beta-scaled
+            # delta, so a replay needs no low-precision re-derivation.
+            if i_t == 0:
+                tl.store(
+                    log_page + i_hv * V * K + o_v[:, None] * K + o_k[None, :],
+                    b_h,
+                    mask=mask_h,
+                )
+            else:
+                w_rec = log_w + i_t * LOG_STEP_STRIDE + i_hv * (1 + K + V)
+                tl.store(w_rec + 1 + K + o_v, b_v, mask=mask_v)
+                if i_v == 0:
+                    tl.store(w_rec, b_decay)
+                    tl.store(w_rec + 1 + o_k, b_k, mask=mask_k)
+        elif INPLACE_FINAL_STATE:
             # Load state index and check for invalid entries.
             final_state_idx = tl.load(
                 ssm_state_indices + i_n * stride_indices_seq + i_t
@@ -644,8 +702,13 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
     precomputed_g: torch.Tensor | None = None,
     precomputed_beta: torch.Tensor | None = None,
     sm70_tp2_q8_bv2: bool = False,
+    gdn_log: GdnLogLayout | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Mixed-QKV update that writes into a caller-provided output buffer.
+
+    ``gdn_log`` selects the plan 075 G-LOG state route: one page per request
+    (column 0 of ``ssm_state_indices``) holding H1 plus update logs, instead of
+    one snapshot page per verified token.
 
     ``precomputed_g`` and ``precomputed_beta`` retain the split verifier's
     exact gating materialization while still removing the packed-QKV rearrange.
@@ -720,6 +783,31 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
         stride_indices_seq, stride_indices_tok = ssm_state_indices.stride(0), 1
     else:
         stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
+
+    log_args: dict[str, object] = {}
+    if gdn_log is not None:
+        if (
+            initial_state.dtype != torch.float32
+            or tuple(initial_state.shape[1:]) != (HV, V, K)
+            or (gdn_log.hv, gdn_log.v, gdn_log.k) != (HV, V, K)
+            or initial_state.stride(0) * 4 != gdn_log.page_size_bytes
+            or quantize_state_each_step
+            or num_accepted_tokens is None
+            or ssm_state_indices.ndim != 2
+        ):
+            raise ValueError(
+                "G-LOG verify needs an FP32 [pages, HV, V, K] SSM view with the "
+                "layout's page stride, 2-D state indices, accepted counts and "
+                "no per-step state quantisation"
+            )
+        log_args = dict(
+            GDN_LOG=True,
+            LOG_BANK0=gdn_log.bank0_words_from_ssm,
+            LOG_BANK_STRIDE=gdn_log.bank_stride_words,
+            LOG_STEP_STRIDE=gdn_log.step_words,
+            LOG_EPOCH=gdn_log.header_words_from_ssm + HDR_WORD_EPOCH,
+            LOG_STEPS=LOG_STEPS,
+        )
 
     BK = triton.next_power_of_2(K)
     BV, num_warps, num_stages = _select_fused_sigmoid_launch(
@@ -825,5 +913,6 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
         MATCH_RECURRENT_NUMERICS=match_recurrent_numerics,
         num_warps=num_warps,
         num_stages=num_stages,
+        **log_args,
     )
     return out, final_state

@@ -283,6 +283,21 @@ class Worker(WorkerBase):
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
 
+        # plan 075 S2 (M1-fix-1): the legacy whole-machine sleep must refuse
+        # when the hot switch already released the drafter (switch back to
+        # DFLASH2 first), and otherwise take the drafter weights along.
+        if self._drafter_released():
+            raise RuntimeError(
+                "legacy sleep() refused: the drafter weights are released "
+                "(draft_weights asleep); switch back to DFLASH2 first"
+            )
+        if getattr(self.model_runner, "elastic_kv_regions", None):
+            # plan 075 S2 (F8): the elastic KV lives outside the cumem
+            # kv_cache pool, so a legacy sleep could not free it.
+            raise RuntimeError(
+                "legacy sleep() refused: the KV cache is an elastic region "
+                "(--spec-hot-switch-elastic), not part of the cumem kv_cache pool"
+            )
         free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
 
         # Save the buffers before level 2 sleep
@@ -293,7 +308,9 @@ class Worker(WorkerBase):
             }
 
         allocator = CuMemAllocator.get_instance()
-        allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
+        allocator.sleep(
+            offload_tags=("weights", "draft_weights") if level == 1 else tuple()
+        )
         free_bytes_after_sleep, total = torch.cuda.mem_get_info()
         freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
         used_bytes = total - free_bytes_after_sleep
@@ -308,6 +325,10 @@ class Worker(WorkerBase):
         from vllm.device_allocator.cumem import CuMemAllocator
 
         allocator = CuMemAllocator.get_instance()
+        # plan 075 S2 (M1-fix-1): waking "weights" also wakes the drafter
+        # weights; allocator.wake_up skips already mapped allocations.
+        if tags is not None and "weights" in tags and "draft_weights" not in tags:
+            tags = [*tags, "draft_weights"]
         allocator.wake_up(tags)
 
         # Restore the buffers after level 2 sleep
@@ -320,6 +341,141 @@ class Worker(WorkerBase):
 
         if tags is None or "kv_cache" in tags:
             self.model_runner.post_kv_cache_wake_up()
+
+    def _drafter_released(self) -> bool:
+        """True when the drafter gate is closed (draft_weights asleep)."""
+        spec = getattr(self.model_runner, "speculator", None)
+        return spec is not None and getattr(spec, "drafter_resident", True) is False
+
+    # plan 075 S2: tags that sleep_tags/wake_tags may move. Only the drafter
+    # weights; "weights" / "kv_cache" stay on the legacy sleep()/wake_up().
+    _SLEEPABLE_TAGS = frozenset({"draft_weights"})
+
+    def _check_sleepable_tags(self, tags: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+        tags = tuple(tags)
+        bad = [t for t in tags if t not in self._SLEEPABLE_TAGS]
+        if not tags or bad:
+            raise ValueError(
+                f"sleep_tags/wake_tags only accept {sorted(self._SLEEPABLE_TAGS)}, "
+                f"got {list(tags)}"
+            )
+        return tags
+
+    def sleep_tags(self, tags: tuple[str, ...] | list[str]) -> dict[str, Any]:
+        """plan 075 S2: back up the given tags to pinned host memory, then unmap
+        them (offload mode). Everything else stays mapped. A second call for
+        the same tags is a no-op that reports ``freed_bytes == 0``.
+        """
+        from vllm.device_allocator.cumem import CuMemAllocator
+        from vllm.utils.platform_utils import is_pin_memory_available
+
+        tags = self._check_sleepable_tags(tags)
+        if not self.vllm_config.model_config.enable_cumem_allocator:
+            raise RuntimeError("sleep_tags requires --enable-cumem-allocator")
+        if not is_pin_memory_available():
+            # A pageable fallback would silently slow wake_tags (F2): fail loud.
+            raise RuntimeError("sleep_tags needs pinned host memory; unavailable")
+        # F12: drain in-flight work before any unmap.
+        torch.cuda.synchronize()
+        allocator = CuMemAllocator.get_instance()
+        free_before = torch.cuda.mem_get_info()[0]
+        mapped_before = allocator.get_current_usage(only_mapped=True)
+        # Close the drafter's entry points before its memory goes away (F7).
+        self.model_runner.set_drafter_resident(False)
+        # If sleep fails midway the gate stays closed (state is half unmapped).
+        allocator.sleep(offload_tags=tags, unmap_tags=tags)
+        free_after = torch.cuda.mem_get_info()[0]
+        return {
+            "tags": list(tags),
+            "freed_bytes": free_after - free_before,
+            "unmapped_bytes": mapped_before
+            - allocator.get_current_usage(only_mapped=True),
+            "free_before": free_before,
+            "free_after": free_after,
+        }
+
+    def wake_tags(self, tags: tuple[str, ...] | list[str]) -> dict[str, Any]:
+        """plan 075 S2: re-map the given tags and copy the host backup back.
+        The drafter gate reopens only after the copy completed.
+        """
+        from vllm.device_allocator.cumem import CuMemAllocator
+
+        tags = self._check_sleepable_tags(tags)
+        allocator = CuMemAllocator.get_instance()
+        free_before = torch.cuda.mem_get_info()[0]
+        mapped_before = allocator.get_current_usage(only_mapped=True)
+        allocator.wake_up(list(tags))
+        torch.cuda.synchronize()
+        self.model_runner.set_drafter_resident(True)
+        free_after = torch.cuda.mem_get_info()[0]
+        return {
+            "tags": list(tags),
+            "mapped_bytes": allocator.get_current_usage(only_mapped=True)
+            - mapped_before,
+            "free_before": free_before,
+            "free_after": free_after,
+        }
+
+    def _s2_teardown(self) -> None:
+        """plan 075 S2: shutdown-time cleanup, best effort (never blocks the
+        shutdown): wake released tags, then close the elastic KV regions."""
+        try:
+            if self.vllm_config.model_config.enable_cumem_allocator:
+                from vllm.device_allocator.cumem import CuMemAllocator
+
+                allocator = CuMemAllocator.get_instance()
+                for tag in sorted(self._SLEEPABLE_TAGS):
+                    if allocator.get_current_usage(tag=tag) > (
+                        allocator.get_current_usage(tag=tag, only_mapped=True)
+                    ):
+                        self.wake_tags((tag,))
+        except Exception:
+            logger.exception("shutdown: waking the released tags failed")
+        runner = getattr(self, "model_runner", None)
+        close = getattr(runner, "close_elastic_kv", None)
+        if close is not None:
+            try:
+                close()
+            except Exception:
+                logger.exception("shutdown: closing the elastic KV regions failed")
+
+    def get_gpu_free_bytes(self) -> dict[str, Any]:
+        """plan 075 S2 (D7): free / total device memory, for the grow precheck."""
+        free, total = torch.cuda.mem_get_info()
+        return {"free_bytes": free, "total_bytes": total}
+
+    def get_elastic_kv_probe(self) -> dict[str, Any]:
+        """plan 075 S2 (A2-3): what the engine needs to size the elastic KV
+        tail: the resident drafter weight bytes (what nospec can give back)
+        and the VMM granularity. Call after load_model, before KV sizing."""
+        from vllm.device_allocator.cumem import CuMemAllocator
+        from vllm.device_allocator.vmm import get_vmm_backend
+
+        if not self.vllm_config.model_config.enable_cumem_allocator:
+            raise RuntimeError("elastic KV needs --enable-cumem-allocator")
+        allocator = CuMemAllocator.get_instance()
+        index = torch.cuda.current_device()
+        return {
+            "draft_weights_bytes": allocator.get_current_usage(
+                tag="draft_weights", only_mapped=True
+            ),
+            "granularity": get_vmm_backend().granularity(index),
+            "device": index,
+        }
+
+    def grow_kv_cache(self, n_blocks_total: int) -> dict[str, Any]:
+        """plan 075 S2 (A2-7): map the elastic KV tail up to ``n_blocks_total``
+        blocks on this rank. Reports mapped size and ``mem_get_info``."""
+        report = self.model_runner.grow_kv_cache(n_blocks_total)
+        free, total = torch.cuda.mem_get_info()
+        return {**report, "free_bytes": free, "total_bytes": total}
+
+    def shrink_kv_cache(self, n_blocks_total: int) -> dict[str, Any]:
+        """plan 075 S2 (A2-7): unmap the elastic KV tail above
+        ``n_blocks_total`` blocks on this rank."""
+        report = self.model_runner.shrink_kv_cache(n_blocks_total)
+        free, total = torch.cuda.mem_get_info()
+        return {**report, "free_bytes": free, "total_bytes": total}
 
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
         if not self.vllm_config.model_config.enable_cumem_allocator:
@@ -471,13 +627,28 @@ class Worker(WorkerBase):
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
-        with (
-            self._maybe_get_memory_pool_context(tag="weights"),
-            set_current_vllm_config(self.vllm_config),
-            # 20 MiB is the minimum PyTorch allows for max_split_size_mb.
-            self._scoped_allocator_max_split(max_split_size_mb=20),
-        ):
-            self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+        if self.use_v2_model_runner:
+            # The V2 runner opens the pools itself: "weights" for the target,
+            # then "draft_weights" for the drafter (plan 075 S2 F4).
+            with (
+                set_current_vllm_config(self.vllm_config),
+                # 20 MiB is the minimum PyTorch allows for max_split_size_mb.
+                self._scoped_allocator_max_split(max_split_size_mb=20),
+            ):
+                self.model_runner.load_model(
+                    load_dummy_weights=load_dummy_weights,
+                    memory_pool_ctx=lambda tag: self._maybe_get_memory_pool_context(
+                        tag=tag
+                    ),
+                )
+        else:
+            with (
+                self._maybe_get_memory_pool_context(tag="weights"),
+                set_current_vllm_config(self.vllm_config),
+                # 20 MiB is the minimum PyTorch allows for max_split_size_mb.
+                self._scoped_allocator_max_split(max_split_size_mb=20),
+            ):
+                self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
 
         if self._ple_offload_enabled:
             self.model_runner._setup_ple_offload(
@@ -736,7 +907,14 @@ class Worker(WorkerBase):
         # related to kv cache connector (e.g. kv cache sharing layers).
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
 
-        with self._maybe_get_memory_pool_context(tag="kv_cache"):
+        # plan 075 S2 (F8): an elastic KV tensor owns its VA through
+        # ElasticKvRegion, so it must not go through the cumem kv_cache pool.
+        elastic = any(t.max_size is not None for t in kv_cache_config.kv_cache_tensors)
+        with (
+            nullcontext()
+            if elastic
+            else self._maybe_get_memory_pool_context(tag="kv_cache")
+        ):
             self.model_runner.initialize_kv_cache(kv_cache_config)
 
         if self.model_config.enable_return_routed_experts:
@@ -1409,6 +1587,11 @@ class Worker(WorkerBase):
         if self._ple_offload_worker_handle is not None:
             self._ple_offload_worker_handle.close()
             self._ple_offload_worker_handle = None
+
+        # plan 075 S2: put the drafter weights back and close the elastic KV
+        # regions first, so the cumem free callback never cuMemUnmap's an
+        # allocation that is already unmapped (mapped=False).
+        self._s2_teardown()
 
         # Release GPU resources held by the model runner so that memory
         # can be reclaimed when running in-process

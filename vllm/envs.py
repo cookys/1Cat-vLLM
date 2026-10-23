@@ -253,6 +253,7 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER: bool = False
     VLLM_SM70_DFLASH2_VERIFY_FASTPATH: bool = False
     VLLM_SM70_DFLASH2_FUSED_GDN_METADATA: bool = False
+    VLLM_DFLASH2_GDN_LOG: bool = False
     VLLM_SM70_MTP4_SHARED_GDN_METADATA: bool = True
     VLLM_SM70_MTP4_FUSED_GDN_METADATA: bool = True
     VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW: bool = False
@@ -2309,6 +2310,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_METADATA", "0"))
     ),
+    # plan 075 G-LOG: keep one FP32 GDN state per request page plus double-bank
+    # FP32 rank-1 update logs inside the page padding instead of 1+K full
+    # snapshots. Default off; the nospec and flag-off paths are unchanged.
+    "VLLM_DFLASH2_GDN_LOG": lambda: bool(int(os.getenv("VLLM_DFLASH2_GDN_LOG", "0"))),
     # Classify native MTP batches (any draft depth; the MTP4 prefix is
     # historical) once per step and share it across GDN cache groups. Set 0 to
     # restore separate per-group GDN metadata builds.

@@ -175,6 +175,17 @@ class EngineClient(ABC):
         """Check whether the engine is sleeping"""
         ...
 
+    async def set_spec_mode(self, mode: str) -> dict:
+        """plan 075 S1: switch spec mode ("dflash2" | "nospec") for new requests.
+
+        Returns ``{"mode": new, "prev": old, "changed": bool}``.
+        """
+        raise NotImplementedError
+
+    async def get_spec_mode(self) -> dict:
+        """plan 075 S1: ``{"mode", "running_spec", "running_nospec"}``."""
+        raise NotImplementedError
+
     @abstractmethod
     async def add_lora(self, lora_request: LoRARequest) -> bool:
         """Load a new LoRA adapter into the engine for future requests."""

@@ -752,6 +752,7 @@ class DFlash2Speculator(DFlashSpeculator):
         return self._record_lookup_width(width, reason)
 
     def capture(self) -> None:
+        self._require_drafter_resident("capture")
         super().capture()
         if (
             not (
@@ -904,6 +905,9 @@ class DFlash2Speculator(DFlashSpeculator):
             or np.any(input_batch.num_scheduled_tokens != self.num_query_per_req)
         ):
             return
+        # Past the K=0 early return: this batch would replay the drafter's
+        # context graph, so it must not run while the drafter is released.
+        self._require_drafter_resident("prepare_target_context")
         if aux_hidden_states:
             hidden_states = self._combine_aux_hidden_states(aux_hidden_states)
         self.hidden_states[:num_tokens].copy_(hidden_states[:num_tokens])
@@ -930,6 +934,7 @@ class DFlash2Speculator(DFlashSpeculator):
         positions: torch.Tensor,
         slots: torch.Tensor | list[torch.Tensor | None] | None,
     ) -> None:
+        self._require_drafter_resident("_precompute_context_kv")
         num_tokens = hidden_states.shape[0]
         prepared = self._prepared_context_batch
         self._prepared_context_batch = None

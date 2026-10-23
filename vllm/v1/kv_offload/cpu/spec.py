@@ -6,7 +6,7 @@ from vllm.config import VllmConfig
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec, SlidingWindowSpec
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     GPULoadStoreSpec,
@@ -75,8 +75,22 @@ class CPUOffloadingSpec(OffloadingSpec):
             for i, group in enumerate(kv_cache_config.kv_cache_groups)
             if group.kv_cache_spec.prefix_cacheable
         }
-        # Equal-sized Mamba/attention blocks need matching checkpoint coverage.
-        # Keep the existing layout for single groups and mixed block geometry.
+        # Equal-sized Mamba/attention blocks need matching checkpoint coverage;
+        # hybrid draft SlidingWindowSpec groups whose block_size divides the
+        # target block_size (e.g. DFlash2 1024 vs 4096) also partition cleanly.
+        non_sw_block_sizes = {
+            group.kv_cache_spec.block_size
+            for group in cacheable_groups.values()
+            if not isinstance(group.kv_cache_spec, SlidingWindowSpec)
+        }
+        target_block_size = (
+            next(iter(non_sw_block_sizes)) if len(non_sw_block_sizes) == 1 else 0
+        )
+        sw_divides_target = target_block_size > 0 and all(
+            target_block_size % group.kv_cache_spec.block_size == 0
+            for group in cacheable_groups.values()
+            if isinstance(group.kv_cache_spec, SlidingWindowSpec)
+        )
         self.partition_by_group = (
             kv_cache_config.num_blocks > 0
             and len(cacheable_groups) > 1
@@ -84,10 +98,8 @@ class CPUOffloadingSpec(OffloadingSpec):
                 isinstance(group.kv_cache_spec, MambaSpec)
                 for group in cacheable_groups.values()
             )
-            and len(
-                {group.kv_cache_spec.block_size for group in cacheable_groups.values()}
-            )
-            == 1
+            and len(non_sw_block_sizes) == 1
+            and sw_divides_target
         )
         # Mamba state slots follow the prefix-cache retention policy (see
         # CacheConfig.prefix_cache_retention_interval): sparse retention keeps
@@ -112,6 +124,7 @@ class CPUOffloadingSpec(OffloadingSpec):
         world_size = vllm_config.parallel_config.world_size
         if self.partition_by_group:
             mamba_groups: set[int] = set()
+            sw_groups: dict[int, SlidingWindowSpec] = {}
             mamba_spec: MambaSpec | None = None
             for i, group in cacheable_groups.items():
                 layer_names = set(group.layer_names)
@@ -127,13 +140,15 @@ class CPUOffloadingSpec(OffloadingSpec):
                 if isinstance(group.kv_cache_spec, MambaSpec):
                     mamba_groups.add(i)
                     mamba_spec = group.kv_cache_spec
+                elif isinstance(group.kv_cache_spec, SlidingWindowSpec):
+                    sw_groups[i] = group.kv_cache_spec
             # Physical storage contains only that group's tensors, rather than
             # every shared GPU tensor for each independently allocated group key.
             self.cpu_page_size_per_worker = sum(self.cpu_group_page_sizes.values())
             token_page = sum(
                 page
                 for i, page in self.cpu_group_page_sizes.items()
-                if i not in mamba_groups
+                if i not in mamba_groups and i not in sw_groups
             )
             state_page = sum(self.cpu_group_page_sizes[i] for i in mamba_groups)
             budget_per_worker = int(cpu_bytes_to_use) // world_size
@@ -152,17 +167,29 @@ class CPUOffloadingSpec(OffloadingSpec):
                     self.state_slots_reference_tokens,
                 )
 
+            def sw_slots(num_token_blocks: int, sw_spec: SlidingWindowSpec) -> int:
+                need = max(1, cdiv(sw_spec.sliding_window, sw_spec.block_size))
+                if self.retention_interval is not None:
+                    return state_slots(num_token_blocks) * need
+                return num_token_blocks * need
+
             def bytes_per_worker(num_token_blocks: int) -> int:
+                sw_bytes = sum(
+                    sw_slots(num_token_blocks, sw_spec) * self.cpu_group_page_sizes[i]
+                    for i, sw_spec in sw_groups.items()
+                )
                 return (
                     num_token_blocks * token_page
                     + state_slots(num_token_blocks) * state_page
+                    + sw_bytes
                 )
 
-            # Largest token-block count whose token pages plus the state slots
+            # Largest token-block count whose token pages plus the state/SW slots
             # the retention mask demands fit the per-worker budget.
             num_blocks = 0
-            if token_page + state_page > 0:
-                num_blocks = budget_per_worker // (token_page + state_page)
+            sw_page = sum(self.cpu_group_page_sizes[i] for i in sw_groups)
+            if token_page + state_page + sw_page > 0:
+                num_blocks = budget_per_worker // (token_page + state_page + sw_page)
                 while bytes_per_worker(num_blocks + 1) <= budget_per_worker:
                     num_blocks += 1
                 while (
@@ -171,9 +198,12 @@ class CPUOffloadingSpec(OffloadingSpec):
                     num_blocks -= 1
             self.num_blocks = num_blocks
             for i in self.cpu_group_page_sizes:
-                self.cpu_group_num_blocks[i] = (
-                    state_slots(num_blocks) if i in mamba_groups else num_blocks
-                )
+                if i in mamba_groups:
+                    self.cpu_group_num_blocks[i] = state_slots(num_blocks)
+                elif i in sw_groups:
+                    self.cpu_group_num_blocks[i] = sw_slots(num_blocks, sw_groups[i])
+                else:
+                    self.cpu_group_num_blocks[i] = num_blocks
         else:
             total_gpu_kv_bytes = sum(t.size for t in kv_cache_config.kv_cache_tensors)
             self.cpu_page_size_per_worker = (

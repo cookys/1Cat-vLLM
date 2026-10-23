@@ -21,6 +21,8 @@ import functools
 import gc
 import os
 import time
+from collections.abc import Callable
+from contextlib import AbstractContextManager, ExitStack, nullcontext
 from copy import deepcopy
 from typing import Any, NamedTuple
 
@@ -32,6 +34,7 @@ from vllm import envs
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.device_allocator.elastic_region import ElasticKvRegion
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
@@ -469,7 +472,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ngram_context_source=ngram_context_source,
         )
 
-    def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
+    def load_model(
+        self,
+        load_dummy_weights: bool = False,
+        *args,
+        memory_pool_ctx: Callable[[str], AbstractContextManager] | None = None,
+        **kwargs,
+    ) -> None:
+        # memory_pool_ctx(tag) opens the cumem pool for that tag. The target
+        # goes in "weights", a DFlash-style drafter in its own "draft_weights"
+        # pool (never nested, plan 075 S2 F4). None = no pools (nullcontext).
+        pool = memory_pool_ctx if memory_pool_ctx is not None else (
+            lambda tag: nullcontext()
+        )
         time_before_load = time.perf_counter()
         if load_dummy_weights:
             self.load_config.load_format = "dummy"
@@ -479,19 +494,37 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             model_loader = get_model_loader(self.vllm_config.load_config)
             logger.info("Loading model from scratch...")
 
-            self.model = model_loader.load_model(
-                vllm_config=self.vllm_config, model_config=self.vllm_config.model_config
+            split_draft_pool = self.speculator is not None and getattr(
+                self.speculator, "supports_draft_weights_pool", False
             )
-            if self.lora_config:
-                self.model = self.load_lora_model(
-                    self.model, self.vllm_config, self.device
+            with ExitStack() as weights_stack:
+                weights_stack.enter_context(pool("weights"))
+                self.model = model_loader.load_model(
+                    vllm_config=self.vllm_config,
+                    model_config=self.vllm_config.model_config,
                 )
+                if self.lora_config:
+                    self.model = self.load_lora_model(
+                        self.model, self.vllm_config, self.device
+                    )
 
-            if self.use_aux_hidden_state_outputs:
-                assert self.speculative_config is not None
-                set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
+                if self.use_aux_hidden_state_outputs:
+                    assert self.speculative_config is not None
+                    set_eagle3_aux_hidden_state_layers(
+                        self.model, self.speculative_config
+                    )
+                if split_draft_pool:
+                    # Close "weights" before opening "draft_weights": pools
+                    # are sequential, never nested, and each tag opens once.
+                    weights_stack.close()
+                    self.speculator.load_model(
+                        self.model, draft_pool_ctx=lambda: pool("draft_weights")
+                    )
+                elif self.speculator is not None:
+                    # Speculators that cannot split their load keep the
+                    # historical behaviour: everything under "weights".
+                    self.speculator.load_model(self.model)
             if self.speculator is not None:
-                self.speculator.load_model(self.model)
                 eplb_models_added = self.eplb.maybe_register_speculator(
                     self.speculator, self.speculative_config, load_dummy_weights
                 )
@@ -537,6 +570,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def get_model(self) -> nn.Module:
         return self.model
+
+    def set_drafter_resident(self, resident: bool) -> None:
+        """plan 075 S2: close / reopen every drafter GPU entry point."""
+        spec = self.speculator
+        if spec is None or not hasattr(spec, "set_drafter_resident"):
+            raise RuntimeError(
+                "no releasable drafter: speculator is missing or does not "
+                "support the draft_weights pool"
+            )
+        spec.set_drafter_resident(resident)
+
+    def _require_drafter_resident(self, entry: str) -> None:
+        spec = self.speculator
+        if spec is not None and not getattr(spec, "drafter_resident", True):
+            raise RuntimeError(
+                f"drafter entry point {entry!r} reached while the drafter "
+                "weights are released (draft_weights asleep)"
+            )
 
     def reload_weights(self, *args, **kwargs) -> None:
         # TODO(Wentao): Use full version instead of import when fully migrated to v2
@@ -668,6 +719,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         self.kv_caches: list[torch.Tensor] = []
+        # plan 075 S2: one ElasticKvRegion per elastic KV tensor (empty when
+        # the config is not elastic).
+        self.elastic_kv_regions: list[ElasticKvRegion] = []
         kv_caches_dict = init_kv_cache(
             self.kv_caches,
             self.compilation_config.static_forward_context,
@@ -677,8 +731,74 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.cache_config.cache_dtype,
             kernel_block_sizes,
             self.vllm_config,
+            elastic_regions=self.elastic_kv_regions,
         )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
+
+    def _elastic_regions(self) -> list[ElasticKvRegion]:
+        regions = getattr(self, "elastic_kv_regions", None)
+        if not regions:
+            raise RuntimeError(
+                "no elastic KV regions: start with --spec-hot-switch-elastic "
+                "and enough released drafter memory for a non-empty tail"
+            )
+        return regions
+
+    def _elastic_report(self) -> dict[str, Any]:
+        regions = self._elastic_regions()
+        return {
+            "mapped_bytes": sum(r.mapped_bytes for r in regions),
+            "mapped_blocks": min(r.mapped_blocks for r in regions),
+            "spec_blocks": regions[0].spec_blocks,
+            "max_blocks": regions[0].max_blocks,
+            "regions": len(regions),
+        }
+
+    def grow_kv_cache(self, n_blocks_total: int) -> dict[str, Any]:
+        """plan 075 S2 (A2-7): map every elastic KV tensor up to
+        ``n_blocks_total`` blocks (zeroed). All-or-nothing across tensors: on
+        failure the ones already grown go back to their previous size."""
+        regions = self._elastic_regions()
+        before = [r.mapped_bytes for r in regions]
+        grown: list[int] = []
+        try:
+            for i, r in enumerate(regions):
+                r.grow_to(n_blocks_total * r.block_bytes)
+                grown.append(i)
+            torch.cuda.synchronize()
+        except BaseException:
+            for i in grown:
+                regions[i].shrink_to(before[i])
+            raise
+        return self._elastic_report()
+
+    def shrink_kv_cache(self, n_blocks_total: int) -> dict[str, Any]:
+        """plan 075 S2 (A2-7): unmap the tail above ``n_blocks_total`` blocks
+        (never below N_spec). The scheduler must already have dropped those
+        blocks (F10)."""
+        regions = self._elastic_regions()
+        torch.cuda.synchronize()
+        failed = []
+        for i, r in enumerate(regions):
+            try:
+                r.shrink_to(n_blocks_total * r.block_bytes)
+            except Exception as exc:  # keep going: report every region's state
+                failed.append(f"region {i}: {exc!r}")
+        report = self._elastic_report()
+        if failed:
+            report["shrink_failed"] = failed  # M3-fix-6: the engine goes to error
+        return report
+
+    def close_elastic_kv(self) -> None:
+        """plan 075 S2: unmap and free the elastic KV regions (teardown). The
+        KV tensors must not be touched afterwards."""
+        regions = getattr(self, "elastic_kv_regions", None)
+        if not regions:
+            return
+        torch.cuda.synchronize()
+        for region in regions:
+            region.close()
+        regions.clear()
 
     def _init_kv_zero_meta(self) -> None:
         """Precompute metadata used to clear newly allocated cache blocks."""
@@ -801,6 +921,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # dummy run the eagle speculator's propose to ensure DP/EP sync.
         if self.speculator is not None:
+            self._require_drafter_resident("dummy_propose")
             assert self.sampler is not None
             mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
             if self.speculator.supports_mm_inputs:
@@ -1515,6 +1636,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # when encoder inputs are scheduled, because this step updates
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
+        if (  # S0D_B1 (plan 075 S0d candidate A): V1 parity, profile run eager (gpu_model_runner.py skip_compiled_profile)
+            is_profile
+            and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+            and envs.VLLM_SM70_FLASH_V100_0DOT3_EAGER_PROFILE_RUN
+            and current_platform.is_device_capability(70)
+        ):
+            skip_compiled = True
 
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
@@ -1756,6 +1884,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
+            skip_draft_propose=scheduler_output.skip_draft_propose,
         )
         self._sm70_v2_mtp_profile_pending = mtp_profile_ctx
 
@@ -1779,6 +1908,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
+        skip_draft_propose = self.execute_model_state.skip_draft_propose
         self.execute_model_state = None
         mtp_profile_ctx = self._sm70_v2_mtp_profile_pending
         self._sm70_v2_mtp_profile_pending = None
@@ -1887,7 +2017,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 time.perf_counter() - mtp_profile_ctx["target_wall_start"]
             ) * 1000.0
 
-        if self.speculator is not None:
+        if self.speculator is not None and skip_draft_propose:
+            # plan 075 S1: every row of this step is a K=0 request, so nobody
+            # consumes a draft next step. Skip the drafter (no context KV
+            # write, no draft graph) and report zero-width drafts. Drafts of
+            # other (K>0) requests live in req_states.draft_tokens and are not
+            # touched. The scheduler never sets the flag for a batch that
+            # contains a K>0 row, including a K>0 prefill chunk.
+            no_drafts = torch.empty(
+                (input_batch.num_reqs, 0),
+                dtype=self.req_states.draft_tokens.dtype,
+                device=self.device,
+            )
+            self.draft_tokens_handler.set_draft_tokens(
+                input_batch, no_drafts, num_draft_tokens=0
+            )
+        elif self.speculator is not None:
+            self._require_drafter_resident("propose")
             assert self.sampler is not None
             requires_host_token_state = bool(
                 getattr(self.speculator, "requires_host_token_state", False)
@@ -2104,3 +2250,5 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     finished_req_ids: set[str]
+    # plan 075 S1: the scheduler marked every row of this step as K=0.
+    skip_draft_propose: bool = False

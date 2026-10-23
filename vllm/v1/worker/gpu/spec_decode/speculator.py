@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
 import numpy as np
@@ -153,7 +154,31 @@ class DraftModelSpeculator(BaseSpeculator):
     ) -> nn.Module:
         pass
 
-    def load_model(self, target_model: nn.Module) -> None:
+    # The drafter weights can live in their own cumem tag so they can be
+    # slept/woken independently of the target (plan 075 S2 P2).
+    supports_draft_weights_pool = True
+
+    # False while the drafter weights are unmapped by ``Worker.sleep_tags``.
+    # Every GPU entry point that reads drafter weights or replays a drafter
+    # graph calls ``_require_drafter_resident`` (fail loud, not a CUDA fault).
+    drafter_resident: bool = True
+
+    def set_drafter_resident(self, resident: bool) -> None:
+        self.drafter_resident = bool(resident)
+
+    def _require_drafter_resident(self, entry: str) -> None:
+        if not self.drafter_resident:
+            raise RuntimeError(
+                f"drafter entry point {entry!r} called while the drafter "
+                "weights are released (draft_weights tag is asleep); the "
+                "scheduler must keep every request at K=0 until wake_tags"
+            )
+
+    def load_model(
+        self,
+        target_model: nn.Module,
+        draft_pool_ctx: Callable[[], AbstractContextManager] | None = None,
+    ) -> None:
         target_attn_layer_names = set(
             get_layers_from_vllm_config(
                 self.vllm_config,
@@ -161,7 +186,10 @@ class DraftModelSpeculator(BaseSpeculator):
             ).keys()
         )
 
-        self.model = self.load_draft_model(target_model, target_attn_layer_names)
+        # Only the draft weights go in the draft pool; the dense draft-logits
+        # buffer is not droppable and is allocated outside it.
+        with draft_pool_ctx() if draft_pool_ctx is not None else nullcontext():
+            self.model = self.load_draft_model(target_model, target_attn_layer_names)
         self._allocate_draft_logits()
         self._validate_local_argmax_reduction()
 

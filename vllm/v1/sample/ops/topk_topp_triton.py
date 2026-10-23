@@ -10,6 +10,11 @@ using Pivot-based Truncation and Selection" By Park et al.
 """
 
 import torch
+import json
+import logging
+
+_SAMPLER_LOG = logging.getLogger(__name__)
+_REFERENCE_ROW_CHUNK = 8
 
 from vllm import envs
 from vllm.platforms import current_platform
@@ -1090,6 +1095,30 @@ def sort_topk_with_vocab_ties(
     return out_values, out_indices
 
 
+def _reference_rows_chunked(logits, k, p, result, rows, *, reasons, mask_value=-float("inf")):
+    """Same reference arithmetic and vocabulary order, bounded row workspace."""
+    from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
+
+    _SAMPLER_LOG.warning("SAMPLER_FALLBACK %s", json.dumps({
+        "reason": reasons, "rows": int(rows.numel()),
+        "input_rows": int(logits.shape[0]), "vocab": int(logits.shape[1]),
+        "chunk_rows": _REFERENCE_ROW_CHUNK,
+    }, sort_keys=True))
+    for start in range(0, rows.numel(), _REFERENCE_ROW_CHUNK):
+        selected = rows[start:start + _REFERENCE_ROW_CHUNK]
+        reference = apply_top_k_top_p_pytorch(
+            logits.index_select(0, selected),
+            k.index_select(0, selected) if k is not None else None,
+            p.index_select(0, selected) if p is not None else None,
+        )
+        if mask_value != float("-inf"):
+            reference.masked_fill_(torch.isneginf(reference), mask_value)
+        result.index_copy_(0, selected, reference)
+        # Drop each batch before constructing the next gathered input.
+        del reference
+    return result
+
+
 def _apply_top_k_top_p_compact(
     logits: torch.Tensor,
     k: torch.Tensor,
@@ -1114,8 +1143,9 @@ def _apply_top_k_top_p_compact(
         values, indices, vocab_size=logits.shape[1]
     )
     cutoff = values.gather(1, (capacity - k.long()).unsqueeze(1))
-    reference_rows = (values[:, 0] >= cutoff[:, 0]) | ~torch.isfinite(values[:, -1])
-    reference_rows |= torch.isnan(values[:, 0])
+    tie_rows = values[:, 0] >= cutoff[:, 0]
+    nonfinite_rows = ~torch.isfinite(values[:, -1]) | torch.isnan(values[:, 0])
+    reference_rows = tie_rows | nonfinite_rows
     values.masked_fill_(values < cutoff, -float("inf"))
     probabilities = values.softmax(dim=-1)
     cumulative = probabilities.cumsum(dim=-1)
@@ -1123,7 +1153,8 @@ def _apply_top_k_top_p_compact(
     # Conservative margin for the different FP32 softmax/cumsum reduction.
     # There are fewer than capacity nonzero probabilities in admitted rows.
     margin = 8 * capacity * torch.finfo(torch.float32).eps
-    reference_rows |= ((cumulative - boundary).abs() <= margin).any(dim=-1)
+    boundary_rows = ((cumulative - boundary).abs() <= margin).any(dim=-1)
+    reference_rows |= boundary_rows
     remove = cumulative <= boundary
     remove[:, -1] = False
     values.masked_fill_(remove, -float("inf"))
@@ -1131,15 +1162,12 @@ def _apply_top_k_top_p_compact(
     result.scatter_(1, indices, values)
 
     if reference_rows.any():
-        from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
-
         rows = reference_rows.nonzero(as_tuple=True)[0]
-        reference = apply_top_k_top_p_pytorch(
-            logits.index_select(0, rows),
-            k.index_select(0, rows),
-            p.index_select(0, rows),
-        )
-        result.index_copy_(0, rows, reference)
+        _reference_rows_chunked(logits, k, p, result, rows, reasons={
+            "shortlist_cutoff_tie": int(tie_rows.sum().item()),
+            "nonfinite": int(nonfinite_rows.sum().item()),
+            "near_top_p_boundary": int(boundary_rows.sum().item()),
+        })
     if mask_value != float("-inf"):
         result.masked_fill_(torch.isneginf(result), mask_value)
     return result
@@ -1290,14 +1318,11 @@ def apply_top_k_top_p_triton(
         # operand. Reuse one ordered row index for logits, parameters and the
         # final scatter without changing the reference's vocabulary tie order.
         reference_indices = reference_rows.nonzero(as_tuple=True)[0]
-        reference_logits = apply_top_k_top_p_pytorch(
-            original_logits.index_select(0, reference_indices),
-            k.index_select(0, reference_indices) if k is not None else None,
-            p.index_select(0, reference_indices) if p is not None else None,
+        _reference_rows_chunked(
+            original_logits, k, p, logits, reference_indices,
+            reasons={"triton_reference_boundary": int(reference_indices.numel())},
+            mask_value=mask_value,
         )
-        if mask_value != float("-inf"):
-            reference_logits.masked_fill_(torch.isneginf(reference_logits), mask_value)
-        logits.index_copy_(0, reference_indices, reference_logits)
     return logits
 
 

@@ -20,6 +20,7 @@ from vllm.model_executor.parameter import (
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
+from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
@@ -83,6 +84,19 @@ def _is_sm70_dflash2_nvfp4_qpn2_runtime_contract() -> bool:
     )
 
 
+def _is_sm70_nospec_nvfp4_qpn2_prefill_runtime_contract() -> bool:
+    """Admit the bounded QPN2-packed prefill route on cold nospec."""
+    vllm_config = get_current_vllm_config()
+    parallel_config = vllm_config.parallel_config
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    return bool(
+        speculative_config is None
+        and parallel_config.pipeline_parallel_size == 1
+        and not getattr(parallel_config, "enable_dbo", False)
+        and int(getattr(parallel_config, "ubatch_size", 0) or 0) <= 1
+    )
+
+
 def _sm70_nvfp4_qpn2_enabled() -> bool:
     """Use the accepted DFlash2 default while retaining an explicit rollback."""
     if os.getenv("VLLM_SM70_NVFP4_QPN2") is not None:
@@ -91,10 +105,13 @@ def _sm70_nvfp4_qpn2_enabled() -> bool:
 
 
 def _sm70_nvfp4_qpn2_prefill_enabled() -> bool:
-    """Promote the bitwise-equal bounded prefill route only with DFlash2."""
+    """Promote the bitwise-equal bounded prefill route with DFlash2 or nospec."""
     if os.getenv("VLLM_SM70_NVFP4_QPN2_PREFILL") is not None:
         return envs.VLLM_SM70_NVFP4_QPN2_PREFILL
-    return _is_sm70_dflash2_nvfp4_qpn2_runtime_contract()
+    return (
+        _is_sm70_dflash2_nvfp4_qpn2_runtime_contract()
+        or _is_sm70_nospec_nvfp4_qpn2_prefill_runtime_contract()
+    )
 
 
 _SM70_NVFP4_QPN4_REQUIRED_OPS = (
@@ -184,6 +201,16 @@ def _pad_qpn2_output_rows(
     return padded_weight, padded_scales, physical_n
 
 
+def _interleave_gated_silu_rows(scales: torch.Tensor) -> torch.Tensor:
+    """Interleave [N, K/16] E4M3 group scales to match TurboMind gated-SiLU columns."""
+    half = scales.size(0) // 2
+    return (
+        torch.stack((scales[:half], scales[half:]), dim=1)
+        .reshape_as(scales)
+        .contiguous()
+    )
+
+
 def _missing_qpn2_ops() -> list[str]:
     return [
         name
@@ -209,6 +236,120 @@ def _missing_qpn2_prefill_ops() -> list[str]:
         for name in _SM70_NVFP4_QPN2_PREFILL_REQUIRED_OPS
         if not hasattr(torch.ops._C, name)
     ]
+
+
+def _nvfp4_qpn2_prefill_only_tm_dispatch_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    tm_weight: torch.Tensor,
+    qpn2_scales: torch.Tensor,
+    global_scale: float,
+    split_k: int,
+    nacc: int,
+    tm_scales: torch.Tensor,
+    tm_group_size: int,
+    tm_k_ld: int,
+    tm_q_ld: int,
+    gated_silu: bool,
+    min_prefill_m: int,
+    prescaled_scales: bool,
+) -> None:
+    if min_prefill_m > 0 and input.shape[0] >= min_prefill_m:
+        if gated_silu:
+            gate_up = torch.empty(
+                (input.shape[0], out.shape[1] * 2),
+                dtype=input.dtype,
+                device=input.device,
+            )
+            sm70_ops.nvfp4_qpn2_tm_dispatch_sm70_out(
+                gate_up,
+                input,
+                tm_weight,
+                qpn2_scales,
+                global_scale,
+                split_k,
+                nacc,
+                tm_scales,
+                tm_group_size,
+                tm_k_ld,
+                tm_q_ld,
+                False,
+                min_prefill_m,
+                prescaled_scales,
+            )
+            sm70_ops.silu_and_mul_interleaved(out, gate_up)
+            return
+        sm70_ops.nvfp4_qpn2_tm_dispatch_sm70_out(
+            out,
+            input,
+            tm_weight,
+            qpn2_scales,
+            global_scale,
+            split_k,
+            nacc,
+            tm_scales,
+            tm_group_size,
+            tm_k_ld,
+            tm_q_ld,
+            False,
+            min_prefill_m,
+            prescaled_scales,
+        )
+        return
+    op = (
+        sm70_ops.nvfp4_gemm_sm70_prescaled_out
+        if prescaled_scales
+        else sm70_ops.nvfp4_gemm_sm70_out
+    )
+    if gated_silu:
+        op(
+            out,
+            input,
+            tm_weight,
+            tm_scales,
+            tm_group_size,
+            tm_k_ld,
+            tm_q_ld,
+            True,
+        )
+    else:
+        op(
+            out,
+            input,
+            tm_weight,
+            tm_scales,
+            tm_group_size,
+            tm_k_ld,
+            tm_q_ld,
+        )
+
+
+def _nvfp4_qpn2_prefill_only_tm_dispatch_sm70_out_fake(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    tm_weight: torch.Tensor,
+    qpn2_scales: torch.Tensor,
+    global_scale: float,
+    split_k: int,
+    nacc: int,
+    tm_scales: torch.Tensor,
+    tm_group_size: int,
+    tm_k_ld: int,
+    tm_q_ld: int,
+    gated_silu: bool,
+    min_prefill_m: int,
+    prescaled_scales: bool,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    "nvfp4_qpn2_prefill_only_tm_dispatch_sm70_out",
+    _nvfp4_qpn2_prefill_only_tm_dispatch_sm70_out,
+    mutates_args=["out"],
+    fake_impl=_nvfp4_qpn2_prefill_only_tm_dispatch_sm70_out_fake,
+    dispatch_key="CompositeExplicitAutograd",
+)
 
 
 def _compact_qpn2_scales_enabled() -> bool:
@@ -413,7 +554,8 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                         "Insufficient memory for the bounded SM70 NVFP4 QPN4 "
                         "prefill workspace; retaining TurboMind."
                     )
-            use_qpn2 = bool(_sm70_nvfp4_qpn2_enabled() and _is_qpn2_layer(layer))
+            is_qpn2_compatible = _is_qpn2_layer(layer)
+            use_qpn2 = bool(_sm70_nvfp4_qpn2_enabled() and is_qpn2_compatible)
             if use_qpn2:
                 missing_ops = _missing_qpn2_ops()
                 if missing_ops:
@@ -422,6 +564,21 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                         f"retaining TurboMind. Missing ops: {missing_ops}."
                     )
                     use_qpn2 = False
+            use_qpn2_prefill_only = bool(
+                not use_qpn2
+                and _sm70_nvfp4_qpn2_prefill_enabled()
+                and is_qpn2_compatible
+            )
+            if use_qpn2_prefill_only:
+                if not envs.VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT:
+                    use_qpn2_prefill_only = False
+                elif missing_shared_ops := _missing_qpn2_shared_ops():
+                    logger.warning_once(
+                        "The requested SM70 NVFP4 nospec QPN2-packed prefill "
+                        "route is unavailable; retaining TurboMind. Missing "
+                        f"ops: {missing_shared_ops}."
+                    )
+                    use_qpn2_prefill_only = False
             if use_qpn2:
                 qpn2_shared = envs.VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT
                 if qpn2_shared and (missing_shared_ops := _missing_qpn2_shared_ops()):
@@ -463,6 +620,16 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             use_gated_silu = bool(
                 envs.VLLM_SM70_NVFP4_DENSE_GATED_SILU and is_qpn4_gate and not use_qpn2
             )
+            if use_qpn2_prefill_only:
+                qpn2_output_size = (layer.weight.shape[0] + 31) // 32 * 32
+                raw_qpn2_scale = (
+                    _interleave_gated_silu_rows(layer.weight_scale.data)
+                    if use_gated_silu
+                    else layer.weight_scale.data
+                )
+                qpn2_scales = sm70_ops.nvfp4_qpn2_prepare_scales_sm70(raw_qpn2_scale)
+                qpn2_global_scale = float(layer.weight_global_scale.item())
+
             sm70_tm.prepare_nvfp4_linear(
                 layer,
                 interleave_gated_silu=use_gated_silu,
@@ -523,6 +690,31 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                         "ephemeral FP16 prefill dispatch enabled for M>=%d.",
                         envs.VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M,
                     )
+            elif use_qpn2_prefill_only:
+                k = layer.input_size_per_partition
+                n = qpn2_output_size
+                split_k, nacc = _qpn2_config(k, n, False)
+                layer.register_buffer(
+                    "sm70_nvfp4_qpn2_scales", qpn2_scales, persistent=False
+                )
+                layer.sm70_nvfp4_qpn2_prefill_only = True
+                layer.sm70_nvfp4_qpn2_shared_weight = True
+                layer.sm70_nvfp4_qpn2_global_scale = qpn2_global_scale
+                layer.sm70_nvfp4_qpn2_output_size = qpn2_output_size
+                layer.sm70_nvfp4_qpn2_split_k = split_k
+                layer.sm70_nvfp4_qpn2_nacc = nacc
+                layer.sm70_nvfp4_qpn2_gated_silu = use_gated_silu
+                layer.sm70_nvfp4_qpn2_prefill_enabled = True
+                if use_gated_silu:
+                    logger.info_once(
+                        "SM70 NVFP4 TurboMind gated-SiLU single-layout path enabled."
+                    )
+                logger.info_once(
+                    "SM70 NVFP4 nospec QPN2-packed ephemeral FP16 prefill "
+                    "dispatch enabled for M>=%d (TurboMind retained for M<%d).",
+                    envs.VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M,
+                    envs.VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M,
+                )
             elif use_gated_silu:
                 logger.info_once(
                     "SM70 NVFP4 TurboMind gated-SiLU single-layout path enabled."
@@ -555,6 +747,8 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
     ) -> torch.Tensor:
         if getattr(layer, "sm70_nvfp4_qpn2", False):
             return self._apply_qpn2(layer, x, bias, gated_silu=False)
+        if getattr(layer, "sm70_nvfp4_qpn2_prefill_only", False):
+            return self._apply_qpn2_prefill_only(layer, x, bias, gated_silu=False)
         if sm70_tm.has_prepared_linear(layer):
             return sm70_tm.apply_prepared_linear(layer, x, bias)
         return self._fallback_kernel().apply_weights(layer=layer, x=x, bias=bias)
@@ -565,10 +759,76 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         x: torch.Tensor,
     ) -> torch.Tensor | None:
         if getattr(layer, "sm70_nvfp4_qpn2_gated_silu", False):
+            if getattr(layer, "sm70_nvfp4_qpn2_prefill_only", False):
+                return self._apply_qpn2_prefill_only(layer, x, None, gated_silu=True)
             return self._apply_qpn2(layer, x, None, gated_silu=True)
         if not sm70_tm.has_prepared_linear(layer):
             return None
         return sm70_tm.apply_prepared_fused_silu_and_mul(layer, x)
+
+    @staticmethod
+    def _apply_qpn2_prefill_only(
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None,
+        *,
+        gated_silu: bool,
+    ) -> torch.Tensor:
+        if x.dtype != torch.float16:
+            raise RuntimeError(
+                f"SM70 NVFP4 QPN2 prefill requires float16 activations, got {x.dtype}."
+            )
+        x_2d = x.reshape(-1, x.shape[-1])
+        if x_2d.stride(-1) != 1:
+            x_2d = x_2d.contiguous()
+        logical_output_size = layer.output_size_per_partition
+        kernel_output_size = int(
+            getattr(layer, "sm70_nvfp4_qpn2_output_size", logical_output_size)
+        )
+        if gated_silu:
+            logical_output_size //= 2
+            kernel_output_size //= 2
+        out_2d = torch.empty(
+            (x_2d.shape[0], kernel_output_size), dtype=x.dtype, device=x.device
+        )
+        if x_2d.shape[0] == 0:
+            return out_2d[:, :logical_output_size].reshape(
+                *x.shape[:-1], logical_output_size
+            )
+        state = getattr(layer, sm70_tm.STATE_ATTR)
+        min_prefill_m = (
+            envs.VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M
+            if getattr(layer, "sm70_nvfp4_qpn2_prefill_enabled", False)
+            else 0
+        )
+        torch.ops.vllm.nvfp4_qpn2_prefill_only_tm_dispatch_sm70_out(
+            out_2d,
+            x_2d,
+            state.weight,
+            layer.sm70_nvfp4_qpn2_scales,
+            float(layer.sm70_nvfp4_qpn2_global_scale),
+            int(layer.sm70_nvfp4_qpn2_split_k),
+            int(layer.sm70_nvfp4_qpn2_nacc),
+            state.scales,
+            state.group_size,
+            state.k_ld,
+            state.q_ld,
+            gated_silu,
+            min_prefill_m,
+            state.prescaled_scales,
+        )
+        if kernel_output_size != logical_output_size:
+            out_2d = out_2d[:, :logical_output_size]
+        if not gated_silu and state.gated_silu and state.op_kind == "nvfp4":
+            out_features = logical_output_size // 2
+            out_2d = (
+                out_2d.reshape(x_2d.shape[0], out_features, 2)
+                .transpose(1, 2)
+                .reshape(x_2d.shape[0], logical_output_size)
+            )
+        if bias is not None:
+            out_2d.add_(bias)
+        return out_2d.reshape(*x.shape[:-1], logical_output_size)
 
     @staticmethod
     def _apply_qpn2(

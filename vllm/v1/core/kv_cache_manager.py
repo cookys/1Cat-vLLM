@@ -126,6 +126,7 @@ class KVCacheManager:
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
         prefix_cache_retention_interval: int | None = None,
+        draft_sliding_window_groups: bool = False,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -158,6 +159,9 @@ class KVCacheManager:
         self.coordinator.configure_prefix_cache_retention(
             prefix_cache_retention_interval
         )
+        if draft_sliding_window_groups:
+            # plan 075 S1: the sliding-window group is the speculator's draft KV.
+            self.coordinator.mark_draft_sliding_window_groups()
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
@@ -199,6 +203,21 @@ class KVCacheManager:
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
 
+    def _draft_window(self) -> int:
+        """plan 075 S2 C1 fix: the draft group's sliding window W in tokens."""
+        mgrs = self.coordinator.single_type_managers
+        return max(
+            getattr(mgrs[g], "sliding_window", 0)
+            for g in self.coordinator.draft_group_ids
+        )
+
+    def _register_request_spec(self, request: Request) -> None:
+        # plan 075 S1: forward the request's fixed K to the group managers.
+        # getattr keeps request stand-ins without the field (K=7 semantics).
+        self.coordinator.register_request_spec(
+            request.request_id, getattr(request, "spec_off", False)
+        )
+
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
@@ -216,6 +235,7 @@ class KVCacheManager:
         # (which happens when the request requires prompt logprobs
         # or calls a pooling model with all pooling).
         request.shared_prefix_boundary = 0
+        self._register_request_spec(request)
         if not self.enable_caching or request.skip_reading_prefix_cache:
             return self.empty_kv_cache_blocks, 0
 
@@ -226,11 +246,46 @@ class KVCacheManager:
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
         max_cache_hit_length = request.num_tokens - 1
-        computed_blocks, num_new_computed_tokens = (
-            self.coordinator.find_longest_cache_hit(
-                request.block_hashes, max_cache_hit_length
+        skip_draft = self.coordinator.draft_group_ids
+        if getattr(request, "spec_off", False) or not skip_draft:
+            # plan 075 S1: a K=0 request never reads draft KV, so the draft
+            # group stays out of its lookup (main layers + Mamba hit in either
+            # mode).
+            computed_blocks, num_new_computed_tokens = (
+                self.coordinator.find_longest_cache_hit(
+                    request.block_hashes,
+                    max_cache_hit_length,
+                    skip_group_ids=skip_draft,
+                )
             )
-        )
+            boundary = self.coordinator.shared_prefix_boundary
+        else:
+            # plan 075 S2 C1 fix: a K>0 request reads draft KV.
+            # (i) draft group takes part: only blocks whose draft KV was
+            #     written (DFlash2 era, see SlidingWindowManager) can match.
+            # (ii) draft group skipped, hit capped at N - W so the target
+            #     reprocesses the last W prompt tokens and writes their draft
+            #     KV. The hit used is the longer of the two.
+            blocks_i, hit_i = self.coordinator.find_longest_cache_hit(
+                request.block_hashes,
+                max_cache_hit_length,
+                skip_group_ids=frozenset(),
+            )
+            boundary_i = self.coordinator.shared_prefix_boundary
+            cap = min(max_cache_hit_length, request.num_tokens - self._draft_window())
+            blocks_ii, hit_ii, boundary_ii = blocks_i, 0, 0
+            if cap > 0:
+                blocks_ii, hit_ii = self.coordinator.find_longest_cache_hit(
+                    request.block_hashes, cap, skip_group_ids=skip_draft
+                )
+                boundary_ii = self.coordinator.shared_prefix_boundary
+            if hit_i >= hit_ii:
+                computed_blocks, num_new_computed_tokens = blocks_i, hit_i
+                boundary = boundary_i
+            else:
+                computed_blocks, num_new_computed_tokens = blocks_ii, hit_ii
+                boundary = boundary_ii
+            self.coordinator.shared_prefix_boundary = boundary
 
         # Keep the existing two-value lookup API used by 1Cat connectors. The
         # synchronous coordinator exposes the junction from this lookup only.
@@ -333,6 +388,8 @@ class KVCacheManager:
         Returns:
             A list of new allocated blocks.
         """
+        # plan 075 S1: per-request K, fixed for the request's life.
+        self._register_request_spec(request)
         # When loading KV data asynchronously, we may have zero new tokens to
         # compute while still allocating slots for externally computed tokens.
         if num_new_tokens == 0 and num_external_computed_tokens == 0:

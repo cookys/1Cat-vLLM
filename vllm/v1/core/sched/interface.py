@@ -197,6 +197,44 @@ class SchedulerInterface(ABC):
     def set_pause_state(self, pause_state: PauseState) -> None:
         raise NotImplementedError
 
+    def set_spec_enabled(self, enabled: bool) -> bool:
+        """plan 075 S1: flip the spec mode for newly added requests; returns prev."""
+        raise NotImplementedError
+
+    def get_spec_mode_info(self) -> dict[str, int | bool | str]:
+        """plan 075 S1/S2: ``spec_enabled``, running request counts by K,
+        ``spec_inflight`` (K>0 requests in any queue), ``drafter_resident`` and
+        the hot-switch ``state``."""
+        raise NotImplementedError
+
+    def set_drafter_resident(self, resident: bool) -> None:
+        """plan 075 S2: record whether the workers hold the drafter weights."""
+        raise NotImplementedError
+
+    def kv_pool_spec_blocks(self) -> int:
+        """plan 075 S2: N_spec, the pool size the scheduler started with."""
+        raise NotImplementedError
+
+    def kv_pool_blocks(self) -> int:
+        """plan 075 S2: current pool size in blocks."""
+        raise NotImplementedError
+
+    def grow_kv_pool(self, n_blocks_total: int) -> int:
+        """plan 075 S2: grow the block pool (workers already mapped)."""
+        raise NotImplementedError
+
+    def shrink_kv_pool(self, n_blocks_total: int) -> int:
+        """plan 075 S2: shrink the block pool; 0 = ok, else tail holders."""
+        raise NotImplementedError
+
+    def set_kv_fence(self, max_block_id: int | None) -> None:
+        """plan 075 S2: fence / unfence the elastic tail for new allocations."""
+        raise NotImplementedError
+
+    def get_kv_pool_info(self) -> dict[str, int | None]:
+        """plan 075 S2: pool size, fence, tail_holder_blocks/_reqs, free blocks."""
+        raise NotImplementedError
+
     @abstractmethod
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False

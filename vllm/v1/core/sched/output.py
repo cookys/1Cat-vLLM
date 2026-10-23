@@ -237,6 +237,13 @@ class SchedulerOutput:
     # Used for adjusting acceptance rate calculation.
     num_invalid_spec_tokens: dict[str, int] | None = None
 
+    # plan 075 S1: True when every request in this step runs with K=0 (spec
+    # mode off for all of them), so no row needs a draft for its next step and
+    # the worker may skip the drafter entirely. Never True while any scheduled
+    # request is a K>0 request (decode, or a prefill chunk that must hand off a
+    # first draft).
+    skip_draft_propose: bool = False
+
     # req_id -> DDTree payload for the scheduled speculative tokens.
     # Present only for dflash_ddtree tree-verifier experiments.
     scheduled_ddtree_payloads: dict[str, DDTreeDraftPayload] | None = None

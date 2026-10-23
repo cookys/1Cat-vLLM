@@ -7,6 +7,8 @@ from typing import Any, cast
 import torch
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
+from vllm.device_allocator.elastic_region import ElasticKvRegion
+from vllm.device_allocator.vmm import VmmBackend
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.utils.torch_utils import get_dtype_size
@@ -14,10 +16,12 @@ from vllm.v1.attention.backend import (
     AttentionCGSupport,
     CommonAttentionMetadata,
 )
+from vllm.v1.gdn_log import layout_from_mamba_spec
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    KVCacheTensor,
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -148,12 +152,106 @@ def init_attn_backend(
     return attn_groups, attn_cg_support_info, kernel_block_sizes
 
 
+def _allocate_elastic_kv_tensor(
+    kv_cache_config: KVCacheConfig,
+    kv_cache_tensor: KVCacheTensor,
+    device: torch.device,
+    elastic_regions: list[ElasticKvRegion],
+    vmm_backend: VmmBackend | None,
+) -> torch.Tensor:
+    """plan 075 S2 (F8/F9): the KV tensor lives in an ElasticKvRegion (own VA,
+    not the cumem ``kv_cache`` pool). The first ``size`` bytes are mapped and
+    zeroed; the tail up to ``max_size`` is mapped later by ``grow_kv_cache``."""
+    assert kv_cache_tensor.max_size is not None
+    block_bytes = kv_cache_tensor.size // kv_cache_config.num_blocks
+    assert block_bytes * kv_cache_config.num_blocks == kv_cache_tensor.size
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    region = ElasticKvRegion(
+        index,
+        kv_cache_tensor.max_size,
+        kv_cache_tensor.size,
+        kv_cache_config.elastic_boundary_blocks * block_bytes,
+        block_bytes,
+        backend=vmm_backend,
+    )
+    elastic_regions.append(region)
+    return region.as_tensor()
+
+
+def check_elastic_kv_layout(
+    kv_cache_config: KVCacheConfig,
+    attn_groups: Iterable[AttentionGroup],
+    kernel_block_sizes: list[int],
+    cache_dtype: str,
+) -> None:
+    """plan 075 S2 startup guards for the elastic KV tail (no-op otherwise).
+
+    * The tail is the high-address end of each tensor, so a low block id must
+      mean a low address (block-major). Hybrid models get that from
+      ``_update_hybrid_attention_layout``; a non-hybrid backend whose block
+      index is not dim 0 keeps K/V planes outermost and would put the V plane
+      in the unmapped tail.
+    * FlexAttention builds its metadata from the startup ``num_gpu_blocks``.
+    """
+    if not any(t.max_size is not None for t in kv_cache_config.kv_cache_tensors):
+        return
+    groups = list(attn_groups)
+    is_hybrid = any(isinstance(g.kv_cache_spec, MambaSpec) for g in groups)
+    for group in groups:
+        if group.backend.get_name() == "FLEX_ATTENTION":
+            raise ValueError(
+                "--spec-hot-switch-elastic is not compatible with the "
+                "FlexAttention backend: it sizes its block metadata from the "
+                "startup num_gpu_blocks, so block ids in the grown tail would "
+                "be out of range"
+            )
+        spec = group.kv_cache_spec
+        if (
+            is_hybrid
+            or not isinstance(spec, AttentionSpec)
+            or group.kv_cache_group_id >= len(kernel_block_sizes)
+        ):
+            continue
+        block_dim = group.backend.get_kv_cache_block_dim(
+            kernel_block_sizes[group.kv_cache_group_id],
+            spec.num_kv_heads,
+            spec.head_size,
+            cache_dtype_str=(
+                "auto"
+                if cache_dtype == "nvfp4" and spec.dtype == torch.float16
+                else cache_dtype
+            ),
+        )
+        if block_dim != 0:
+            raise ValueError(
+                "--spec-hot-switch-elastic needs a block-major KV layout "
+                "(num_blocks as dim 0), but the "
+                f"{group.backend.get_name()} backend puts num_blocks at dim "
+                f"{block_dim} of a non-hybrid model: the K/V planes would be "
+                "outermost and the V plane would land in the unmapped tail"
+            )
+
+
 def _allocate_kv_cache(
-    kv_cache_config: KVCacheConfig, shared_layers: dict[str, str], device: torch.device
+    kv_cache_config: KVCacheConfig,
+    shared_layers: dict[str, str],
+    device: torch.device,
+    elastic_regions: list[ElasticKvRegion] | None = None,
+    vmm_backend: VmmBackend | None = None,
 ):
     kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-        tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
+        if kv_cache_tensor.max_size is not None:
+            if elastic_regions is None:
+                raise RuntimeError(
+                    "elastic KV tensor (max_size set) but the caller gave no "
+                    "elastic_regions list to own the regions"
+                )
+            tensor = _allocate_elastic_kv_tensor(
+                kv_cache_config, kv_cache_tensor, device, elastic_regions, vmm_backend
+            )
+        else:
+            tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
         for layer_name in kv_cache_tensor.shared_by:
             kv_cache_raw_tensors[layer_name] = tensor
 
@@ -272,6 +370,10 @@ def _reshape_kv_cache(
 
             elif isinstance(kv_cache_spec, MambaSpec):
                 has_mamba = True
+                if kv_cache_spec.gdn_log_spec_tokens > 0:
+                    # Final geometry is known here: the log banks and header
+                    # must fit the page that is actually being carved.
+                    layout_from_mamba_spec(kv_cache_spec)
                 state_tensors = []
                 storage_offset_bytes = 0
                 for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
@@ -372,10 +474,22 @@ def init_kv_cache(
     cache_dtype: str,
     kernel_block_sizes: list[int],
     vllm_config: VllmConfig,
+    elastic_regions: list[ElasticKvRegion] | None = None,
+    vmm_backend: VmmBackend | None = None,
 ) -> dict[str, Any]:
     shared_kv_cache_layers = get_shared_kv_cache_layers(vllm_config)
+    check_elastic_kv_layout(
+        kv_cache_config,
+        [g for groups in attn_groups for g in groups],
+        kernel_block_sizes,
+        cache_dtype,
+    )
     kv_cache_raw_tensors = _allocate_kv_cache(
-        kv_cache_config, shared_kv_cache_layers, device
+        kv_cache_config,
+        shared_kv_cache_layers,
+        device,
+        elastic_regions=elastic_regions,
+        vmm_backend=vmm_backend,
     )
     flattened_attn_groups = list(group for groups in attn_groups for group in groups)
     kv_caches = _reshape_kv_cache(

@@ -44,6 +44,7 @@ from vllm.utils.network_utils import make_zmq_socket
 from vllm.utils.system_utils import decorate_logs, set_process_title
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
+    apply_elastic_kv_tail,
     generate_scheduler_kv_cache_config,
     get_kv_cache_configs,
     get_request_block_hasher,
@@ -237,6 +238,109 @@ class EngineCore:
         # environment variable overrides after this point)
         enable_envs_cache()
 
+    def _make_kv_cache_configs_elastic(
+        self, kv_cache_configs: list[KVCacheConfig]
+    ) -> None:
+        """plan 075 S2 (A2-3): size the elastic KV tail from the drafter
+        weights the workers report, and rewrite the per-rank configs."""
+        probes = self.collective_rpc("get_elastic_kv_probe")
+        granularity = max(int(p["granularity"]) for p in probes)
+        tail = apply_elastic_kv_tail(
+            kv_cache_configs,
+            [int(p["draft_weights_bytes"]) for p in probes],
+            granularity,
+            max_model_len=self.vllm_config.model_config.max_model_len,
+            block_size=max(
+                [g.kv_cache_spec.block_size for g in kv_cache_configs[0].kv_cache_groups]
+                or [self.vllm_config.cache_config.block_size]
+            ),
+        )
+        if tail == 0:
+            logger.warning(
+                "--spec-hot-switch-elastic: the drafter weights are too small "
+                "for one KV tail chunk (draft bytes %s, granularity %d); the "
+                "KV pool stays fixed-size.",
+                [int(p["draft_weights_bytes"]) for p in probes],
+                granularity,
+            )
+            return
+        logger.info(
+            "Elastic KV tail: N_spec=%d blocks (aligned down to the boundary, "
+            "%d blocks lost), N_tail_max=%d blocks "
+            "(boundary %d blocks, VMM granularity %d B)",
+            kv_cache_configs[0].num_blocks,
+            kv_cache_configs[0].elastic_spec_blocks_lost,
+            tail,
+            kv_cache_configs[0].elastic_boundary_blocks,
+            granularity,
+        )
+
+    def grow_kv_cache(self, n_blocks_total: int | None = None) -> dict:
+        """plan 075 S2 (A2-7, F10): map the KV tail on every worker, and only
+        when all succeeded let the scheduler's block pool grow. A failure
+        leaves the scheduler at its previous size (workers may have mapped
+        more, which is harmless and retried idempotently)."""
+        cfg = self.scheduler.kv_cache_config
+        n_spec, tail = self.scheduler.kv_pool_spec_blocks(), cfg.elastic_tail_blocks
+        if tail <= 0:
+            raise RuntimeError("grow_kv_cache: the engine has no elastic KV tail")
+        target = n_spec + tail if n_blocks_total is None else int(n_blocks_total)
+        if not n_spec <= target <= n_spec + tail:
+            raise ValueError(
+                f"grow_kv_cache target {target} outside [{n_spec}, {n_spec + tail}]"
+            )
+        if (target - n_spec) % cfg.elastic_boundary_blocks:
+            raise ValueError(
+                f"grow_kv_cache target {target} is not N_spec {n_spec} plus a "
+                f"multiple of {cfg.elastic_boundary_blocks} blocks"
+            )
+        workers = self.collective_rpc(
+            "grow_kv_cache", timeout=self._SPEC_RPC_TIMEOUT_S, args=(target,)
+        )
+        added = self.scheduler.grow_kv_pool(target)
+        return {"pool_blocks": target, "added_blocks": added, "workers": workers}
+
+    def shrink_kv_cache(self, n_blocks_total: int | None = None) -> dict:
+        """plan 075 S2 (A2-7, F10): the scheduler stops using the tail first;
+        only then do the workers unmap it. If requests still hold tail blocks
+        nothing changes and ``tail_holder_blocks`` / ``tail_holder_reqs`` say how many."""
+        n_spec = self.scheduler.kv_pool_spec_blocks()
+        target = n_spec if n_blocks_total is None else int(n_blocks_total)
+        if target < n_spec:
+            raise ValueError(f"shrink_kv_cache target {target} below N_spec {n_spec}")
+        boundary = self.scheduler.kv_cache_config.elastic_boundary_blocks
+        if boundary and (target - n_spec) % boundary:
+            raise ValueError(
+                f"shrink_kv_cache target {target} is not N_spec {n_spec} plus a "
+                f"multiple of {boundary} blocks"
+            )
+        holders = self.scheduler.shrink_kv_pool(target)
+        if holders:
+            return {
+                "ok": False,
+                "pool_blocks": self.scheduler.kv_pool_blocks(),
+                "tail_holder_blocks": holders,
+                "tail_holder_reqs": self.scheduler.count_tail_holder_reqs(),
+            }
+        workers = self.collective_rpc(
+            "shrink_kv_cache", timeout=self._SPEC_RPC_TIMEOUT_S, args=(target,)
+        )
+        return {
+            "ok": True,
+            "pool_blocks": target,
+            "tail_holder_blocks": 0,
+            "tail_holder_reqs": 0,
+            "workers": workers,
+        }
+
+    def set_kv_fence(self, max_block_id: int | None) -> dict:
+        """plan 075 S2 (F13): stop (or resume) handing out tail blocks."""
+        self.scheduler.set_kv_fence(max_block_id)
+        return self.scheduler.get_kv_pool_info()
+
+    def get_kv_pool_info(self) -> dict:
+        return self.scheduler.get_kv_pool_info()
+
     @instrument(span_name="Prepare model")
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
         start = time.time()
@@ -277,6 +381,9 @@ class EngineCore:
         max_model_len_after = vllm_config.model_config.max_model_len
         if max_model_len_after != max_model_len_before:
             self.collective_rpc("update_max_model_len", args=(max_model_len_after,))
+
+        if vllm_config.cache_config.spec_hot_switch_elastic and has_kv_cache:
+            self._make_kv_cache_configs_elastic(kv_cache_configs)
 
         scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
         vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
@@ -938,6 +1045,384 @@ class EngineCore:
         """Check if engine is sleeping at any level."""
         return self.is_scheduler_paused() or self.model_executor.is_sleeping
 
+    # ---- plan 075 S2 M3: spec hot-switch state machine ----------------------
+    #
+    # DFLASH2 -> NOSPEC_DRAINING -> NOSPEC_RELEASED -> NOSPEC_GROWN
+    #   NOSPEC_GROWN/RELEASED -> DFLASH2_FENCING -> DFLASH2
+    # Only ``spec_enabled`` flips inside the POST; every other step runs in
+    # ``_advance_spec_transition`` between engine steps (and once right after
+    # the POST, which finishes the whole chain on an idle engine). A failed
+    # step stops the machine at the previous stable state with
+    # ``_spec_blocked`` set (no per-step retry loop); the next POST in the
+    # same direction retries. ``error`` is reserved for a failed recovery.
+
+    _SPEC_GROW_MARGIN_BYTES = 64 << 20  # D7: free memory kept after the grow
+    _SPEC_DRAFT_TAGS = ("draft_weights",)
+    _spec_blocked = False
+    _spec_last_error: str | None = None
+    _spec_last_transition: dict | None = None
+    _spec_shrink_rpc_pending = False
+    _SPEC_RPC_TIMEOUT_S = 120.0  # M3-fix-3: a hung worker must not hang the engine
+
+    def _spec_rpc(self, method: str, args: tuple = ()):
+        return self.collective_rpc(
+            method, timeout=self._SPEC_RPC_TIMEOUT_S, args=args
+        )
+
+    def _spec_machine_on(self) -> bool:
+        cache_config = self.vllm_config.cache_config
+        return bool(
+            getattr(cache_config, "spec_hot_switch_elastic", False)
+            and self.scheduler.num_spec_tokens > 0
+        )
+
+    def _spec_state(self) -> str:
+        return self.scheduler.get_spec_mode_info()["state"]
+
+    def _spec_set_state(self, state: str) -> None:
+        prev = self.scheduler.spec_state or self._spec_state()
+        self.scheduler.spec_state = state
+        logger.info("spec hot-switch state %s -> %s", prev, state)
+
+    def _spec_fail(self, what: str) -> bool:
+        self._spec_blocked = True
+        self._spec_last_error = what
+        logger.error("spec hot-switch stopped in %s: %s", self._spec_state(), what)
+        return False
+
+    def _spec_to_error(self, what: str) -> bool:
+        """Terminal state for what a retry cannot fix (a worker that does not
+        answer, or answers in an unexpected shape): gate closed, restart."""
+        self.scheduler.set_drafter_resident(False)
+        self.scheduler.set_spec_enabled(False)
+        self._spec_blocked = True
+        self._spec_last_error = what
+        self._spec_set_state("error")
+        self._spec_end("error")
+        logger.error("spec hot-switch: %s", what)
+        return False
+
+    def _spec_begin(self, src: str) -> None:
+        self._spec_blocked = False
+        self._spec_last_error = None
+        self._spec_t0 = time.monotonic()
+        self._spec_last_transition = {
+            "from": src,
+            "to": None,
+            "started_at": time.time(),
+            "finished_at": None,
+            "duration_s": None,
+            "attempts": 0,
+            "steps": {},
+        }
+
+    def _spec_note(self, step: str, detail: dict) -> None:
+        if self._spec_last_transition is not None:
+            self._spec_last_transition["steps"][step] = detail
+
+    def _spec_end(self, state: str) -> None:
+        # every round that ends overwrites ``to`` / ``finished_at`` /
+        # ``duration_s`` (the last round wins); ``attempts`` counts the rounds.
+        tr = self._spec_last_transition
+        if tr is not None:
+            tr["attempts"] += 1
+            tr["to"] = state
+            tr["finished_at"] = time.time()
+            tr["duration_s"] = time.monotonic() - self._spec_t0
+
+    def set_spec_mode(self, mode: str) -> dict:
+        """plan 075 S1/S2: switch the spec mode.
+
+        S1 (no ``--spec-hot-switch-elastic``): flips the mode for requests
+        added from now on. S2: runs the state machine above. Re-sending the
+        current direction changes nothing and reports ``changed: false`` (a
+        blocked machine retries its stopped step). Returns the new state.
+        """
+        if mode not in ("dflash2", "nospec"):
+            raise ValueError(f"mode must be 'dflash2' or 'nospec', got {mode!r}")
+        want = mode == "dflash2"
+        if not self._spec_machine_on():
+            was = self.scheduler.get_spec_mode_info()["spec_enabled"]
+            if want != was:
+                self.scheduler.set_spec_enabled(want)
+            return {
+                "mode": mode,
+                "prev": "dflash2" if was else "nospec",
+                "changed": want != was,
+                "state": self._spec_state(),
+            }
+        st = self._spec_state()
+        if st == "error":
+            raise RuntimeError(
+                f"spec hot-switch is in the error state ({self._spec_last_error}); "
+                "restart the engine"
+            )
+        prev = "dflash2" if st == "DFLASH2" else "nospec"
+        changed = False
+        spec_blocks = self.scheduler.kv_pool_spec_blocks()
+        if want:
+            if st == "NOSPEC_DRAINING":
+                # the weights were never released: only flip the flag back
+                self._spec_begin(st)
+                self.scheduler.set_spec_enabled(True)
+                self._spec_set_state("DFLASH2")
+                self._spec_end("DFLASH2")
+                changed = True
+            elif st in ("NOSPEC_RELEASED", "NOSPEC_GROWN"):
+                self._spec_begin(st)
+                self.scheduler.set_kv_fence(spec_blocks - 1)  # F13
+                self._spec_set_state("DFLASH2_FENCING")
+                changed = True
+                self._advance_spec_transition()
+            elif st == "DFLASH2_FENCING" and self._spec_blocked:
+                self._spec_blocked = False
+                self._spec_last_error = None
+                self._advance_spec_transition()
+        else:
+            if st == "DFLASH2":
+                self._spec_begin(st)
+                self.scheduler.set_spec_enabled(False)
+                self._spec_set_state("NOSPEC_DRAINING")
+                changed = True
+                self._advance_spec_transition()
+            elif st == "DFLASH2_FENCING":
+                # cancel the switch back: lift the fence, keep what is mapped
+                self.scheduler.set_kv_fence(None)
+                back = (
+                    "NOSPEC_GROWN"
+                    if self.scheduler.kv_pool_blocks() > spec_blocks
+                    else "NOSPEC_RELEASED"
+                )
+                self._spec_set_state(back)
+                self._spec_blocked = False
+                self._spec_last_error = None
+                changed = True
+            elif st == "NOSPEC_DRAINING" and self._spec_blocked:
+                self._spec_blocked = False
+                self._spec_last_error = None
+                self._advance_spec_transition()
+            elif st == "NOSPEC_RELEASED":
+                # RELEASED is not a resting state: POST nospec retries the grow.
+                self._spec_blocked = False
+                self._spec_last_error = None
+                self._advance_spec_transition()
+                return {
+                    "mode": mode,
+                    "prev": prev,
+                    "changed": False,
+                    "retried": True,
+                    "state": self._spec_state(),
+                }
+        return {
+            "mode": mode,
+            "prev": prev,
+            "changed": changed,
+            "state": self._spec_state(),
+        }
+
+    def _advance_spec_transition(self) -> None:
+        """Run the pending steps of the state machine until one has to wait or
+        fails. Cheap when stable; never raises (failures stop the machine)."""
+        if not self._spec_machine_on():
+            return
+        for _ in range(4):
+            if self._spec_blocked:
+                return
+            st = self._spec_state()
+            try:
+                if st == "NOSPEC_DRAINING":
+                    ok = self._spec_release()
+                elif st == "NOSPEC_RELEASED":
+                    ok = self._spec_grow()
+                elif st == "DFLASH2_FENCING":
+                    ok = self._spec_restore()
+                else:
+                    return
+            except Exception as exc:  # e.g. a worker reply missing a key
+                self._spec_to_error(
+                    f"unexpected failure in {st} ({exc!r}); worker state unknown"
+                )
+                return
+            if not ok:
+                return
+
+    def _spec_release(self) -> bool:
+        if self.scheduler.count_spec_inflight() > 0:
+            return False  # wait: K>0 requests must drain first (F6)
+        try:
+            res = self._spec_rpc("sleep_tags", (self._SPEC_DRAFT_TAGS,))
+        except TimeoutError as exc:
+            return self._spec_to_error(
+                f"sleep_tags timed out ({exc!r}); worker state unknown"
+            )
+        except Exception as exc:
+            # D8 failure edge: put the weights back at once.
+            try:
+                self._spec_rpc("wake_tags", (self._SPEC_DRAFT_TAGS,))
+            except Exception as exc2:
+                self.scheduler.set_drafter_resident(False)
+                self._spec_last_error = (
+                    f"sleep_tags failed ({exc!r}) and the recovery wake_tags "
+                    f"failed too ({exc2!r}); drafter gate closed"
+                )
+                self._spec_set_state("error")
+                self._spec_end("error")
+                logger.error("spec hot-switch: %s", self._spec_last_error)
+                return False
+            self.scheduler.set_drafter_resident(True)
+            return self._spec_fail(
+                f"sleep_tags failed ({exc!r}); drafter weights restored"
+            )
+        self.scheduler.set_drafter_resident(False)
+        self._spec_note(
+            "release",
+            {
+                "freed_bytes": [r["freed_bytes"] for r in res],
+                "free_after": [r["free_after"] for r in res],
+            },
+        )
+        self._spec_set_state("NOSPEC_RELEASED")
+        return True
+
+    def _spec_grow(self) -> bool:
+        cfg = self.scheduler.kv_cache_config
+        if cfg.elastic_tail_blocks <= 0:
+            self._spec_end("NOSPEC_RELEASED")
+            return self._spec_fail(
+                "no elastic KV tail: the drafter weights are released but the "
+                "pool cannot grow"
+            )
+        need = sum(
+            t.max_size - t.size for t in cfg.kv_cache_tensors if t.max_size is not None
+        )
+        try:
+            free = min(
+                int(r["free_bytes"]) for r in self._spec_rpc("get_gpu_free_bytes")
+            )
+        except TimeoutError as exc:
+            return self._spec_to_error(f"get_gpu_free_bytes timed out ({exc!r})")
+        except Exception as exc:
+            return self._spec_fail(f"get_gpu_free_bytes failed ({exc!r})")
+        if free < need + self._SPEC_GROW_MARGIN_BYTES:
+            self._spec_end("NOSPEC_RELEASED")
+            return self._spec_fail(
+                f"grow skipped: min free {free} B over ranks < tail {need} B + "
+                f"{self._SPEC_GROW_MARGIN_BYTES} B margin"
+            )
+        try:
+            out = self.grow_kv_cache()
+        except TimeoutError as exc:
+            return self._spec_to_error(
+                f"grow_kv_cache timed out ({exc!r}); worker state unknown"
+            )
+        except Exception as exc:
+            return self._spec_fail(f"grow_kv_cache failed ({exc!r}); staying released")
+        self._spec_note(
+            "grow",
+            {
+                "pool_blocks": out["pool_blocks"],
+                "added_blocks": out["added_blocks"],
+                "free_bytes": [w.get("free_bytes") for w in out["workers"]],
+            },
+        )
+        self._spec_set_state("NOSPEC_GROWN")
+        self._spec_end("NOSPEC_GROWN")
+        return True
+
+    def _spec_note_shrink(self, workers: list[dict], pool_blocks=None) -> None:
+        detail = {"mapped_bytes": [w["mapped_bytes"] for w in workers]}
+        if pool_blocks is not None:
+            detail["pool_blocks"] = pool_blocks
+        self._spec_note("shrink", detail)
+
+    @staticmethod
+    def _spec_shrink_failures(workers: list[dict]) -> str | None:
+        """D-fix-2: a worker that could not unmap one of its regions leaves
+        its tail half-mapped; that is not retriable, so the machine errors."""
+        bad = {i: w["shrink_failed"] for i, w in enumerate(workers) if w.get("shrink_failed")}
+        if not bad:
+            return None
+        return f"worker shrink failed on rank(s) {bad}; mapped state inconsistent"
+
+    def _spec_restore(self) -> bool:
+        spec_blocks = self.scheduler.kv_pool_spec_blocks()
+        try:
+            if self._spec_shrink_rpc_pending:
+                workers = self._spec_rpc("shrink_kv_cache", (spec_blocks,))
+                self._spec_note_shrink(workers)
+                bad = self._spec_shrink_failures(workers)
+                if bad:
+                    return self._spec_to_error(bad)
+                self._spec_shrink_rpc_pending = False
+            elif self.scheduler.kv_pool_blocks() > spec_blocks:
+                out = self.shrink_kv_cache()
+                if not out["ok"]:
+                    self._spec_note(
+                        "shrink_wait",
+                        {
+                            "tail_holder_blocks": out["tail_holder_blocks"],
+                            "tail_holder_reqs": out["tail_holder_reqs"],
+                        },
+                    )
+                    return False  # wait: requests still hold tail blocks (F13)
+                self._spec_note_shrink(out["workers"], out["pool_blocks"])
+                bad = self._spec_shrink_failures(out["workers"])
+                if bad:
+                    return self._spec_to_error(bad)
+        except TimeoutError as exc:
+            return self._spec_to_error(
+                f"shrink_kv_cache timed out ({exc!r}); worker state unknown"
+            )
+        except Exception as exc:
+            if self.scheduler.kv_pool_blocks() <= spec_blocks:
+                # scheduler already dropped the tail; only the unmap is missing
+                self._spec_shrink_rpc_pending = True
+            return self._spec_fail(f"shrink_kv_cache failed ({exc!r})")
+        try:
+            res = self._spec_rpc("wake_tags", (self._SPEC_DRAFT_TAGS,))
+        except TimeoutError as exc:
+            return self._spec_to_error(
+                f"wake_tags timed out ({exc!r}); drafter state unknown"
+            )
+        except Exception as exc:
+            return self._spec_fail(f"wake_tags failed ({exc!r}); drafter still released")
+        self._spec_note("wake", {"mapped_bytes": [r["mapped_bytes"] for r in res]})
+        self.scheduler.set_drafter_resident(True)
+        self.scheduler.set_kv_fence(None)
+        # F11: spec turns back on only after every rank has its weights again.
+        self.scheduler.set_spec_enabled(True)
+        self._spec_set_state("DFLASH2")
+        self._spec_end("DFLASH2")
+        return True
+
+    def get_gpu_free_bytes(self) -> list[dict]:
+        return self.collective_rpc("get_gpu_free_bytes")
+
+    def get_spec_mode(self) -> dict:
+        """plan 075 S1/S2: mode, state machine state, request counts by K, the
+        KV pool and the last transition (read-only)."""
+        info = self.scheduler.get_spec_mode_info()
+        spec_blocks = self.scheduler.kv_pool_spec_blocks()
+        pool_blocks = self.scheduler.kv_pool_blocks()
+        grown = pool_blocks > spec_blocks
+        pool = self.scheduler.get_kv_pool_info()
+        tail_reqs = self.scheduler.count_tail_holder_reqs() if grown else 0
+        return {
+            "mode": "dflash2" if info["spec_enabled"] else "nospec",
+            "state": info["state"],
+            "running_spec": info["running_spec"],
+            "running_nospec": info["running_nospec"],
+            "spec_inflight": info["spec_inflight"],
+            "drafter_resident": info["drafter_resident"],
+            "pool_blocks": pool_blocks,
+            "spec_blocks": spec_blocks,
+            "tail_holder_reqs": tail_reqs,  # requests (F13)
+            "tail_holder_blocks": pool["tail_holder_blocks"],
+            "error": self._spec_last_error,
+            "blocked": self._spec_blocked,
+            "last_transition": self._spec_last_transition,
+        }
+
     def execute_dummy_batch(self):
         self.model_executor.execute_dummy_batch()
 
@@ -1422,6 +1907,13 @@ class EngineCoreProc(EngineCore):
             self.output_queue.put_nowait(output)
         # Post-step hook.
         self.post_step(model_executed)
+        # plan 075 S2: move the spec hot-switch state machine forward.
+        if (
+            self.scheduler.spec_state
+            in ("NOSPEC_DRAINING", "NOSPEC_RELEASED", "DFLASH2_FENCING")
+            and not self._spec_blocked
+        ):
+            self._advance_spec_transition()
 
         # If no model execution happened but there is still scheduler work
         # (e.g. WAITING_FOR_REMOTE_KVS or delayed KV connector frees), yield

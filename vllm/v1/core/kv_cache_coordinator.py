@@ -17,6 +17,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
     MambaManager,
     SingleTypeKVCacheManager,
+    SlidingWindowManager,
     get_manager_for_kv_cache_spec,
 )
 from vllm.v1.kv_cache_interface import (
@@ -80,21 +81,78 @@ class KVCacheCoordinator(ABC):
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
+        self._mark_draft_groups()
+
+    def _mark_draft_groups(self) -> None:
+        """plan 075 S1: find the draft sliding-window group(s).
+
+        Groups explicitly flagged ``is_eagle_group`` and managed by a
+        SlidingWindowManager count. The "flag everything" fallback of
+        ``eagle_group_ids`` is deliberately not used here: a fallback-flagged
+        main group must never be skipped. DFlash does not set the flag; see
+        ``mark_draft_sliding_window_groups``.
+        """
+        groups = self.kv_cache_config.kv_cache_groups
+        draft = frozenset(
+            i
+            for i, g in enumerate(groups)
+            if g.is_eagle_group
+            and isinstance(self.single_type_managers[i], SlidingWindowManager)
+        )
+        if len(draft) >= len(groups):
+            draft = frozenset()
+        self.draft_group_ids: frozenset[int] = draft
+        for i in draft:
+            self.single_type_managers[i].is_draft_group = True
+
+    def mark_draft_sliding_window_groups(self) -> None:
+        """plan 075 S1: treat every sliding-window group as the draft group.
+
+        The DFlash family's draft attention is the only sliding-window KV in
+        its hybrid layout (target = full attention + Mamba/GDN), and 1Cat's
+        DFlash does not flag its group ``is_eagle_group`` (that flag is only
+        set for DeepSeek-V4), so the scheduler asks for this explicitly when
+        the speculative method is a DFlash variant. Never marks every group.
+        """
+        groups = self.kv_cache_config.kv_cache_groups
+        draft = frozenset(
+            i
+            for i in range(len(groups))
+            if isinstance(self.single_type_managers[i], SlidingWindowManager)
+        )
+        if not draft or len(draft) >= len(groups):
+            return
+        self.draft_group_ids = self.draft_group_ids | draft
+        for i in draft:
+            self.single_type_managers[i].is_draft_group = True
+
+    def register_request_spec(self, request_id: str, spec_off: bool) -> None:
+        """plan 075 S1: tell every group manager whether the request is K=0.
+
+        Idempotent; KVCacheManager calls it before each entry point that
+        reaches the managers, so the manager signatures stay unchanged.
+        """
+        for manager in self.single_type_managers:
+            manager.register_request_spec(request_id, spec_off)
 
     def configure_prefix_cache_retention(self, interval: int | None) -> None:
         """Validate after 1Cat has resolved the heterogeneous cache geometry."""
         self.retention_interval = interval
         if interval is None or not self.enable_caching:
             return
-        mamba = [m for m in self.single_type_managers if isinstance(m, MambaManager)]
-        if not mamba:
+        sparse_mgrs = [
+            m
+            for m in self.single_type_managers
+            if isinstance(m, (MambaManager, SlidingWindowManager))
+        ]
+        if not sparse_mgrs:
             if interval == 0:
                 return
             raise ValueError(
-                "prefix_cache_retention_interval requires a Mamba cache group "
+                "prefix_cache_retention_interval requires a Mamba or SlidingWindow cache group "
                 "in this backport"
             )
-        alignment = getattr(self, "lcm_block_size", mamba[0].block_size)
+        alignment = getattr(self, "lcm_block_size", sparse_mgrs[0].block_size)
         if interval < 0 or interval % alignment:
             raise ValueError(
                 f"prefix_cache_retention_interval ({interval}) must be a non-negative "
@@ -107,17 +165,35 @@ class KVCacheCoordinator(ABC):
         """Retain both identical resend and longer-sibling resume positions.
 
         Adapted from upstream #53945/#54713. Use the current request length so
-        resumed output-token prefills follow 1Cat's existing scheduler behavior.
+        resumed output-token prefills follow 1Cat's existing scheduler behavior,
+        and also retain the prompt boundary so decode across an alignment
+        boundary never orphans the prompt resend checkpoint.
         """
+        prompt_tokens = getattr(request, "num_prompt_tokens", request.num_tokens)
         if not self.eagle_group_ids:
             # At an exact boundary, retain the completed extension block now.
             # Once the cache horizon advances, the next decode token cannot
             # retroactively admit it. The preceding boundary serves a resend.
-            return (request.num_tokens - 1, request.num_tokens)
+            pts = {
+                max(prompt_tokens - 1, 0),
+                prompt_tokens,
+                max(request.num_tokens - 1, 0),
+                request.num_tokens,
+            }
+            return tuple(sorted(pts))
         resend = (request.num_tokens - 1) // alignment * alignment
         extension = request.num_tokens // alignment * alignment
+        prompt_resend = max(prompt_tokens - 1, 0) // alignment * alignment
+        prompt_ext = prompt_tokens // alignment * alignment
         return tuple(
-            sorted({max(resend - alignment, 0), max(extension - alignment, 0)})
+            sorted(
+                {
+                    max(resend - alignment, 0),
+                    max(extension - alignment, 0),
+                    max(prompt_resend - alignment, 0),
+                    max(prompt_ext - alignment, 0),
+                }
+            )
         )
 
     def _cache_manager_blocks(
@@ -127,7 +203,7 @@ class KVCacheCoordinator(ABC):
         num_tokens: int,
         alignment: int | None = None,
     ) -> None:
-        if isinstance(manager, MambaManager):
+        if isinstance(manager, (MambaManager, SlidingWindowManager)):
             alignment = alignment or manager.block_size
             manager.cache_blocks(
                 request,
@@ -334,7 +410,14 @@ class KVCacheCoordinator(ABC):
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
+        skip_group_ids: frozenset[int] = frozenset(),
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+        """Longest common cache hit over the participating groups.
+
+        plan 075 S1: groups in ``skip_group_ids`` (the draft group) do not take
+        part: they neither constrain the hit length nor contribute blocks, and
+        their slot in the returned tuple is an empty list.
+        """
         pass
 
     def new_step_starts(self) -> None:
@@ -384,6 +467,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
+        skip_group_ids: frozenset[int] = frozenset(),
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         blocks: tuple[list[KVCacheBlock], ...] = tuple(
             [] for _ in range(self.num_single_type_manager)
@@ -446,7 +530,10 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
+        skip_group_ids: frozenset[int] = frozenset(),
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+        # A single group is never a skippable draft group (see
+        # ``_mark_draft_groups``), so ``skip_group_ids`` is ignored here.
         hit_blocks = self.single_type_managers[0].find_longest_cache_hit(
             block_hashes=block_hashes,
             max_length=max_cache_hit_length,
@@ -608,6 +695,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
+        skip_group_ids: frozenset[int] = frozenset(),
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         """
         Find the longest cache hit using an iterative fixed-point algorithm.
@@ -620,6 +708,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         Args:
             block_hashes: The block hashes of the request.
             max_cache_hit_length: The maximum length of the cache hit.
+            skip_group_ids: plan 075 S1: groups that do not take part in the
+                lookup (the draft group). They neither shorten the hit nor
+                return blocks; their slot in the result is ``[]``.
 
         Returns:
             A tuple containing:
@@ -654,9 +745,12 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         while True:
             curr_hit_length = hit_length
 
-            for idx, (spec, group_ids, manager_cls, use_eagle) in enumerate(
+            for idx, (spec, all_group_ids, manager_cls, use_eagle) in enumerate(
                 self.attention_groups
             ):
+                group_ids = [g for g in all_group_ids if g not in skip_group_ids]
+                if not group_ids:
+                    continue
                 cached_blocks = hit_blocks_by_group[group_ids[0]]
                 if isinstance(spec, FullAttentionSpec) and cached_blocks is not None:
                     # Full attention is downward-closed: we only need to look
