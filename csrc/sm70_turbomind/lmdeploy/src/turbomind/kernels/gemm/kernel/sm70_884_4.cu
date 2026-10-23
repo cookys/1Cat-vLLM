@@ -14,6 +14,44 @@ using namespace cache_policy;
 using S = cache_policy::Stream;
 using D = cache_policy::Default;
 
+// K-GEMM P1 (plan 075, Fable DESIGN daf9a9b7): whole-M decode tiles so a
+// team decode step with M = 8*c (c = 10/12/16/20 -> M = 80/96/128/160) is
+// one CTA row instead of a 64+16 pair.  Context::Filter keeps only the
+// smallest CTA_M covering M, so M <= 64 problems never see these tiles.
+// Prescaled counterparts are registered by the same list below.
+// X(CTA_M, CTA_N, CTA_K, TG_M, TG_N, Stages, TILE_C_M, TILE_C_N)
+#define SM70_NVF4_WHOLE_M_TILES(X)              \
+  X(80, 128, 64, 2, 4, 2, -1, -1)               \
+  X(80, 128, 64, 2, 2, 2, -1, -1)               \
+  X(80, 128, 32, 2, 4, 4, -1, -1)               \
+  X(80, 64, 64, 2, 2, 2, -1, -1)                \
+  X(80, 64, 64, 2, 2, 4, -1, -1)                \
+  X(96, 128, 64, 2, 4, 2, -1, -1)               \
+  X(96, 64, 64, 2, 2, 2, -1, -1)                \
+  X(128, 128, 64, 4, 2, 2, 64, 128)             \
+  X(128, 64, 64, 4, 2, 2, -1, -1)               \
+  X(160, 128, 64, 4, 2, 2, 80, 128)             \
+  X(160, 64, 64, 4, 2, 2, 80, 64)               \
+  X(160, 128, 32, 4, 2, 4, 80, 128) \
+  /* P1b: warp 40x64, 2-warp small-N, wide-N, deeper stages (epilogue needs CTA_M*CTA_N <= 128*THREADS) */ \
+  X(80, 64, 32, 2, 1, 4, -1, -1)                \
+  X(80, 64, 64, 2, 1, 2, -1, -1)                \
+  X(80, 256, 32, 2, 4, 4, 40, 256)              \
+  X(80, 256, 64, 2, 4, 2, 40, 256)              \
+  X(80, 128, 64, 2, 2, 4, -1, -1)               \
+  X(80, 128, 128, 2, 2, 2, -1, -1)              \
+  X(96, 256, 32, 2, 4, 4, 48, 256)              \
+  X(96, 128, 32, 2, 4, 4, -1, -1)               \
+  X(96, 128, 64, 2, 2, 2, -1, -1)
+
+#define SM70_NVF4_WHOLE_M_TYPE(Cfg, M, N, K, TM, TN, ST, CM, CN) \
+  Cfg::Type<M, N, K, TM, TN, 1, D, S, ST, true, 1, 16, CM, CN>
+
+inline bool Sm70Nvfp4WholeMTilesEnabled() {
+  const char* raw = std::getenv("VLLM_SM70_NVFP4_WHOLE_M_TILES");
+  return raw == nullptr || std::atoi(raw) != 0;
+}
+
 namespace {
 
 // Keep shape-specific small-N tactics out of prefill and unrelated CUDA graph
@@ -175,6 +213,12 @@ void Registry::sm70_884_4() {
         Add<C::Type< 32, 128,  32, 1, 4, 1, D, S, 2, true, 1, 16>>();
         Add<C::Type< 16, 128,  32, 1, 4, 1, D, S, 2, true, 1, 16>>();
         Add<C::Type<  8, 128,  64, 1, 4, 1, D, S, 2, true, 1, 16>>();
+        if (Sm70Nvfp4WholeMTilesEnabled()) {
+#define SM70_NVF4_ADD_WHOLE_M(M, N, K, TM, TN, ST, CM, CN) \
+          Add<SM70_NVF4_WHOLE_M_TYPE(C, M, N, K, TM, TN, ST, CM, CN)>();
+          SM70_NVF4_WHOLE_M_TILES(SM70_NVF4_ADD_WHOLE_M)
+#undef SM70_NVF4_ADD_WHOLE_M
+        }
         using Qwen38CacheB = C::Type<32, 128, 32, 1, 4, 1, D, D, 2, true, 1, 16>;
         Add(std::make_unique<Qwen38Nvfp4W2CacheBKernelImpl<typename Qwen38CacheB::Kernel>>());
         using Qwen38W13TailN64 = C::Type<32, 64, 32, 1, 2, 1, D, S, 2, true, 1, 16>;
@@ -235,6 +279,13 @@ Kernel* Sm70Nvfp4PrescaledCounterpart(const Kernel& control) {
     return k;
   if (auto* k = MatchPrescaled<B::Type<64, 128, 64, 2, 4, 1, D, S, 2, true, 1, 16, 64, 128, 1, true, true>, BP::Type<64, 128, 64, 2, 4, 1, D, S, 2, true, 1, 16, 64, 128, 1, true, true>>(control, true, true))
     return k;
+#define SM70_NVF4_MATCH_WHOLE_M(M, N, K, TM, TN, ST, CM, CN)               \
+  if (auto* k = MatchPrescaled<                                            \
+          SM70_NVF4_WHOLE_M_TYPE(C, M, N, K, TM, TN, ST, CM, CN),          \
+          SM70_NVF4_WHOLE_M_TYPE(P, M, N, K, TM, TN, ST, CM, CN)>(control)) \
+    return k;
+  SM70_NVF4_WHOLE_M_TILES(SM70_NVF4_MATCH_WHOLE_M)
+#undef SM70_NVF4_MATCH_WHOLE_M
   if (auto* k = MatchPrescaled<
           C::Type<128, 128, 16, 2, 2, 1, D, D, 2, true, 1, 16, 64, 128>,
           P::Type<128, 128, 16, 2, 2, 1, D, D, 2, true, 1, 16, 64, 128>>(
