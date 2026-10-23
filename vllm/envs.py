@@ -497,6 +497,8 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN: int = 32768
     VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_EXTRA_PAGES: str = ""
     VLLM_FLASH_V100_GROUPED_VERIFY_MTP: bool = False
+    VLLM_FLASH_V100_K7A_SEGMENTED_RENEWAL: bool = True
+    VLLM_FLASH_V100_K7A2_BATCHED_DECODER_ROWS: bool = False
     VLLM_FLASH_V100_DFLASH2_FIXED_INTERLEAVED: bool = True
     VLLM_FLASH_V100_DFLASH2_STAGE_PAGE_IDS: bool = True
     VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN: int = 32768
@@ -3280,6 +3282,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # native-MTP verification (2 <= q <= 16). Batched MTP stays rejected.
     "VLLM_FLASH_V100_GROUPED_VERIFY_MTP": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_GROUPED_VERIFY_MTP", "0"))
+    ),
+    # K7a (plan 075): short-q renewal rows -> segmented S1 grouped verify.
+    "VLLM_FLASH_V100_K7A_SEGMENTED_RENEWAL": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_K7A_SEGMENTED_RENEWAL", "1"))
+    ),
+    "VLLM_FLASH_V100_K7A2_BATCHED_DECODER_ROWS": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_K7A2_BATCHED_DECODER_ROWS", "0"))
     ),
     "VLLM_FLASH_V100_DFLASH2_FIXED_INTERLEAVED": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_DFLASH2_FIXED_INTERLEAVED", "1"))

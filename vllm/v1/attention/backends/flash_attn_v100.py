@@ -993,6 +993,61 @@ class _GroupedVerifyRequestView:
         return getattr(self._meta, name)
 
 
+class _GroupedVerifyGatheredView:
+    """K7a-2: n-request view gathered from row indices of batch metadata.
+
+    ``index_select`` copies the selected block_table / seq_lens rows into new
+    contiguous int32 tensors (request-major), so the S1 grouped verify sees a
+    plain B=n batch of q8 requests.
+    """
+
+    def __init__(self, meta, rows, device, query_len: int = 8):
+        self._meta = meta
+        self.rows = list(rows)
+        self.num_reqs = len(self.rows)
+        self.max_query_len = query_len
+        idx = torch.tensor(self.rows, device=device, dtype=torch.long)
+        self.block_table = meta.block_table.index_select(0, idx)
+        self.seq_lens = meta.seq_lens.index_select(0, idx)
+
+    def __getattr__(self, name):
+        return getattr(self._meta, name)
+
+
+# K7a (plan 075) process-level counters, logged cumulatively every
+# _K7A_LOG_EVERY events (1 = every event; a coarser cadence cannot be diffed over a short window) so the readout can diff them over a window.
+_K7A_SEG_WIDTH = 8
+_K7A_MAX_Q = 104
+_K7A_BASE_FACTOR = 16
+_K7A_LOG_EVERY = 1
+_k7a_counters = {
+    "rows": 0,
+    "segments": 0,
+    "fallbacks": 0,
+    "bridge_q_le_104": 0,
+    "bridge_q_le_104_geom": 0,
+    "k7a2_calls": 0,
+    "k7a2_rows": 0,
+}
+_k7a_events = 0
+
+
+def _k7a_note(**delta: int) -> None:
+    global _k7a_events
+    for key, val in delta.items():
+        _k7a_counters[key] += val
+    _k7a_events += 1
+    if _k7a_events % _K7A_LOG_EVERY == 1 or _k7a_events % _K7A_LOG_EVERY == 0:
+        logger.info(
+            "FLASH_ATTN_V100 K7A counters (cumulative, events=%d): %s",
+            _k7a_events,
+            json.dumps(_k7a_counters, sort_keys=True),
+        )
+    if _route_summary_enabled():
+        for key, val in _k7a_counters.items():
+            _route_counts[f"k7a_counter_{key}"] = val
+
+
 def _is_cuda_graph_capturing(tensor: torch.Tensor) -> bool:
     return bool(tensor.is_cuda and torch.cuda.is_current_stream_capturing())
 
@@ -6004,6 +6059,10 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 qsl,
                 seq_lens_cpu,
             )
+        k7a_on = bool(
+            envs.VLLM_FLASH_V100_K7A_SEGMENTED_RENEWAL
+            and self.flash_attn_grouped_verify_paged is not None
+        )
         for request in range(len(qsl) - 1):
             if request in decode_rows:
                 continue
@@ -6014,6 +6073,29 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             seq_len = int(seq_lens_cpu[request])
             if seq_len < end - start:
                 raise ValueError("NVFP4 prefill sequence is shorter than its query")
+            if k7a_on:
+                k7a_q = end - start
+                k7a_geom = (
+                    _K7A_SEG_WIDTH <= k7a_q <= _K7A_MAX_Q
+                    and seq_len - k7a_q >= _K7A_BASE_FACTOR * k7a_q
+                )
+                if k7a_geom and self._run_k7a_segmented_verify(
+                    layer,
+                    query,
+                    key_cache,
+                    value_cache,
+                    attn_metadata.block_table,
+                    request,
+                    start,
+                    end,
+                    seq_len,
+                    output,
+                ):
+                    continue
+                if k7a_q <= _K7A_MAX_Q:
+                    _k7a_note(
+                        bridge_q_le_104=1, bridge_q_le_104_geom=int(k7a_geom)
+                    )
             result = self._run_fp8_prefill_bridge(
                 query=query[start:end].unsqueeze(0),
                 key_cache=key_cache,
@@ -6079,6 +6161,10 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             return set()
 
         consumed = set(rows)
+        if envs.VLLM_FLASH_V100_K7A2_BATCHED_DECODER_ROWS:
+            rows = self._run_k7a2_batched_decoder_rows(
+                layer, query, key_cache, value_cache, attn_metadata, output, qsl, rows
+            )
         rows = self._run_grouped_per_request_rows(
             layer, query, key_cache, value_cache, attn_metadata, output, qsl, rows
         )
@@ -6595,6 +6681,163 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 output[qsl[i] : qsl[i] + width],
             )
         done = set(grouped)
+        return [i for i in rows if i not in done]
+
+    def _k7a_s1_selected(
+        self,
+        query_seg: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> bool:
+        """True when select_native would hand back S1/A1B (not the FIX base).
+
+        Pure mirror of ``team_serving.select_native``'s ``use`` decision (no
+        route-selection side effects), so a FIX-bound shape falls back to the
+        bridge instead of paying 7 FIX verify launches per renewal row.
+        """
+        from flash_attn_v100 import team_serving
+
+        name = os.getenv("FLASH_V100_VERIFY_ARM")
+        name = "A1B" if name == "A1" else name
+        return bool(
+            name in ("S1", "A1B")
+            and team_serving.eligible(
+                query_seg,
+                key_cache,
+                value_cache,
+                block_table,
+                seq_lens,
+                self.kv_cache_dtype,
+                True,
+            )
+        )
+
+    def _run_k7a_segmented_verify(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_table_all: torch.Tensor,
+        request: int,
+        start: int,
+        end: int,
+        seq_len: int,
+        output: torch.Tensor,
+    ) -> bool:
+        """K7a-1: a short-q renewal row as ceil(q/8) S1 grouped-verify calls.
+
+        Segment j < nseg-1 covers rows [8j, 8j+8) with seq_len_j = base+8(j+1);
+        the last segment covers rows [q-8, q) with seq_len_j = seq_len (it
+        overlaps the previous segment when q % 8 != 0 and recomputes the same
+        rows). No zero padding and no read past seq_len. Returns False (caller
+        runs the bridge) when select_native would not pick S1.
+        """
+        q = end - start
+        base = seq_len - q
+        width = _K7A_SEG_WIDTH
+        nseg = -(-q // width)
+        block_table = block_table_all[request : request + 1]
+        seq_lens_j = (
+            torch.arange(
+                1, nseg + 1, device=query.device, dtype=block_table.dtype
+            )
+            * width
+            + base
+        )
+        seq_lens_j[nseg - 1] = seq_len
+        if not self._k7a_s1_selected(
+            query[start : start + width],
+            key_cache,
+            value_cache,
+            block_table,
+            seq_lens_j[0:1],
+        ):
+            _record_route("nvfp4_k7a_fallback_bridge")
+            _k7a_note(fallbacks=1)
+            return False
+        k_scale = float(layer._k_scale_float)
+        v_scale = float(layer._v_scale_float)
+        for j in range(nseg):
+            a = width * j if j < nseg - 1 else q - width
+            self.flash_attn_grouped_verify_paged(
+                query[start + a : start + a + width],
+                key_cache,
+                value_cache,
+                block_table,
+                seq_lens_j[j : j + 1],
+                softmax_scale=self.scale,
+                out=output[start + a : start + a + width],
+                kv_cache_dtype=self.kv_cache_dtype,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                one_pass=True,
+            )
+        _record_route("nvfp4_k7a_segmented_verify")
+        _k7a_note(rows=1, segments=nseg)
+        return True
+
+    def _run_k7a2_batched_decoder_rows(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+        qsl: list[int],
+        rows: list[int],
+    ) -> list[int]:
+        """K7a-2: all eligible q == 8 decoder rows in ONE B=n grouped verify.
+
+        Only taken with S1 selected for the gathered batch; otherwise (or with
+        fewer than two eligible rows) the rows are returned untouched for the
+        per-request path. Returns the rows still needing the later paths.
+        """
+        if not self._grouped_verify_per_request_enabled():
+            return rows
+        width = _DFLASH2_VERIFY_WIDTH
+        grouped = [
+            i
+            for i in rows
+            if qsl[i + 1] - qsl[i] == width
+            and self._grouped_verify_request_eligible(
+                query[qsl[i] : qsl[i] + width],
+                key_cache,
+                value_cache,
+                attn_metadata,
+                i,
+            )
+        ]
+        if len(grouped) < 2:
+            return rows
+        max_b = 20 if os.getenv("VLLM_TEAM_MIXED") == "1" else 16
+        done: set[int] = set()
+        for lo in range(0, len(grouped), max_b):
+            chunk = grouped[lo : lo + max_b]
+            if len(chunk) < 2:
+                continue
+            view = _GroupedVerifyGatheredView(attn_metadata, chunk, query.device)
+            idx = torch.tensor(
+                [qsl[i] + t for i in chunk for t in range(width)],
+                device=query.device,
+                dtype=torch.long,
+            )
+            q_g = query.index_select(0, idx)
+            if not self._k7a_s1_selected(
+                q_g, key_cache, value_cache, view.block_table, view.seq_lens
+            ):
+                continue
+            out_g = torch.empty_like(q_g)
+            _record_route("nvfp4_k7a2_batched_decoder_rows")
+            self._call_dflash2_grouped_verify(
+                layer, q_g, key_cache, value_cache, view, out=out_g
+            )
+            output.index_copy_(0, idx, out_g)
+            _k7a_note(k7a2_calls=1, k7a2_rows=len(chunk))
+            done.update(chunk)
         return [i for i in rows if i not in done]
 
     def _try_grouped_verify_per_request(
