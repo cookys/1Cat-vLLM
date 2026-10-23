@@ -614,7 +614,7 @@ def tilelang_fused_chunk_gdr_fwd_sm70(
         h: T.Tensor(h_shape, dtype=h_dtype),
         ht: T.Tensor(ht_shape, dtype=ht_dtype),
     ):
-        with T.Kernel(T.ceildiv(DV, block_DV) * batch_size * H, threads=128) as (bbhv,):
+        with T.Kernel(T.ceildiv(DV, block_DV) * batch_size * H, threads=256) as (bbhv,):
             bbh, bv = bbhv // T.ceildiv(DV, block_DV), bbhv % T.ceildiv(DV, block_DV)
             bb, bh = bbh // H, bbh % H
             bhg = bh // (H // Hg)
