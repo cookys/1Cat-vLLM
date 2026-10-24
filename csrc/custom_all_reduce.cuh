@@ -324,6 +324,38 @@ inline int custom_allreduce_block_limit(int default_limit, int world_size,
   return static_cast<int>(parsed);
 }
 
+// Plan 075 R1 (c10 AR 800 KiB geometry cell): the SM70 TP4 fp16 20x256 window is
+// [512 KiB, 768 KiB] by default. VLLM_CUSTOM_ALLREDUCE_SM70_WINDOW_MAX_KIB raises the
+// upper bound (default 768 = the previous behaviour, bit-identical launch choice).
+// Bytes above 768 KiB that fall inside the raised window use
+// VLLM_CUSTOM_ALLREDUCE_SM70_EXT_BLOCKS CTAs (default 20) x 256 threads; the
+// original 512-768 KiB range always keeps 20 x 256.
+inline size_t sm70_tp4_window_max_bytes() {
+  const char* raw = std::getenv("VLLM_CUSTOM_ALLREDUCE_SM70_WINDOW_MAX_KIB");
+  if (raw == nullptr || raw[0] == '\0') return 768 * 1024;
+  char* end = nullptr;
+  const long parsed = std::strtol(raw, &end, 10);
+  if (end == raw || *end != '\0' || parsed < 768 || parsed > 8192) {
+    throw std::runtime_error(
+        "Invalid VLLM_CUSTOM_ALLREDUCE_SM70_WINDOW_MAX_KIB: " +
+        std::string(raw) + ". Expected an integer in [768, 8192].");
+  }
+  return static_cast<size_t>(parsed) * 1024;
+}
+
+inline int sm70_tp4_window_ext_blocks() {
+  const char* raw = std::getenv("VLLM_CUSTOM_ALLREDUCE_SM70_EXT_BLOCKS");
+  if (raw == nullptr || raw[0] == '\0') return 20;
+  char* end = nullptr;
+  const long parsed = std::strtol(raw, &end, 10);
+  if (end == raw || *end != '\0' || parsed <= 0 || parsed > kMaxBlocks) {
+    throw std::runtime_error(
+        "Invalid VLLM_CUSTOM_ALLREDUCE_SM70_EXT_BLOCKS: " + std::string(raw) +
+        ". Expected an integer in [1, " + std::to_string(kMaxBlocks) + "].");
+  }
+  return static_cast<int>(parsed);
+}
+
 inline int sm70_tp4_m5_allreduce_threads(int world_size, bool fully_connected,
                                          size_t bytes) {
   const char* raw = std::getenv("VLLM_SM70_TP4_M5_AR_THREADS");
@@ -2019,12 +2051,13 @@ class CustomAllreduce {
       const char* blocks_override =
           std::getenv("VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT");
       if (world_size_ == 4 && fully_connected_ && bytes >= 512 * 1024 &&
-          bytes <= 768 * 1024 && block_limit == defaultBlockLimit &&
+          bytes <= sm70_tp4_window_max_bytes() &&
+          block_limit == defaultBlockLimit &&
           (blocks_override == nullptr || blocks_override[0] == '\0') &&
           std::getenv("VLLM_CUSTOM_ALLREDUCE_ALGO") == nullptr &&
           custom_allreduce_current_device_is_sm70()) {
         threads = 256;
-        block_limit = 20;
+        block_limit = bytes <= 768 * 1024 ? 20 : sm70_tp4_window_ext_blocks();
       }
     }
     int blocks = std::min(block_limit, (size + threads - 1) / threads);
