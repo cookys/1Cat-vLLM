@@ -17,6 +17,8 @@ typedef __hip_bfloat16 nv_bfloat16;
 #include <unordered_map>
 #include <vector>
 #include <cstdlib>
+#include <cstdio>
+#include <unistd.h>
 #include <cstring>
 #include <string>
 
@@ -341,6 +343,28 @@ inline size_t sm70_tp4_window_max_bytes() {
         std::string(raw) + ". Expected an integer in [768, 8192].");
   }
   return static_cast<size_t>(parsed) * 1024;
+}
+
+// Subthreshold bundle P1 (route counter): VLLM_CUSTOM_ALLREDUCE_ROUTE_LOG=1 makes the host-side dispatch print, per process, one stderr line
+// "[ar-route] pid=.. dev=.. rank=.. ws=.. bytes=.. blocks=.. threads=.. algo=1stage|2stage count=N" for every distinct (bytes, blocks, threads) the
+// CUDA-graph capture / eager path dispatches, at the 1st, 2nd, 4th, 8th ... occurrence. Default unset = no output, no behaviour change.
+// Under CUDA-graph capture the host dispatch runs once per capture, so `count` counts dispatches (captures), not graph replays.
+inline void sm70_ar_route_log(int rank, int world_size, size_t bytes, int blocks, int threads, bool two_stage) {
+  const char* raw = std::getenv("VLLM_CUSTOM_ALLREDUCE_ROUTE_LOG");
+  if (raw == nullptr || raw[0] != '1') return;
+  struct Key { size_t bytes; int blocks; int threads; bool two; unsigned long count; };
+  static thread_local std::vector<Key> seen;
+  Key* k = nullptr;
+  for (auto& s : seen) {
+    if (s.bytes == bytes && s.blocks == blocks && s.threads == threads && s.two == two_stage) { k = &s; break; }
+  }
+  if (k == nullptr) { seen.push_back({bytes, blocks, threads, two_stage, 0}); k = &seen.back(); }
+  ++k->count;
+  if ((k->count & (k->count - 1)) != 0) return;
+  int dev = -1;
+  cudaGetDevice(&dev);
+  std::fprintf(stderr, "[ar-route] pid=%d dev=%d rank=%d ws=%d bytes=%zu blocks=%d threads=%d algo=%s count=%lu\n", static_cast<int>(getpid()), dev, rank,
+               world_size, bytes, blocks, threads, two_stage ? "2stage" : "1stage", k->count);
 }
 
 inline int sm70_tp4_window_ext_blocks() {
@@ -2089,6 +2113,10 @@ class CustomAllreduce {
             ". Valid values: 1stage, oneshot, 2stage, twoshot");
       }
     }
+
+    sm70_ar_route_log(rank_, world_size_, bytes, blocks, threads,
+                      force_2stage || (!force_1stage && world_size_ != 2 && fully_connected_ &&
+                                       !((world_size_ <= 4 && bytes < 512 * 1024) || (world_size_ <= 8 && bytes < 256 * 1024))));
 
 #define KL(ngpus, name)                                                       \
   name<T, ngpus><<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, \
