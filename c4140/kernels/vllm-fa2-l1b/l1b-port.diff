@@ -1,0 +1,49 @@
+--- a/csrc/flash_attn/src/flash_fwd_d256_splitd_sm70.cu	2026-10-28 17:09:13.803986447 +0800
++++ b/csrc/flash_attn/src/flash_fwd_d256_splitd_sm70.cu	2026-10-28 17:09:25.859805283 +0800
+@@ -558,6 +558,27 @@
+     copy_even_tile(gmem_k_copy, tKgKFirst, tKsKFirst);
+     __syncthreads();
+ 
++    // VARIANT: Q A-fragments resident in registers for kQRegChunks d_chunks
++    constexpr int kQRegChunks = 2;
++    const int q_n_warp = warp & 1;
++    auto sQChunk0 = local_tile(
++        sQ, Shape<Int<Traits::kQkWarpRows>, Int<kDChunk>>{},
++        make_coord(mma_group * Traits::kWarpsPerGroup + q_n_warp, 0));
++    decltype(qk_mma_thread.partition_fragment_A(sQChunk0)) tSrQ_all[kQRegChunks];
++#pragma unroll
++    for (int dc = 0; dc < kQRegChunks; ++dc) {
++        auto sQc = local_tile(
++            sQ, Shape<Int<Traits::kQkWarpRows>, Int<kDChunk>>{},
++            make_coord(mma_group * Traits::kWarpsPerGroup + q_n_warp, dc));
++        auto tOsQc = qk_mma_thread.partition_A(sQc);
++        auto smem_copy_qc =
++            make_tiled_copy_A(typename Traits::SmemCopyAtom{}, qk_tiled_mma);
++        auto smem_thread_qc = smem_copy_qc.get_thread_slice(lane);
++        auto tSsQc = smem_thread_qc.retile_S(tOsQc);
++        auto tCrA_view = smem_thread_qc.retile_D(tSrQ_all[dc]);
++        cute::copy(smem_copy_qc, tSsQc, tCrA_view);
++    }
++
+     for (int n_block = n_block_max; n_block >= n_block_min; --n_block) {
+         const int n_warp = warp & 1;
+         const int group_row_base = mma_group * Traits::kGroupRows;
+@@ -609,9 +630,15 @@
+             auto smem_thread_k = smem_copy_k.get_thread_slice(lane);
+             auto tSsQ = smem_thread_q.retile_S(tOsQ);
+             auto tSsK = smem_thread_k.retile_S(tOsK);
+-            FLASH_NAMESPACE::gemm<false, false>(
+-                acc_s, tSrQ, tSrK, tSsQ, tSsK, qk_tiled_mma,
+-                smem_copy_q, smem_copy_k, smem_thread_q, smem_thread_k);
++            if (d_chunk < kQRegChunks) {
++                FLASH_NAMESPACE::gemm<true, false>(
++                    acc_s, tSrQ_all[d_chunk < kQRegChunks ? d_chunk : 0], tSrK, tSsQ, tSsK, qk_tiled_mma,
++                    smem_copy_q, smem_copy_k, smem_thread_q, smem_thread_k);
++            } else {
++                FLASH_NAMESPACE::gemm<false, false>(
++                    acc_s, tSrQ, tSrK, tSsQ, tSsK, qk_tiled_mma,
++                    smem_copy_q, smem_copy_k, smem_thread_q, smem_thread_k);
++            }
+             if (d_chunk + 1 < Traits::kDChunks) {
+                 auto sKNext = make_tensor(
+                     make_smem_ptr(

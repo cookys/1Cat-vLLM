@@ -1,0 +1,29 @@
+{
+ "build_artifact": "/data/bench/explore/pf-p6-l1b-v1/build/so-l1b/_vllm_fa2_C.abi3.so",
+ "build_artifact_sha256": "81b515b10f25d4e5d73d8716f9945ebb485d92b7b7e018b0ebcc4866719e5c62",
+ "build_command": "scripts/fence.sh -- build/build_port.sh <patched .cu> l1b  (nvcc object l1b.o, flags from build.ninja:2417), then build/link.sh (g++-14 relink of _vllm_fa2_C with l1b.o replacing flash_fwd_d256_splitd_sm70.cu.o; other objects from /data/src/1cat-vllm-main/build/temp.linux-x86_64-cpython-312)",
+ "build_dir": "/data/bench/explore/pf-p6-l1b-v1/build",
+ "committed_sources": {
+  "original(base)": "57c261bfd91beee742e49a40cffb5aa375bd6589d7c7e9d93b3eda8665d5dd47",
+  "original_equals_deps_file": true,
+  "patched": "04fa52d483424119b980634d7dd1d72cc9c49c55a3ae8bacbe3b555ec5bebf18"
+ },
+ "compilers": {
+  "cuda_toolkit": "12.9.2 / nvcc 12.9.86 (version.json at import time)",
+  "host_compiler": "g++-14 14.3.0",
+  "note": "queried at import time; build logs do not print versions"
+ },
+ "group": "vllm-fa2-l1b",
+ "live_so": {
+  "nm_defined_symbols": 573,
+  "path": "/data/bench/explore/stage-develop-cs-g20-pool-v3-pf-d2dense-tbl2-mpad/vllm/vllm_flash_attn/_vllm_fa2_C.abi3.so",
+  "sass_kernel_count": 125,
+  "sha256": "81b515b10f25d4e5d73d8716f9945ebb485d92b7b7e018b0ebcc4866719e5c62",
+  "size": 28204096,
+  "stage_rel": "vllm/vllm_flash_attn/_vllm_fa2_C.abi3.so"
+ },
+ "matches_live": true,
+ "not_rebuilt": true,
+ "note": "the .cu lives in FetchContent dep vllm-flash-attn-src (.deps), not in the fork git; committed here with no upstream home. Object l1b.o sha256 b7228aef6b7e6b9a0d95923a6b7aeb8175b1e64a6f8b7e526f61cd211fe76984",
+ "rulings": "RULING-pf-p6-l1b-v1 531ee4c1; RULING-pf-pool-serve-v3 d26440d7"
+}

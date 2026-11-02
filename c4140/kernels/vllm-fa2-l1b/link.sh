@@ -1,0 +1,16 @@
+#!/bin/bash
+# Link, exact rule + object list + g++-14 line of pattn-build-20261023/link.sh (CXX_MODULE_LIBRARY_LINKER___vllm_fa2_C_RelWithDebInfo); here the replaced object is flash_fwd_d256_splitd_sm70.cu.o (so-l1b only).
+# usage: link.sh   (run under scripts/fence.sh --mem 16G --cpu 8 -- bash link.sh)
+set -e
+cd /data/bench/explore/pf-p6-l1b-v1/build
+B=/data/src/1cat-vllm-main/build/temp.linux-x86_64-cpython-312
+for name in base l1b; do
+  mkdir -p so-$name
+  OBJS=""
+  for o in vllm-flash-attn/CMakeFiles/_vllm_fa2_C.dir/csrc/flash_attn/flash_api.cpp.o vllm-flash-attn/CMakeFiles/_vllm_fa2_C.dir/csrc/flash_attn/flash_api_torch_lib.cpp.o vllm-flash-attn/CMakeFiles/_vllm_fa2_C.dir/csrc/flash_attn/src/flash_fwd_d256_splitd_sm70.cu.o vllm-flash-attn/CMakeFiles/_vllm_fa2_C.dir/csrc/flash_attn/src/flash_fwd_hdim256_causal_prefill_sm70.cu.o vllm-flash-attn/CMakeFiles/_vllm_fa2_C.dir/csrc/flash_attn/src/flash_fwd_split_hdim256_causal_prefill_sm70.cu.o vllm-flash-attn/CMakeFiles/_vllm_fa2_C.dir/__/__/csrc/attention/sm70_v37/prefill.cu.o vllm-flash-attn/CMakeFiles/_vllm_fa2_C.dir/__/__/csrc/attention/sm70_v37/tail.cu.o vllm-flash-attn/CMakeFiles/_vllm_fa2_C.dir/__/__/csrc/attention/sm70_v37/bridge.cu.o vllm-flash-attn/CMakeFiles/_vllm_fa2_C.dir/__/__/csrc/attention/sm70_v37/register.cpp.o vllm-flash-attn/CMakeFiles/_vllm_fa2_C.dir/__/__/csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu.o vllm-flash-attn/CMakeFiles/_vllm_fa2_C.dir/__/__/csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu.o vllm-flash-attn/CMakeFiles/_vllm_fa2_C.dir/__/__/csrc/attention/sm70_79t/prefill.cu.o vllm-flash-attn/CMakeFiles/_vllm_fa2_C.dir/__/__/csrc/attention/sm70_79t/prefill_q8192.cu.o vllm-flash-attn/CMakeFiles/_vllm_fa2_C.dir/__/__/csrc/attention/sm70_79t/legacy_tail_adapter.cu.o vllm-flash-attn/CMakeFiles/_vllm_fa2_C.dir/__/__/csrc/attention/sm70_79t/register.cpp.o; do
+    case $o in *csrc/flash_attn/src/flash_fwd_d256_splitd_sm70.cu.o) if [ $name = l1b ]; then o=/data/bench/explore/pf-p6-l1b-v1/build/port/l1b.o; else o=$B/$o; fi;; *) o=$B/$o;; esac
+    OBJS="$OBJS $o"
+  done
+  /usr/bin/g++-14 -fPIC -I/usr/local/cuda/include -O2 -g -DNDEBUG -shared -o so-$name/_vllm_fa2_C.abi3.so $OBJS -L/lib/intel64   -L/lib/intel64_win   -L/lib/win-x64   -L/usr/local/cuda/targets/x86_64-linux/lib/stubs   -L/usr/local/cuda/targets/x86_64-linux/lib -Wl,-rpath,/lib/intel64:/lib/intel64_win:/lib/win-x64:/data/venvs/1cat-main/lib/python3.12/site-packages/torch/lib:/usr/local/cuda/lib64:  /data/venvs/1cat-main/lib/python3.12/site-packages/torch/lib/libtorch.so  /usr/local/cuda/lib64/libcudart.so  /usr/lib/x86_64-linux-gnu/libcuda.so  /usr/local/cuda/lib64/libcublas.so  -Wl,--no-as-needed,"/data/venvs/1cat-main/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so" -Wl,--as-needed  -Wl,--no-as-needed,"/data/venvs/1cat-main/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so" -Wl,--as-needed  /data/venvs/1cat-main/lib/python3.12/site-packages/torch/lib/libc10_cuda.so  /data/venvs/1cat-main/lib/python3.12/site-packages/torch/lib/libc10.so  /usr/local/cuda/lib64/libcudart.so  /usr/local/cuda/lib64/libcublasLt.so  -lcudadevrt  -lcudart_static  -lrt  -lpthread  -ldl > logs/link-$name.log 2>&1
+  echo linked $name
+done
