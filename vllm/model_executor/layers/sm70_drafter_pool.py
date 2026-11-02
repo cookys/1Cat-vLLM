@@ -34,10 +34,10 @@ DRAFT_PREFIXES = ("draft_model.", "model.layers.", "model.fc")
 # down / gate_up are exact M = 128 (in-graph, padded to the capture size; RULING-drafter-gateup-live-v1). fc / ctxkv are EMPTY in this source: compose_stage_v3.py fills the two marked lines verbatim from the table.json of drafter-table-live-m-v1
 # (every range = the contiguous measured-PASS M values of that cell, never widened by hand). An empty list never routes.
 RANGE_TABLE = {
-    (5120, 4352): [(128, 128, 2)],    # down    S2 (exact M 128)
-    (8704, 5120): [(128, 128, 1)],    # gate_up S1 (exact M 128)
-    (1280, 25600): [(112, 128, 8)],    # fc      ranges from drafter-table-live-m-v1 table.json
-    (2560, 5120): [(96, 128, 4)],    # ctxkv   ranges from drafter-table-live-m-v1 table.json
+    (5120, 4352): [(96, 128, 2)],    # down    S2 (M 96..128, drafter-table-m104-v1 table.json ee7e660f)
+    (8704, 5120): [(96, 128, 1)],    # gate_up S1 (M 96..128, drafter-table-m104-v1 table.json ee7e660f)
+    (1280, 25600): [(96, 128, 8)],    # fc      S8 (M 96..128, drafter-table-m104-v1 table.json ee7e660f)
+    (2560, 5120): [(96, 128, 4)],    # ctxkv   S4 (M 96..128, drafter-table-m104-v1 table.json ee7e660f)
 }
 SHAPE_NAMES = {(8704, 5120): "gate_up", (5120, 4352): "down", (1280, 25600): "fc", (2560, 5120): "ctxkv"}      # (N, K) -> name
 # derived views (receipt / slot_check): one entry per range, keyed at the range's m_hi
