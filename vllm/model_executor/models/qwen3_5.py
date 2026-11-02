@@ -128,7 +128,6 @@ def _sm70_qwen35_gdn_split_kernel(
     output,
     stride_qkvz_row: tl.int64,
     stride_ba_row: tl.int64,
-    num_rows: tl.constexpr,
     qkv_size: tl.constexpr,
     z_size: tl.constexpr,
     ba_size: tl.constexpr,
@@ -136,6 +135,7 @@ def _sm70_qwen35_gdn_split_kernel(
     BLOCK_BA: tl.constexpr,
 ):
     row = tl.program_id(0)
+    num_rows = tl.num_programs(0)
 
     z_cols = tl.arange(0, BLOCK_Z)
     z_mask = z_cols < z_size
@@ -197,7 +197,6 @@ def _sm70_materialize_qwen35_gdn_splits(
         packed,
         mixed_qkvz.stride(0),
         mixed_ba.stride(0),
-        num_rows=num_rows,
         qkv_size=qkv_size,
         z_size=z_size,
         ba_size=ba_size,
@@ -347,6 +346,15 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
         self.use_split_input_projections = _uses_split_gdn_input_projections(
             self.quant_config
         )
+        if (
+            self.enable_sm70_dflash2_fused_gdn_combined_split
+            and not self.use_split_input_projections
+        ):
+            # Logged at construction, never inside the traced forward.
+            logger.info_once(
+                "SM70 DFlash2 combined QKVZBA split route enabled (any batch size).",
+                scope="local",
+            )
 
     def create_qkvz_proj(
         self,
@@ -481,7 +489,6 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
             mixed_qkv = mixed_qkvzba[..., :qkv_size]
             if (
                 self.enable_sm70_dflash2_fused_gdn_combined_split
-                and num_tokens == 8
                 and mixed_qkvzba.dtype == torch.float16
                 and (qkv_size, z_size, ba_size) == (2560, 1536, 12)
             ):
@@ -493,10 +500,6 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
                     qkv_size,
                     z_size,
                     ba_size,
-                )
-                logger.info_once(
-                    "SM70 DFlash2 combined QKVZBA q8 split route hit.",
-                    scope="local",
                 )
             else:
                 z = _sm70_compile_graph_slice_dim(mixed_qkvzba, -1, z_start, z_size)
