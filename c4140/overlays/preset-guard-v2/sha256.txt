@@ -1,0 +1,2 @@
+1c73ab72bab238c416d334cfd9000390260503d3d227a862e73152ad59ce9673  /data/bench/explore/preset-guard-v2/manifest-v2.json
+2fba9efae532c2d1ba8b5684ba6a5cd08fbfc2385625ff31790a3f5f994d9a0e  /data/bench/explore/preset-guard-v2/READY-v2.md

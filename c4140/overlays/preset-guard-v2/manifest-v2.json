@@ -1,0 +1,24 @@
+{
+  "status": "CPU_READY",
+  "gpu_run": false,
+  "tests": 14,
+  "policy": "any mode gmu >= 0.88 blocks effective non-null prompt_logprobs",
+  "files": {
+    "/data/bench/explore/preset-guard-v2/LIMITS-v2.md": "1e183e853b47c9bd4b817947fe35d034dc3609267795acda96ca9efbf1661b63",
+    "/data/bench/explore/preset-guard-v2/README-v2.md": "4bc40ce1703ac7943a472b5c6d16751094c763a460c46f1b0e1d81aa6b9cdccb",
+    "/data/bench/explore/preset-guard-v2/launch-dflash2-guard-v2.sh": "c1baae6d222304fa253f279a24c0c7c6f8dae392ed7e6a3fe1b9f6d11853e877",
+    "/data/bench/explore/preset-guard-v2/launch-nospec-guard-v2.sh": "b743fca8c125a9bd600c09b25d63a9c3b2c0e8187b4f5e66cff71a20fb07f7f7",
+    "/data/bench/explore/preset-guard-v2/preset_guard_v2.py": "98073c35c888fb10678a2381cea452e7df544bf25bf5ff8d321775c94457f1a8",
+    "/data/bench/explore/preset-guard-v2/selfcheck-v2.py": "913fa19adc59c5e2f9b6a0d4eceb6390c5694cf8edfac5dceda7c464cf785782",
+    "/data/bench/explore/preset-guard-v2/test_guard_v2.py": "079a1bf39745da1064f60f3c13afff674f8ec678c80217cb017d51d96cee7a38",
+    "/data/bench/explore/preset-guard-v2-cpu/dflash92.argv": "829b45c3bdd3d1e5f64b7d4638d349db88f17a38b946991391ece8ce58b27c87",
+    "/data/bench/explore/preset-guard-v2-cpu/launch-check.json": "42a534dc0d40f3e05da5d499436a0defcdc70fadbca0cd8b7c06573982123899",
+    "/data/bench/explore/preset-guard-v2-cpu/nospec92.argv": "e7742b6cc0abaa6f7cd212db77111b886444abaa483c48577c76eb05333b2207",
+    "/data/bench/explore/preset-guard-v2-cpu/selfcheck-plan.json": "5c557146428ac74803a774336c6357b25e1146772dc2cab66cb552d81ad435a9",
+    "/data/bench/explore/preset-guard-v2-cpu/tests.log": "63850c7497860c1269c42c1859737cbb72b2d5dde8096ead0afaa40912eefa62",
+    "/home/cookys/projects/llm-playground/scripts/c4140-1cat-serve.sh": "d8b3f4c72effc654bdc13a8b2a3cd25015c091807a42c8af7a7525352682e980",
+    "/data/bench/s2-impl/c1fix/stage-FIX/vllm/entrypoints/openai/api_server.py": "b0d8c972a9601f7195fa1be04156c876e71c3871f6f43c2190a7e8e11a25851d",
+    "/data/bench/s2-impl/c1fix/stage-FIX/vllm/entrypoints/openai/completion/protocol.py": "e894c428cce7c82625e3483d5ee4650eb4ac92c9e1de9adbd29093d0cb34bba7",
+    "/data/bench/s2-impl/c1fix/stage-FIX/vllm/entrypoints/openai/chat_completion/protocol.py": "7e8964c60bed493cc4e49a38b36dbee6874375d2b208f28ca3bb53480d150f21"
+  }
+}
