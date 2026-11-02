@@ -1,0 +1,31 @@
+{
+ "anchor_source_dir": "flash-attention-v100/flash_attn_v100/_s1_native/source",
+ "build_artifact": "/data/bench/explore/pv-hmma/a1b-on-A/build/lib/flash_attn_v100_cuda.cpython-312-x86_64-linux-gnu.so",
+ "build_artifact_sha256": "c3cf94613d8a9d0ec27fb46d88534c70ac04f13108e2ad7ad023fa9ba0069e31",
+ "build_command": "python3 /data/bench/explore/pv-hmma/a1b-on-A/build.py (nvcc -c native-source/kernel/flash_decode_paged.cu ... see build-compile.argv.json, build-link.argv.json); env FLASH_V100_VERIFY_ARM=A1 selects this path",
+ "build_dir": "/data/bench/explore/pv-hmma/a1b-on-A/build",
+ "committed_source": "c4140/kernels/a1b-native/native-source/kernel/flash_decode_paged.cu (sha 145c095f) = translation unit used for the build; it differs from the anchor TU",
+ "compilers": {
+  "cuda_toolkit": "12.9.2 / nvcc 12.9.86 (version.json at import time)",
+  "host_compiler": "g++-14 14.3.0",
+  "note": "queried at import time; build logs do not print versions"
+ },
+ "group": "a1b-native",
+ "live_so": {
+  "nm_defined_symbols": 567,
+  "path": "/data/bench/explore/stage-develop-cs-g20-pool-v3-pf-d2dense-tbl2-mpad/flash_attn_v100/_a1b_native/flash_attn_v100_cuda.cpython-312-x86_64-linux-gnu.so",
+  "sass_kernel_count": 816,
+  "sha256": "c3cf94613d8a9d0ec27fb46d88534c70ac04f13108e2ad7ad023fa9ba0069e31",
+  "size": 29744576,
+  "stage_rel": "flash_attn_v100/_a1b_native/flash_attn_v100_cuda.cpython-312-x86_64-linux-gnu.so"
+ },
+ "matches_live": true,
+ "native_source_files_differing_or_absent": [
+  "kernel/a_on_loader.cuh",
+  "kernel/flash_decode_paged.cu",
+  "kernel/fp8_kv_utils.cuh"
+ ],
+ "native_source_files_identical_in_anchor_tree": 36,
+ "not_rebuilt": true,
+ "rulings": "RESULT-a1b-provenance-v1 (d1/); no RULING file"
+}

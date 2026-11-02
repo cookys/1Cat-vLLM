@@ -1,0 +1,33 @@
+{
+  "name": "a1b-on-A",
+  "layout_source": "/data/bench/explore/pv-hmma/a1b-lds-v2",
+  "A_source": "/data/bench/explore/pv-hmma/verify-v2",
+  "A_so_sha256": "fe2eafc79db9beee0ebe4ea51ef295aada614a0ea22b26b9eb972455273dc859",
+  "GPU_executed": false,
+  "source_dependencies": [
+    {
+      "path": "/data/bench/explore/pv-hmma/verify-v2/native-source/kernel/pvb_a.cuh",
+      "sha256": "a356e511c94a50a068ca6d2e47561d35da7fb485f992bd2440f6b3f7666edd51"
+    },
+    {
+      "path": "/data/bench/explore/pv-hmma/verify-v2/native-source/kernel/pvb_loader.cuh",
+      "sha256": "daa8dc119eee85597f5b3a83cdb2131e298b457b48987a5082a30f3cd771cf6e"
+    },
+    {
+      "path": "/data/bench/explore/pv-hmma/a1b-lds-v2/native-source/kernel/a1_mma.cuh",
+      "sha256": "3c2700ebdb2db1b1d1e4bd478e6b9172e8fd77d30b00ed3d1644644ab8cf47b2"
+    },
+    {
+      "path": "/data/bench/explore/pv-hmma/a1b-lds-v2/native-source/kernel/a1_loader.cuh",
+      "sha256": "5d7538b82a3cf551b2e595f2a3c9b1714be5ec26d3bfbc3321dcec47902d5500"
+    },
+    {
+      "path": "/data/bench/explore/pv-hmma/verify-v2/manifest.json",
+      "sha256": "3fe67088458fa450cbaa2abdc3b7704db96af11b78a870bcc53d9f14fbd37f10"
+    },
+    {
+      "path": "/data/bench/explore/pv-hmma/a1b-lds-v2/manifest.json",
+      "sha256": "891edca6f6b82076a0dc463e0bc77ec0d3b85d74aa85917e61b2fa810694f5f0"
+    }
+  ]
+}

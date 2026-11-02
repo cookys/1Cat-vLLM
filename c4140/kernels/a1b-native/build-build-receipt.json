@@ -1,0 +1,39 @@
+{
+  "GPU_NOT_RUN": true,
+  "so": "/data/bench/explore/pv-hmma/a1b-on-A/build/lib/flash_attn_v100_cuda.cpython-312-x86_64-linux-gnu.so",
+  "sha256": "c3cf94613d8a9d0ec27fb46d88534c70ac04f13108e2ad7ad023fa9ba0069e31",
+  "reused_unchanged_objects": [
+    {
+      "path": "/data/bench/explore/pv-hmma/harness/native-build-base/temp/kernel/fused_mha_api.o",
+      "sha256": "ffdecb420129e99bff0ef17b745236536f699278545bb0d3f2491f24f07ca6db"
+    },
+    {
+      "path": "/data/bench/explore/pv-hmma/harness/native-build-base/temp/kernel/fused_mha_forward.o",
+      "sha256": "079086924d7053a70e5fbaac046197f5d9c358166ff7f486ba7c7699017a3d49"
+    },
+    {
+      "path": "/data/bench/explore/pv-hmma/harness/native-build-base/temp/kernel/fused_mha_forward_paged.o",
+      "sha256": "c168c9af818282da293d2f3dfae728dbd5b7f90d70f5671a969dc465f61a2e82"
+    },
+    {
+      "path": "/data/bench/explore/pv-hmma/harness/native-build-base/temp/kernel/fp8_kv_bridge.o",
+      "sha256": "cc054dfc83f91c8efb03b080671eb8562bc1d3addcc25c9696320296dac962c1"
+    },
+    {
+      "path": "/data/bench/explore/pv-hmma/harness/native-build-base/temp/kernel/flash_decode_turboquant.o",
+      "sha256": "cb2921550f4bb75e53e5302ae38ace8ed08d2f2c04443f9304e8289272a653a7"
+    },
+    {
+      "path": "/data/bench/explore/pv-hmma/harness/native-build-base/temp/kernel/fused_mha_backward.o",
+      "sha256": "f392217ded08ee128ecc647910f1827f04a5dec62c18723e1249bc4f3a27067c"
+    }
+  ],
+  "common_source_equality_verified": true,
+  "variant": "a1b-on-A",
+  "sources": {
+    "kernel/pvb_loader.cuh": "daa8dc119eee85597f5b3a83cdb2131e298b457b48987a5082a30f3cd771cf6e",
+    "kernel/pvb_b.cuh": "da44b17de2ded1bf01f1a6f59cf4a12029482ed75b8a7c1ee507e820b6a6b4b5",
+    "kernel/pvb_a.cuh": "a356e511c94a50a068ca6d2e47561d35da7fb485f992bd2440f6b3f7666edd51"
+  },
+  "translation_unit_sha256": "145c095fbb5181811c91873f239af7238d00f41fd7c4053f93dad6fc4a8c07f1"
+}

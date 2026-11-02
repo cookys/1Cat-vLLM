@@ -1,0 +1,126 @@
+--- verify-v2/pvb_a.cuh
++++ a1b-on-A/a1_verify.cuh
+@@ -1,5 +1,7 @@
+-namespace pvb_a {
+-#include "pvb_loader.cuh"
++namespace a1 {
++#include "a1_mma.cuh"
++#include "a1_loader.cuh"
++#include "a_on_loader.cuh"
+ constexpr int kGroupedVerifyQ8MaxQ = 8;
+ constexpr int kGroupedVerifyQ16MaxQ = 16;
+ constexpr int kGroupedVerifyMaxSupportedQ = kGroupedVerifyQ16MaxQ;
+@@ -7,13 +9,13 @@
+ constexpr int kGroupedVerifyHeadDim = 256;
+ constexpr int kGroupedVerifyRows = 48;
+ constexpr int kGroupedVerifyBlockN = 32;
+-constexpr int kGroupedVerifyQStride = 264;
+-constexpr int kGroupedVerifyKVStride = 264;
++constexpr int kGroupedVerifyQStride = 256;
++constexpr int kGroupedVerifyKVStride = 256;
+ // 32 floats = 128 B puts every score row in bank 0 for store_matrix_sync; 36
+ // keeps the 16-byte ldm alignment wmma requires (multiple of 4 floats) and
+ // spreads rows over banks.
+ constexpr int kGroupedVerifyScoreStride = 36;
+-constexpr int kGroupedVerifyProbStride = 40;
++constexpr int kGroupedVerifyProbStride = 64;
+ constexpr int kGroupedVerifyPageIdsCapacity = 16;
+ // One packed head group times eighty context splits maps one 512-thread CTA to
+ // each of V100's eighty SMs. Short sequences still reduce active_splits using
+@@ -180,14 +182,10 @@
+ 
+ #pragma unroll
+   for (int k_offset = 0; k_offset < kGroupedVerifyHeadDim; k_offset += 16) {
+-    volta::load_matrix_sync(
+-        q_fragment, shared_q + m_tile * 16 * kGroupedVerifyQStride + k_offset,
+-        kGroupedVerifyQStride);
++    a1_load(q_fragment, shared_q, m_tile * 16, k_offset, kGroupedVerifyQStride);
+     // K is row-major [N, D].  The same bytes represent K^T as a col-major
+     // [D, N] matrix, which is the B operand needed by Q @ K^T.
+-    volta::load_matrix_sync(
+-        k_fragment, shared_k + n_tile * 16 * kGroupedVerifyKVStride + k_offset,
+-        kGroupedVerifyKVStride);
++    a1_load(k_fragment, shared_k, n_tile * 16, k_offset, kGroupedVerifyKVStride);
+     if constexpr (COMPENSATE) {
+       // E4M3 x FP16 products fit comfortably in FP32, but a D256 Tensor
+       // Core accumulation can still lose low bits. Sum short K16 products
+@@ -281,7 +279,7 @@
+           bool SPARSE_PAGE4 = false, typename PARTIAL_T = __half,
+           bool ROW_SEQLENS = false, bool COMPENSATE_P = false>
+ __global__
+-__launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_pvb_a_verify_partial_kernel(
++__launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_a1_verify_partial_kernel(
+     const __half* __restrict__ q, const void* __restrict__ k_cache,
+     const void* __restrict__ v_cache, const int* __restrict__ block_table,
+     const int* __restrict__ seq_lens, PARTIAL_T* __restrict__ partial_out,
+@@ -441,11 +439,11 @@
+     if (token_idx < query_len && head_idx < kGroupedVerifyHeads) {
+       const int64_t query_row =
+           static_cast<int64_t>(group_idx) * MAX_QUERY_TOKENS + token_idx;
+-      shared_q_vec[row * kSharedQVecsPerRow + vec_col] = __ldg(
++      shared_q_vec[row * kSharedQVecsPerRow + (vec_col ^ a1_mask(row))] = __ldg(
+           q_vec + (query_row * kGroupedVerifyHeads + head_idx) * kVecsPerRow +
+           vec_col);
+     } else {
+-      shared_q_vec[row * kSharedQVecsPerRow + vec_col] = make_uint4(0, 0, 0, 0);
++      shared_q_vec[row * kSharedQVecsPerRow + (vec_col ^ a1_mask(row))] = make_uint4(0, 0, 0, 0);
+     }
+   }
+   if (tid < kGroupedVerifyRows) {
+@@ -663,7 +661,7 @@
+         const float tile_sum = __shfl_sync(0xffffffffu, tile_sum_lane, 0);
+         const float exp_diff =
+             tile_sum > 0.0f ? __expf(fmaxf(old_max - new_max, -80.0f)) : 1.0f;
+-        shared_probs[row * kGroupedVerifyProbStride + lane_id] =
++        shared_probs[a1_offset(row,lane_id,kGroupedVerifyProbStride)] =
+             __float2half_rn(probability);
+         __syncwarp();
+         if (lane_id == 0) {
+@@ -697,14 +695,10 @@
+ #pragma unroll
+         for (int k_offset = 0; k_offset < kGroupedVerifyBlockN;
+              k_offset += 16) {
+-          volta::load_matrix_sync(
+-              probability_fragment,
+-              shared_probs + m_tile * 16 * kGroupedVerifyProbStride + k_offset,
+-              kGroupedVerifyProbStride);
+-          volta::load_matrix_sync(
+-              value_fragment,
+-              shared_v + k_offset * kGroupedVerifyKVStride + d_tile * 16,
+-              kGroupedVerifyKVStride);
++          a1_load(probability_fragment, shared_probs, m_tile * 16, k_offset,
++                  kGroupedVerifyProbStride);
++          a1_load(value_fragment, shared_v, k_offset, d_tile * 16,
++                  kGroupedVerifyKVStride);
+           volta::mma_sync(pv_fragment, probability_fragment, value_fragment,
+                           pv_fragment);
+         }
+@@ -844,7 +838,7 @@
+         const float tile_sum = __shfl_sync(0xffffffffu, tile_sum_lane, 0);
+         const float exp_diff =
+             tile_sum > 0.0f ? __expf(fmaxf(old_max - new_max, -80.0f)) : 1.0f;
+-        shared_probs[row * kGroupedVerifyProbStride + lane_id] =
++        shared_probs[a1_offset(row,lane_id,kGroupedVerifyProbStride)] =
+             __float2half_rn(probability);
+         if constexpr (COMPENSATE_P) {
+           const float rounded = __half2float(__float2half_rn(probability));
+
+--- verify-v2/pvb_loader.cuh
++++ a1b-on-A/a_on_loader.cuh
+@@ -11,11 +11,11 @@
+ __device__ __forceinline__ void raw_store(__half* dst,const Raw& x,int r,int u) {
+   const __half2 a=__half2half2(__float2half_rn(flash_v100::fp8_e4m3fn_to_float_bits(uint8_t(x.scales))));
+   const __half2 b=__half2half2(__float2half_rn(flash_v100::fp8_e4m3fn_to_float_bits(uint8_t(x.scales>>8))));
+-  auto* o=reinterpret_cast<uint4*>(dst+r*264+u*32);
+-  o[0]=flash_v100::nvfp4_word_to_half8(x.data.x,a);
+-  o[1]=flash_v100::nvfp4_word_to_half8(x.data.y,a);
+-  o[2]=flash_v100::nvfp4_word_to_half8(x.data.z,b);
+-  o[3]=flash_v100::nvfp4_word_to_half8(x.data.w,b);
++  auto* o=reinterpret_cast<uint4*>(dst);
++  o[r*32+((u*4+0)^a1_mask(r))]=flash_v100::nvfp4_word_to_half8(x.data.x,a);
++  o[r*32+((u*4+1)^a1_mask(r))]=flash_v100::nvfp4_word_to_half8(x.data.y,a);
++  o[r*32+((u*4+2)^a1_mask(r))]=flash_v100::nvfp4_word_to_half8(x.data.z,b);
++  o[r*32+((u*4+3)^a1_mask(r))]=flash_v100::nvfp4_word_to_half8(x.data.w,b);
+ }
+ __device__ __forceinline__ void pvb_load_vk_pair(__half* v,__half* k,
+  const uint8_t* vp,const uint8_t* kp,int vt,int kt,int vv,int kv,int tid) {
