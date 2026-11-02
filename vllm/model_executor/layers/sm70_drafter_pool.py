@@ -30,13 +30,19 @@ N_VARIANTS = 3                                  # S1-F16, SPLIT-PARTIAL, SPLIT-R
 # (v1/spec_decode/draft_model.py:76) uses "draft_model". The target's modules start with "language_model.", so "model.layers." does not match them; the exact-shape table is the second guard.
 DRAFT_PREFIXES = ("draft_model.", "model.layers.", "model.fc")
 
-SPLIT_TABLE = {   # (M, N, K) -> S   (RULING-drafter-gemm-v1-fable-20261028.md sec 2 table, "median r" column; sec 3 "split table {gate_up: 1, down: 2, fc: 8, ctxkv: 4}")
-    (128, 5120, 4352): 2,    # down    S2 r 0.7257
-    (120, 1280, 25600): 8,   # fc      S8 r 0.6252
-    (120, 2560, 5120): 4,    # ctxkv   S4 r 0.8374
+# pool-serve-v3 re-key (RULING-pool-serve-v2 sec 4.2, DESIGN-pool-serve-v3 sec 1.2): the table is keyed by (N, K) and holds ranges (m_lo, m_hi, S); a call routes when m_lo <= M <= m_hi (first matching range), else it falls back.
+# down / gate_up are exact M = 128 (in-graph, padded to the capture size; RULING-drafter-gateup-live-v1). fc / ctxkv are EMPTY in this source: compose_stage_v3.py fills the two marked lines verbatim from the table.json of drafter-table-live-m-v1
+# (every range = the contiguous measured-PASS M values of that cell, never widened by hand). An empty list never routes.
+RANGE_TABLE = {
+    (5120, 4352): [(128, 128, 2)],    # down    S2 (exact M 128)
+    (8704, 5120): [(128, 128, 1)],    # gate_up S1 (exact M 128)
+    (1280, 25600): [(112, 128, 8)],    # fc      ranges from drafter-table-live-m-v1 table.json
+    (2560, 5120): [(96, 128, 4)],    # ctxkv   ranges from drafter-table-live-m-v1 table.json
 }
-SHAPE_NAMES = {(128, 8704, 5120): "gate_up", (128, 5120, 4352): "down", (120, 1280, 25600): "fc", (120, 2560, 5120): "ctxkv"}
-NK_TABLE = frozenset((n, k) for (_, n, k) in SPLIT_TABLE)
+SHAPE_NAMES = {(8704, 5120): "gate_up", (5120, 4352): "down", (1280, 25600): "fc", (2560, 5120): "ctxkv"}      # (N, K) -> name
+# derived views (receipt / slot_check): one entry per range, keyed at the range's m_hi
+SPLIT_TABLE = {(hi, n, k): s for (n, k), rs in RANGE_TABLE.items() for (lo, hi, s) in rs}
+NK_TABLE = frozenset(RANGE_TABLE)
 NON_TABLE_KEEP = 20
 
 capture_mode = False
@@ -45,6 +51,7 @@ _lib_sha8 = None
 _ws = {}                  # (M,N,K) -> preallocated fp32 workspace (uint8 tensor), created at the first eager call of that shape
 _ws_allocs = 0
 _stats = {}               # (M,N,K) -> dict(routed, fallback, capture_fallback, contract_fallback)
+_capture_sizes = {}       # (N,K) -> set of M seen while a CUDA graph was being captured (a capture is not a replay)
 _non_table = []           # first NON_TABLE_KEEP (prefix tail, M or -1, N, K) seen by the static guard for draft-prefix layers outside the table
 _total = 0
 _lock = threading.Lock()
@@ -74,8 +81,11 @@ def is_draft_prefix(prefix):
 
 
 def split_for(m, n, k):
-    """pure function of (M, N, K): the split S, or None when the shape is not in the table"""
-    return SPLIT_TABLE.get((m, n, k))
+    """pure function of (M, N, K): the split S of the first range of (N, K) with m_lo <= M <= m_hi, or None when the shape / M is not in the table"""
+    for lo, hi, s in RANGE_TABLE.get((n, k), ()):
+        if lo <= m <= hi:
+            return s
+    return None
 
 
 def _stream_ptr(x):
@@ -97,7 +107,7 @@ def _capturing():
 def _stat(key):
     s = _stats.get(key)
     if s is None:
-        s = _stats[key] = dict(routed=0, fallback=0, capture_fallback=0, contract_fallback=0)
+        s = _stats[key] = dict(routed=0, routed_capture=0, fallback=0, capture_fallback=0, contract_fallback=0)
     return s
 
 
@@ -170,13 +180,16 @@ def drafter_linear_impl(x, w):
     m = int(x2d.shape[0])
     key = (m, n, k)
     s = split_for(m, n, k)
+    cap = _capturing()
+    if cap:
+        _capture_sizes.setdefault((n, k), set()).add(m)
     if s is None:
         _bump(key, "fallback")
         return _linear_fallback(x, w)
     if not _contract_ok(x2d, w, s):
         _bump(key, "contract_fallback")
         return _linear_fallback(x, w)
-    if _capturing() and (_lib is None or (s > 1 and key not in _ws)):
+    if cap and (_lib is None or (s > 1 and key not in _ws)):
         _bump(key, "capture_fallback")
         return _linear_fallback(x, w)
     global _ws_allocs
@@ -190,7 +203,7 @@ def drafter_linear_impl(x, w):
         ws_ptr = ws.data_ptr()
     out = torch.empty((m, n), dtype=torch.float16, device=x.device)
     lib.run(m, n, k, s, x2d.data_ptr(), w.data_ptr(), out.data_ptr(), ws_ptr, _stream_ptr(x))
-    _bump(key, "routed")
+    _bump(key, "routed_capture" if cap else "routed")
     return out.reshape(*x.shape[:-1], n)
 
 
@@ -245,12 +258,17 @@ def maybe_linear_weight(x, w, bias):
 
 
 def _table_summary():
+    """per table (N, K) (DESIGN-pool-serve-v3 sec 1.2): eager calls whose M is inside a range (routed + fallback + contract_fallback; capture-time calls are not eager), eager routed, hit_rate = routed / in-range eager calls
+    (None when there are none), capture_sizes = sorted M seen under capture, in_graph = capture_sizes inside a range. calls_at_nk / routed are kept for the v2 readers (calls_at_nk = every call at (N, K), routed = eager routed)."""
     out = {}
-    for (m, n, k), s in SPLIT_TABLE.items():
-        calls = [v for (mm, nn, kk), v in _stats.items() if (nn, kk) == (n, k)]
-        tot = sum(sum(v.values()) for v in calls)
-        routed = sum(v["routed"] for v in calls)
-        out[SHAPE_NAMES[(m, n, k)]] = dict(m=m, n=n, k=k, split=s, calls_at_nk=tot, routed=routed, hit_rate=(routed / tot if tot else None))
+    for (n, k), rs in RANGE_TABLE.items():
+        inr = lambda m: any(lo <= m <= hi for lo, hi, _s in rs)
+        calls = [(mm, v) for (mm, nn, kk), v in _stats.items() if (nn, kk) == (n, k)]
+        in_eager = sum(v["routed"] + v["fallback"] + v["contract_fallback"] for mm, v in calls if inr(mm))
+        routed = sum(v["routed"] for mm, v in calls if inr(mm))
+        caps = sorted(_capture_sizes.get((n, k), ()))
+        out[SHAPE_NAMES[(n, k)]] = dict(n=n, k=k, ranges=[list(r) for r in rs], calls_at_nk=sum(sum(v.values()) for _mm, v in calls), eager_in_range=in_eager, routed=routed, hit_rate=(routed / in_eager if in_eager else None),
+                                        capture_sizes=caps, in_graph=[m for m in caps if inr(m)], routed_capture=sum(v["routed_capture"] for _mm, v in calls))
     return out
 
 
@@ -267,7 +285,7 @@ def dump_receipt(path=None):
     path = Path(path)
     rec = dict(schema="sm70-drafter-pool-hits/1", pid=os.getpid(), env={ENV_FLAG: os.environ.get(ENV_FLAG)}, per_shape=snapshot(), table_summary=_table_summary(), total_calls=_total,
                non_table_draft_shapes=[dict(layer=a, m=b, n=c, k=e) for (a, b, c, e) in _non_table], draft_prefixes=list(draft_prefixes()), ws_allocs=_ws_allocs,
-               drafter_so=str(DRAFTER_SO), drafter_so_sha8=_lib_sha8, split_table={f"{m}x{n}x{k}": s for (m, n, k), s in SPLIT_TABLE.items()}, capture_mode=capture_mode,
+               drafter_so=str(DRAFTER_SO), drafter_so_sha8=_lib_sha8, split_table={f"{n}x{k}": [list(r) for r in rs] for (n, k), rs in RANGE_TABLE.items()}, capture_sizes={f"{n}x{k}": sorted(v) for (n, k), v in sorted(_capture_sizes.items())}, capture_mode=capture_mode,
                note="a count under CUDA-graph capture is a capture, not a replay; non_table_draft_shapes is filled at eager/trace time (M = -1 when symbolic)")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -288,6 +306,7 @@ def reset_for_tests():
     capture_mode = False
     _ws.clear()
     _stats.clear()
+    _capture_sizes.clear()
     _non_table.clear()
 
 
