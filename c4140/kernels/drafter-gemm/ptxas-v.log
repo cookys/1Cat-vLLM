@@ -1,0 +1,18 @@
+fence.sh: MemoryMax=24.0G MemoryHigh=20.4G CPU=8/112 threads jobs=4 (avail 95.5G) :: /usr/local/cuda-12.9/bin/nvcc -ccbin /usr/bin/g++-14 -std=c++17 -O3 -arch=sm_70 -lineinfo -Xptxas -v --shared -Xcompiler -fPIC -Xlinker --build-id=none -o /data/bench/explore/drafter-gemm-v1/pack/sm70_drafter_gemm.so /data/bench/explore/drafter-gemm-v1/pack/sm70_drafter_gemm.cu
+nvcc warning : Support for offline compilation for architectures prior to '<compute/sm/lto>_75' will be removed in a future release (Use -Wno-deprecated-gpu-targets to suppress warning).
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_ZN53_GLOBAL__N__18e998f8_20_sm70_drafter_gemm_cu_adf2cdc617drafter_gemm_swapILi64ELi1ELi1EEEvPK6__halfS3_Pviiii' for 'sm_70'
+ptxas info    : Function properties for _ZN53_GLOBAL__N__18e998f8_20_sm70_drafter_gemm_cu_adf2cdc617drafter_gemm_swapILi64ELi1ELi1EEEvPK6__halfS3_Pviiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 184 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 103.209 ms
+ptxas info    : Compiling entry function '_ZN53_GLOBAL__N__18e998f8_20_sm70_drafter_gemm_cu_adf2cdc617drafter_gemm_swapILi64ELi1ELi0EEEvPK6__halfS3_Pviiii' for 'sm_70'
+ptxas info    : Function properties for _ZN53_GLOBAL__N__18e998f8_20_sm70_drafter_gemm_cu_adf2cdc617drafter_gemm_swapILi64ELi1ELi0EEEvPK6__halfS3_Pviiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 184 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 101.236 ms
+ptxas info    : Compiling entry function '_ZN53_GLOBAL__N__18e998f8_20_sm70_drafter_gemm_cu_adf2cdc621drafter_splitk_reduceEPKfP6__halfiii' for 'sm_70'
+ptxas info    : Function properties for _ZN53_GLOBAL__N__18e998f8_20_sm70_drafter_gemm_cu_adf2cdc621drafter_splitk_reduceEPKfP6__halfiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, used 0 barriers, 380 bytes cmem[0]
+ptxas info    : Compile time = 6.140 ms

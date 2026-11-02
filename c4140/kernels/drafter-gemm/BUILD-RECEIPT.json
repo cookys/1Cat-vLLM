@@ -1,0 +1,38 @@
+{
+ "build_commands": {
+  "script": "/data/bench/explore/drafter-gemm-v1/pack/build.sh (fence.sh -> nvcc -ccbin /usr/bin/g++-14 -std=c++17 -O3 -arch=sm_70 -lineinfo -Xptxas -v --shared -Xcompiler -fPIC -Xlinker --build-id=none)"
+ },
+ "build_dir": "/data/bench/explore/drafter-gemm-v1/pack",
+ "build_dir_artifact": {
+  "exists": true,
+  "matches_live": true,
+  "path": "/data/bench/explore/drafter-gemm-v1/pack/sm70_drafter_gemm.so",
+  "sha256": "5cca278480cc34763366cd504aa7fd27e2716ddcc4bd7436bbb9a76da3d81f31"
+ },
+ "compilers": {
+  "cuda_toolkit": "12.9.2 (/usr/local/cuda-12.9/version.json), nvcc 12.9.86",
+  "host_compiler": "g++-14 (Ubuntu 14.3.0-14ubuntu1) 14.3.0",
+  "source": "versions queried at import time (2026-11-02) from the installed toolchain the build scripts reference (-ccbin /usr/bin/g++-14, /usr/local/cuda-12.9); the ptxas/build logs themselves do not print versions"
+ },
+ "live_so": {
+  "cuobjdump_note": null,
+  "nm_defined_symbols": 7,
+  "path": "/data/bench/explore/stage-develop-cs-g20-pool-v3-pf-d2dense-tbl2-mpad/vllm/model_executor/layers/sm70_drafter_gemm.so",
+  "sass_kernel_count": 3,
+  "sass_kernel_names_file": "c4140/kernels/drafter-gemm/kernels.txt",
+  "sha256": "5cca278480cc34763366cd504aa7fd27e2716ddcc4bd7436bbb9a76da3d81f31",
+  "size": 1186200,
+  "stage_rel": "vllm/model_executor/layers/sm70_drafter_gemm.so"
+ },
+ "name": "drafter-gemm",
+ "not_rebuilt": true,
+ "notes": {},
+ "rulings": "RULING-pool-serve-v1 f1c507a1 (DRAFTER-SK)",
+ "sources": [
+  {
+   "committed_as": "c4140/kernels/drafter-gemm/sm70_drafter_gemm.cu",
+   "origin": "/data/bench/explore/drafter-gemm-v1/pack/sm70_drafter_gemm.cu",
+   "sha256": "846f0b5e0a14e09542b7fa545fe46a5193421107b8446415591945414a1d2898"
+  }
+ ]
+}

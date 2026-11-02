@@ -1,0 +1,182 @@
+{
+ "address_arith_count_diff": {
+  "EPI0": {
+   "IADD3": [
+    32,
+    33
+   ],
+   "IADD3.X": [
+    0,
+    4
+   ],
+   "IMAD.SHL.U32": [
+    10,
+    9
+   ],
+   "IMAD.X": [
+    8,
+    4
+   ],
+   "ISETP.GE.AND": [
+    5,
+    1
+   ],
+   "LEA": [
+    5,
+    9
+   ],
+   "LEA.HI.X": [
+    4,
+    8
+   ],
+   "LEA.HI.X.SX32": [
+    0,
+    1
+   ],
+   "SHF.L.U64.HI": [
+    1,
+    0
+   ],
+   "SHF.R.S32.HI": [
+    2,
+    1
+   ]
+  },
+  "EPI1": {
+   "IADD3": [
+    32,
+    33
+   ],
+   "IADD3.X": [
+    0,
+    4
+   ],
+   "IMAD.SHL.U32": [
+    10,
+    9
+   ],
+   "IMAD.X": [
+    8,
+    4
+   ],
+   "ISETP.GE.AND": [
+    5,
+    1
+   ],
+   "LEA": [
+    5,
+    9
+   ],
+   "LEA.HI.X": [
+    4,
+    8
+   ],
+   "LEA.HI.X.SX32": [
+    0,
+    1
+   ],
+   "SHF.L.U64.HI": [
+    1,
+    0
+   ],
+   "SHF.R.S32.HI": [
+    2,
+    1
+   ]
+  }
+ },
+ "class_multiset_equal": {
+  "EPI0": {
+   "BAR": true,
+   "HMMA": true,
+   "LDG": true,
+   "LDS": true,
+   "STS": true
+  },
+  "EPI1": {
+   "BAR": true,
+   "HMMA": true,
+   "LDG": true,
+   "LDS": true,
+   "STS": true
+  }
+ },
+ "identical_pipe_multiset": true,
+ "method": "(CPU only, cuobjdump reads the fatbin, no CUDA context):\n 1. cuobjdump -arch sm_70 -sass of both .so; split into functions (Function : <mangled>).\n 2. MAINLOOP = the backward-branch region (target <= branch address) of the function that contains the most HMMA instructions: the K loop, from its loop-top label to the closing branch inclusive. (Prologue, split-K pointer shift and epilogue are outside it by construction.)\n 3. Finding (measured, see evidence/sass-parity.json): the K-loop of the drafter kernels is NOT text-identical to v4's, at any normalisation level. The loop is one iteration of the 4-kk x 4-j x 2-i tile (512 HMMA, 48 LDS, 8 STS, 8 LDG, 1 BAR) in both,\n    but ptxas schedules it differently (different position of the 4 LDG of the next tile, different HMMA/LDS interleave, different .reuse flags) and the address arithmetic differs (split-K base pointers, KT from Ks, hoisted row predicates). That is expected from a different\n    surrounding function and is why the verdict is NOT a text hash.\n 4. Verdict level = scheduling-independent parity of the tensor / shared / global pipe of the loop: for each class HMMA, LDS, STS, LDG, BAR the MULTISET of instructions (opcode + every modifier + immediates / shared offsets / cache hints, with register and predicate numbers and the\n    scheduler's .reuse flag stripped) must be equal between v4 SWAP and each drafter instantiation. Equal multisets mean the same fragment loads (same smem offsets, same pitch), the same 512 HMMA (same STEP/ROW/COL forms), the same staging stores and the same global load forms; they do\n    not prove the same operand dataflow, which is why the SOURCE-text identity of the mainloop (selftest_dg.py, byte compare against the vendored v4 text) stays the primary identity claim and this receipt the codegen cross-check.\n    Informational only (not in the verdict): the raw / register-renamed / opcode-sequence sha256 of the loop, and the per-opcode count differences of the remaining (address-arithmetic) instructions.",
+ "reference": {
+  "function": "_custom_v4_cu_e35fe8e716lmhead_gemm_swapILi64ELi1EEEvPK6__halfS3_Pfiii",
+  "loop_end": "0x3770",
+  "loop_insns": 709,
+  "loop_start": "0xb30",
+  "op_counts": {
+   "BAR": 1,
+   "HMMA": 512,
+   "LDG": 8,
+   "LDS": 48,
+   "STS": 8
+  },
+  "sha256": {
+   "opcodes": "b7e5dccdb127c2db5957a81edadc5be3550ec54a57aabb954751253dce2b9f78",
+   "raw": "1ae5a19562c55a3a5c1e48f5c8e0c2c22c2fe546fc6aa451473b61e0ecb49a21",
+   "regrenamed": "43d8010572128d7b38786599d608cf803dacae2270bf2cacb081df49eb5735bd"
+  },
+  "so": "/data/bench/explore/lmhead-custom-v4/pack/sm70_lmhead_custom_v4.so",
+  "so_sha256": "f3dc07afca05e0b4566fcf8d26ee615f80fcb2d98cbb2126fbf3ee408515c51b",
+  "total_insns": 2192
+ },
+ "schema": "dg1-sass-parity/2",
+ "subject_so": "/data/bench/explore/drafter-gemm-v1/pack/sm70_drafter_gemm.so",
+ "subject_so_sha256": "5cca278480cc34763366cd504aa7fd27e2716ddcc4bd7436bbb9a76da3d81f31",
+ "subjects": {
+  "EPI0": {
+   "function": "gemm_cu_adf2cdc617drafter_gemm_swapILi64ELi1ELi0EEEvPK6__halfS3_Pviiii",
+   "loop_end": "0x3900",
+   "loop_insns": 712,
+   "loop_start": "0xc90",
+   "op_counts": {
+    "BAR": 1,
+    "HMMA": 512,
+    "LDG": 8,
+    "LDS": 48,
+    "STS": 8
+   },
+   "sha256": {
+    "opcodes": "154fc8b3513e67f51a8617caf5f304d28438810502d13c2a2adfe8d788539526",
+    "raw": "f1a165e9f4b0acbbfc5cc69b0cb1c46af1fe145233cfe86e97c4f7745a40acc8",
+    "regrenamed": "9ffbae30dbb0e326377007ec9202974c7fc6d7a81632014b3587c0fba404e9f1"
+   },
+   "total_insns": 1392
+  },
+  "EPI1": {
+   "function": "gemm_cu_adf2cdc617drafter_gemm_swapILi64ELi1ELi1EEEvPK6__halfS3_Pviiii",
+   "loop_end": "0x3900",
+   "loop_insns": 712,
+   "loop_start": "0xc90",
+   "op_counts": {
+    "BAR": 1,
+    "HMMA": 512,
+    "LDG": 8,
+    "LDS": 48,
+    "STS": 8
+   },
+   "sha256": {
+    "opcodes": "154fc8b3513e67f51a8617caf5f304d28438810502d13c2a2adfe8d788539526",
+    "raw": "f1a165e9f4b0acbbfc5cc69b0cb1c46af1fe145233cfe86e97c4f7745a40acc8",
+    "regrenamed": "9ffbae30dbb0e326377007ec9202974c7fc6d7a81632014b3587c0fba404e9f1"
+   },
+   "total_insns": 1280
+  }
+ },
+ "text_level_equal": {
+  "EPI0": {
+   "opcodes": false,
+   "raw": false,
+   "regrenamed": false
+  },
+  "EPI1": {
+   "opcodes": false,
+   "raw": false,
+   "regrenamed": false
+  }
+ }
+}
