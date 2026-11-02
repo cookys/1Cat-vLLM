@@ -11,6 +11,23 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
 
 
+# ---- p8-suffix-v1 (text-only M-RoPE positions built on the device) ----
+# Holder written by the model runner (overlay model_runner.py) around model_state.add_request: nc = prefix-hit length under the gate, else None; mode = what the last
+# init_prefill_positions call did ("device-arange" | "full"), read back by the runner for the per-request stage_mode log line.
+_P8_ROPE: dict = {"nc": None, "mode": None}
+
+
+def _p8_text_only_model(model) -> bool:
+    """True only for a model whose get_mrope_input_positions is the Qwen3-VL one, which for an empty mm_features list returns arange(N) in all three dims and delta 0."""
+    try:
+        from vllm.model_executor.models.qwen3_vl import Qwen3VLForConditionalGeneration as _Q
+
+        return type(model).get_mrope_input_positions is _Q.get_mrope_input_positions
+    except Exception:
+        return False
+# ---- end p8-suffix-v1 helper ----
+
+
 class RopeState:
     """Unified state for multi-dimensional RoPE variants (M-RoPE, XD-RoPE).
 
@@ -66,6 +83,24 @@ class RopeState:
         prefill_token_ids: list[int],
         mm_features: list,
     ) -> None:
+        # p8-suffix-v1: text-only request with a prefix hit (gate decided by the model runner): the rows are only read at positions >= num_computed (_prepare_rope_positions_kernel),
+        # so build arange(nc, N) for the three dims ON THE DEVICE (stream-ordered kernel into the UVA view, no host list round trip) and use delta 0 (text-only M-RoPE).
+        _nc = _P8_ROPE["nc"]
+        _n = len(prefill_token_ids)
+        if (
+            _nc is not None
+            and self.has_delta
+            and not mm_features
+            and 0 < _nc < _n
+            and _p8_text_only_model(model)
+        ):
+            self.prefill_delta.np[req_idx] = 0
+            _pos = torch.arange(_nc, _n, dtype=torch.int32, device=self.device)
+            for i in range(self.num_dims):
+                self.prefill_positions.gpu[self.num_dims * req_idx + i, _nc:_n].copy_(_pos)
+            _P8_ROPE["mode"] = "device-arange"
+            return
+        _P8_ROPE["mode"] = "full"
         if self.has_delta:
             mrope_model = cast(SupportsMRoPE, model)
             prefill_positions, delta = mrope_model.get_mrope_input_positions(
@@ -195,3 +230,23 @@ def _prepare_rope_positions_kernel(
                 pos,
                 mask=mask,
             )
+
+
+# ---- p8-suffix-v1 overlay-loaded receipt (one JSON line per process that imports this module; no-op unless VLLM_SM70_PRELAYER_LOG is set) ----
+def _p8s_loaded_receipt(_module=__name__, _file=__file__):
+    import hashlib as _h, json as _j, os as _o, time as _t
+    _path = _o.environ.get("VLLM_SM70_PRELAYER_LOG")
+    if not _path:
+        return
+    try:
+        _fd = _o.open(_path, _o.O_WRONLY | _o.O_APPEND | _o.O_CREAT, 0o644)
+        try:
+            _o.write(_fd, (_j.dumps({"kind": "overlay-loaded", "module": _module, "pid": _o.getpid(), "ppid": _o.getppid(), "comm": open("/proc/self/comm").read().strip(), "file": _file, "sha256": _h.sha256(open(_file, "rb").read()).hexdigest(), "ts": _t.time()}, separators=(",", ":")) + "\n").encode())
+        finally:
+            _o.close(_fd)
+    except Exception:
+        pass
+
+
+_p8s_loaded_receipt()
+# ---- end p8-suffix-v1 overlay-loaded receipt ----

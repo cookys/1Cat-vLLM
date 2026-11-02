@@ -19,6 +19,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import json
 import os
 import time
 from collections.abc import Callable
@@ -134,6 +135,219 @@ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import KVBlockZeroer, clear_layer_kv_caches
 
 logger = init_logger(__name__)
+
+# ---- p8-prelayer-probe-v1 probe (host-side perf_counter only; no-op unless VLLM_SM70_PRELAYER_LOG is set) ----
+_P8_PATH = os.environ.get("VLLM_SM70_PRELAYER_LOG") or None
+_P8_STATE: dict[str, Any] = {"rank0": None, "fd": None, "idx": 0, "prev_t0": None, "cur": None}
+
+
+def _p8_write(obj: dict) -> None:
+    try:
+        if _P8_STATE["fd"] is None:
+            _P8_STATE["fd"] = os.open(_P8_PATH, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        os.write(_P8_STATE["fd"], (json.dumps(obj, separators=(",", ":")) + "\n").encode())
+    except Exception:
+        pass
+
+
+def _p8_rank0() -> bool:
+    if _P8_STATE["rank0"] is None:
+        try:
+            _P8_STATE["rank0"] = bool(
+                torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
+            )
+        except Exception:
+            _P8_STATE["rank0"] = False
+    return _P8_STATE["rank0"]
+
+
+class _P8Null:
+    def mark(self, name: str) -> None:
+        pass
+
+    def forward_start(self) -> None:
+        pass
+
+    def end(self, no_forward: bool = False) -> None:
+        pass
+
+
+_P8_NULL = _P8Null()
+
+
+class _P8Step:
+    def __init__(self, scheduler_output) -> None:
+        self.t0 = time.perf_counter()
+        self.ts = time.time()
+        self.last = self.t0
+        self.seg: dict[str, float] = {}
+        self.sub: dict[str, float] = {}
+        self.pre_forward_ms = None
+        try:
+            news = scheduler_output.scheduled_new_reqs
+            nst = scheduler_output.num_scheduled_tokens
+            self.new_reqs = [
+                [
+                    len(n.prompt_token_ids),
+                    int(n.num_computed_tokens),
+                    int(nst.get(n.req_id, 0)),
+                    str(n.req_id),
+                ]
+                for n in news
+            ]
+            self.num_reqs = len(nst)
+            self.num_tokens = int(scheduler_output.total_num_scheduled_tokens)
+        except Exception:
+            self.new_reqs, self.num_reqs, self.num_tokens = [], -1, -1
+
+    def mark(self, name: str) -> None:
+        now = time.perf_counter()
+        self.seg[name] = self.seg.get(name, 0.0) + (now - self.last) * 1e3
+        self.last = now
+
+    def forward_start(self) -> None:
+        self.pre_forward_ms = (time.perf_counter() - self.t0) * 1e3
+
+    def end(self, no_forward: bool = False) -> None:
+        t1 = time.perf_counter()
+        prev = _P8_STATE["prev_t0"]
+        _P8_STATE["prev_t0"] = self.t0
+        _P8_STATE["cur"] = None
+        idx = _P8_STATE["idx"]
+        _P8_STATE["idx"] = idx + 1
+        _p8_write(
+            {
+                "kind": "step",
+                "step": idx,
+                "ts": round(self.ts, 6),
+                "num_reqs": self.num_reqs,
+                "num_new_reqs": len(self.new_reqs),
+                "new_reqs": self.new_reqs,
+                "num_tokens": self.num_tokens,
+                "no_forward": no_forward,
+                "seg_ms": {k: round(v, 4) for k, v in self.seg.items()},
+                "sub_ms": {k: round(v, 4) for k, v in self.sub.items()},
+                "pre_forward_ms": None
+                if self.pre_forward_ms is None
+                else round(self.pre_forward_ms, 4),
+                "wall_ms": round((t1 - self.t0) * 1e3, 4),
+                "period_ms": None if prev is None else round((self.t0 - prev) * 1e3, 4),
+            }
+        )
+
+
+def _p8_begin(scheduler_output, dummy_run: bool):
+    if _P8_PATH is None or dummy_run or not _p8_rank0():
+        return _P8_NULL
+    p = _P8Step(scheduler_output)
+    _P8_STATE["cur"] = p
+    return p
+
+
+def _p8_sub(name: str, t_start: float) -> None:
+    p = _P8_STATE["cur"]
+    if p is not None:
+        p.sub[name] = p.sub.get(name, 0.0) + (time.perf_counter() - t_start) * 1e3
+
+
+if _P8_PATH is not None:
+    try:
+        _p8_write(
+            {
+                "kind": "overlay-loaded",
+                "pid": os.getpid(),
+                "ppid": os.getppid(),
+                "comm": open("/proc/self/comm").read().strip(),
+                "file": __file__,
+                "sha256": __import__("hashlib").sha256(open(__file__, "rb").read()).hexdigest(),
+                "ts": time.time(),
+            }
+        )
+    except Exception:
+        pass
+# ---- end p8-prelayer-probe-v1 probe ----
+
+# ---- p8-suffix-v1 gate (suffix-only staging of a prefix-hit arrival; DESIGN section 1) ----
+from vllm.v1.worker.gpu.mm import rope as _p8s_rope  # noqa: E402
+
+
+def _p8s_gate(nc, prefill_len, sampling_params, mm_features, ngram_on):
+    """-> (mode, reason). mode is "suffix" only when NO whole-row reader of all_token_ids can be live for this request: no penalty, no ngram/lookup assist, no mm_features, no prompt_logprobs,
+    and a real prefix hit (0 < nc < prefill_len). Every other case takes the full write (conservative)."""
+    try:
+        if ngram_on:
+            return "full", "ngram-assist"
+        if mm_features:
+            return "full", "mm-features"
+        if sampling_params is None:
+            return "full", "no-sampling-params"
+        if (
+            sampling_params.presence_penalty != 0.0
+            or sampling_params.frequency_penalty != 0.0
+            or sampling_params.repetition_penalty != 1.0
+        ):
+            return "full", "penalty"
+        if getattr(sampling_params, "prompt_logprobs", None) is not None:
+            return "full", "prompt-logprobs"
+        if not isinstance(nc, int) or nc <= 0:
+            return "full", "no-prefix-hit"
+        if nc >= prefill_len:
+            return "full", "full-hit"
+        return "suffix", "prefix-hit"
+    except Exception as e:  # any doubt -> full write
+        return "full", "gate-error:%s" % type(e).__name__
+
+
+def _p8s_ngram_on(runner):
+    try:
+        sc = getattr(runner, "speculative_config", None)
+        if sc is not None and getattr(sc, "ngram_assist", False):
+            return True
+        sp = getattr(runner, "speculator", None)
+        if sp is None:
+            return False
+        return bool(
+            getattr(sp, "_ngram_assist", None) is not None
+            or getattr(sp, "_lookup_enabled", False)
+            or getattr(sp, "requires_host_token_state", False)
+        )
+    except Exception:
+        return True
+
+
+def _p8s_pre(runner, new_req_data, sampling_params, prefill_len):
+    """Decide the stage mode of this request and publish nc to the two staging sites (RequestState, RopeState). Returns (mode, reason, nc_or_None)."""
+    nc = new_req_data.num_computed_tokens
+    mode, reason = _p8s_gate(nc, prefill_len, sampling_params, new_req_data.mm_features, _p8s_ngram_on(runner))
+    use = int(nc) if mode == "suffix" else None
+    runner.req_states._p8_suffix_nc = use
+    _p8s_rope._P8_ROPE["nc"] = use
+    _p8s_rope._P8_ROPE["mode"] = None
+    return mode, reason, use
+
+
+def _p8s_post(runner, req_id, mode, reason, nc, prefill_len):
+    """Clear the holders (never leak into another request) and write the per-request log line (rank0): stage_mode=suffix|full reason=<...> rope=<device-arange|full>."""
+    rope_mode = _p8s_rope._P8_ROPE["mode"]
+    runner.req_states._p8_suffix_nc = None
+    _p8s_rope._P8_ROPE["nc"] = None
+    if not _p8_rank0():
+        return
+    if _P8_PATH is not None:
+        _p8_write(
+            {
+                "kind": "stage_mode",
+                "req_id": str(req_id),
+                "mode": mode,
+                "reason": reason,
+                "rope": rope_mode,
+                "nc": None if nc is None else int(nc),
+                "n": int(prefill_len),
+                "ts": round(time.time(), 6),
+            }
+        )
+    logger.info("p8-suffix stage_mode=%s reason=%s rope=%s req=%s nc=%s n=%d", mode, reason, rope_mode, req_id, nc, prefill_len)
+# ---- end p8-suffix-v1 gate ----
 
 
 def _detach_model_runtime_state(model: nn.Module) -> None:
@@ -1150,6 +1364,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             sampling_params = new_req_data.sampling_params
             max_tokens = 1 if sampling_params is None else sampling_params.max_tokens
             assert max_tokens is not None
+            _p8s_mode, _p8s_reason, _p8s_nc = _p8s_pre(
+                self, new_req_data, sampling_params, len(new_req_data.prefill_token_ids)
+            )
+            _p8_t = time.perf_counter()
             self.req_states.add_request(
                 req_id=req_id,
                 prompt_len=prompt_len,
@@ -1157,12 +1375,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 max_tokens=max_tokens,
             )
+            _p8_sub("add_req_states", _p8_t)
             req_index = self.req_states.req_id_to_index[req_id]
 
             if self.encoder_cache is not None:
                 self.encoder_cache.add_request(req_id, new_req_data.mm_features)
 
             self.model_state.add_request(req_index, new_req_data)
+            _p8s_post(
+                self, req_id, _p8s_mode, _p8s_reason, _p8s_nc, len(new_req_data.prefill_token_ids)
+            )
             self.block_tables.append_block_ids(
                 req_index, new_req_data.block_ids, overwrite=True
             )
@@ -1179,8 +1401,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
 
         if scheduler_output.scheduled_new_reqs:
+            _p8_t = time.perf_counter()
             self.req_states.apply_staged_writes()
             self.model_state.apply_staged_writes()
+            _p8_sub("add_apply_staged", _p8_t)
         if self.sampler is not None:
             self.sampler.apply_staged_writes()
 
@@ -1606,6 +1830,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        _p8 = _p8_begin(scheduler_output, dummy_run)
         if not dummy_run:
             if self.mixed_prefill_timer is not None:
                 self.mixed_prefill_timer.begin(scheduler_output)
@@ -1613,14 +1838,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.update_pp_decode_requests()
             self.finish_requests(scheduler_output)
             self.free_states(scheduler_output)
+            _p8.mark("finish_free")
             self.add_requests(scheduler_output)
+            _p8.mark("add_requests")
             self.update_requests(scheduler_output)
+            _p8.mark("update_requests")
             self.block_tables.apply_staged_writes()
             if scheduler_output.new_block_ids_to_zero:
                 self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
+            _p8.mark("block_tables_apply")
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
+                _p8.end(no_forward=True)
                 return empty_output
 
         # Get batch descriptor and sync across DP ranks.
@@ -1654,9 +1884,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             need_eager=is_profile or skip_compiled,
         )
 
+        _p8.mark("dispatch")
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
             empty_output = self.kv_connector.no_forward(scheduler_output)
+            _p8.end(no_forward=True)
             return empty_output
 
         early_ple_model_inputs: dict[str, Any] | None = None
@@ -1664,6 +1896,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
+            _p8.mark("prepare_inputs")
             if (
                 self._ple_offload_connector is not None
                 and batch_desc.cg_mode != CUDAGraphMode.FULL
@@ -1679,7 +1912,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_batch.num_tokens_after_padding,
                     dummy_run=False,
                 )
+            _p8.mark("ple_early")
             block_tables, slot_mappings = self.prepare_attn(input_batch)
+            _p8.mark("prepare_attn_tables")
             # Hybrid Mamba align-mode prefix caching migrates recurrent state
             # across block boundaries before attention metadata consumes it.
             self.model_state.preprocess_state(
@@ -1688,6 +1923,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_cache_config,
                 self.req_states.num_computed_tokens.gpu,
             )
+            _p8.mark("preprocess_state")
 
             if self.lora_config:
                 # Activate LoRA adapters.
@@ -1756,6 +1992,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_cache_config,
             )
 
+        _p8.mark("attn_metadata")
         inputs_embeds = None
         if self.supports_mm_inputs and self.is_first_pp_rank:
             # Run MM encoder (if needed) and get multimodal embeddings.
@@ -1823,6 +2060,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 mtp_profile_ctx
             )
         mtp_target_start = self._sm70_v2_mtp_profile_start(mtp_profile_ctx)
+        _p8.mark("model_inputs")
+        _p8.forward_start()
 
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
@@ -1855,6 +2094,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_connector.pre_forward(scheduler_output)
                 model_output = self.model(**model_inputs)
 
+        _p8.mark("forward_launch")
         if self._ple_offload_connector is not None:
             self._ple_offload_connector.release_outputs()
         self._sm70_v2_mtp_profile_finish(
@@ -1888,6 +2128,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self._sm70_v2_mtp_profile_pending = mtp_profile_ctx
 
+        _p8.end()
         if not self.is_last_pp_rank:
             # Non-last PP rank: return IntermediateTensors for sending.
             return output_intermediate_tensors

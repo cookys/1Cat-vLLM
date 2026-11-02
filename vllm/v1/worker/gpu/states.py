@@ -23,6 +23,8 @@ class RequestState:
         self.vocab_size = vocab_size
         self.device = device
 
+        # p8-suffix-v1: prefix-hit length the model runner sets for the request being added (None = full write). Never set outside add_requests.
+        self._p8_suffix_nc: int | None = None
         self.req_id_to_index: dict[str, int] = {}
         self.index_to_req_id: dict[int, str] = {}
         self.free_indices = list(range(max_num_reqs))
@@ -105,7 +107,13 @@ class RequestState:
         )
         self.prefill_len.np[req_idx] = prefill_len
         self.total_len.stage_write_elem(req_idx, prefill_len)
-        self.all_token_ids.stage_write(req_idx, 0, all_token_ids)
+        # p8-suffix-v1: under the model runner's gate (no penalty / ngram-lookup / mm_features / prompt_logprobs) only the suffix [nc:prefill_len) is staged; the cached-prefix
+        # region [0:nc) keeps whatever the slot held (no reader touches it under the gate). The write still goes through the StagedWriteTensor (async-scheduling slot reuse).
+        _p8_nc = self._p8_suffix_nc
+        if _p8_nc is not None and 0 < _p8_nc < prefill_len:
+            self.all_token_ids.stage_write(req_idx, _p8_nc, all_token_ids[_p8_nc:])
+        else:
+            self.all_token_ids.stage_write(req_idx, 0, all_token_ids)
         self.num_computed_prefill_tokens[req_idx] = num_computed_tokens
         self.num_computed_tokens_np[req_idx] = num_computed_tokens
         self.num_computed_tokens.stage_write_elem(req_idx, num_computed_tokens)
@@ -143,3 +151,23 @@ class RequestState:
             self.num_computed_prefill_tokens[idx_mapping_np]
             < self.prefill_len.np[idx_mapping_np]
         )
+
+
+# ---- p8-suffix-v1 overlay-loaded receipt (one JSON line per process that imports this module; no-op unless VLLM_SM70_PRELAYER_LOG is set) ----
+def _p8s_loaded_receipt(_module=__name__, _file=__file__):
+    import hashlib as _h, json as _j, os as _o, time as _t
+    _path = _o.environ.get("VLLM_SM70_PRELAYER_LOG")
+    if not _path:
+        return
+    try:
+        _fd = _o.open(_path, _o.O_WRONLY | _o.O_APPEND | _o.O_CREAT, 0o644)
+        try:
+            _o.write(_fd, (_j.dumps({"kind": "overlay-loaded", "module": _module, "pid": _o.getpid(), "ppid": _o.getppid(), "comm": open("/proc/self/comm").read().strip(), "file": _file, "sha256": _h.sha256(open(_file, "rb").read()).hexdigest(), "ts": _t.time()}, separators=(",", ":")) + "\n").encode())
+        finally:
+            _o.close(_fd)
+    except Exception:
+        pass
+
+
+_p8s_loaded_receipt()
+# ---- end p8-suffix-v1 overlay-loaded receipt ----
