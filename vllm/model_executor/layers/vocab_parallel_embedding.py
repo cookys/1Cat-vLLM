@@ -440,7 +440,14 @@ def _maybe_sm70_lm_head_forward(
 ) -> torch.Tensor | None:
     if getattr(layer, "_sm70_dflash2_fp32_logits", False):
         x_2d = x.reshape(-1, x.shape[-1]).contiguous()
-        out = torch.mm(x_2d, layer.weight.t(), out_dtype=torch.float32)
+        out = None
+        if os.environ.get("VLLM_SM70_LMHEAD_POOL") == "1":
+            # pool-serve-v1 (DESIGN sec 2.1): per-M dispatch, custom v4 SWAP -> cublasLt -> unchanged torch.mm; bias handling below is untouched
+            from vllm.model_executor.layers import sm70_lmhead_pool
+
+            out = sm70_lmhead_pool.route(layer, x_2d)
+        if out is None:
+            out = torch.mm(x_2d, layer.weight.t(), out_dtype=torch.float32)
         if bias is not None:
             out = out + bias.float()
         return out.reshape(*x.shape[:-1], out.shape[-1])
@@ -763,6 +770,11 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
             return
 
         maybe_prepare_sm70_lm_head_top1(layer)
+        if getattr(layer, "_sm70_dflash2_fp32_logits", False) and os.environ.get("VLLM_SM70_LMHEAD_POOL") == "1":
+            # pool-serve-v1: load the custom .so + cublasLt handles here, before any CUDA-graph capture
+            from vllm.model_executor.layers import sm70_lmhead_pool
+
+            sm70_lmhead_pool.prepare(layer)
 
     def apply(
         self,

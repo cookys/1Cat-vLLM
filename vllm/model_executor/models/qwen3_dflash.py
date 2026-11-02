@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import io
+import os
 from collections.abc import Iterable
 
 import torch
@@ -47,6 +48,11 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
 )
 
 from .dflash_sm70 import dflash_layered_rms_norm_sm70
+
+# pool-serve-v1 member DRAFTER-SK (DESIGN sec 2.2): module-load import, only with the arm-B env flag.
+_sm70_drafter_pool = None
+if os.environ.get("VLLM_SM70_DRAFTER_GEMM") == "1":
+    from vllm.model_executor.layers import sm70_drafter_pool as _sm70_drafter_pool
 from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen3 import Qwen3ForCausalLM
 from .utils import (
@@ -628,9 +634,16 @@ class DFlashQwen3Model(nn.Module):
             self._fuse_dense_kv_weight(context_states.dtype, context_states.device)
         # --- Fused KV projection (one GEMM for all layers) ---
         normed_context_states = self._normalize_context_states(context_states)
-        all_kv_flat = F.linear(
-            normed_context_states, self._fused_kv_weight, self._fused_kv_bias
-        )
+        all_kv_flat = None
+        if _sm70_drafter_pool is not None:
+            # pool-serve-v1: ctxkv (120, 2560, 5120) split-K S4; None -> the unchanged F.linear below
+            all_kv_flat = _sm70_drafter_pool.maybe_linear_weight(
+                normed_context_states, self._fused_kv_weight, self._fused_kv_bias
+            )
+        if all_kv_flat is None:
+            all_kv_flat = F.linear(
+                normed_context_states, self._fused_kv_weight, self._fused_kv_bias
+            )
         # Single contiguous copy that separates K/V and transposes to
         # layer-major layout.  Result: [2, L, num_ctx, nkv, hd] contiguous.
         # Indexing dim-0 gives contiguous [L, num_ctx, nkv, hd] for K and V.

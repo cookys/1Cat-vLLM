@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import os
 from abc import abstractmethod
 from collections.abc import Iterable
 
@@ -47,6 +48,11 @@ from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 _SM70_AWQ_MLP_DOWN_TILE_OVERLAP_TRACE_SEEN: set[str] = set()
+
+# pool-serve-v1 member DRAFTER-SK (DESIGN sec 2.2): imported at module load (never inside a traced region) and only when the arm-B env flag is set.
+_sm70_drafter_pool = None
+if os.environ.get("VLLM_SM70_DRAFTER_GEMM") == "1":
+    from vllm.model_executor.layers import sm70_drafter_pool as _sm70_drafter_pool
 
 
 def _interleave_output_rows_for_gated_silu(weight: torch.Tensor) -> torch.Tensor:
@@ -487,6 +493,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
         sm70_out = _maybe_sm70_dense_forward(layer, x, bias)
         if sm70_out is not None:
             return sm70_out
+        if _sm70_drafter_pool is not None and bias is None:
+            # pool-serve-v1: draft-prefix fp16 layers whose (N, K) is in the split table go through the op sm70_pool::drafter_linear (exact (M, N, K) table inside, F.linear outside)
+            pooled = _sm70_drafter_pool.maybe_linear(layer, x)
+            if pooled is not None:
+                return pooled
         if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
             return linear_batch_invariant(x, layer.weight, bias)
         if envs.VLLM_SM70_UNQUANT_DEBUG and x.dim() >= 2:
