@@ -1,0 +1,192 @@
+{
+ "build_command": "NOT recorded in a log. Configuration evidence = CMakeCache.txt keys below + build.ninja in the build dir; invocation was a pip/setup.py build_ext of the p075-develop worktree on 2026-10-24 05:15-05:27 (file mtimes).",
+ "build_dir": "/data/src/1cat-wt-p075-develop/build (CMake/Ninja, vllm .so) and /data/src/1cat-wt-p075-develop/flash-attention-v100/build (setup.py native flash_attn_v100)",
+ "cmakecache_keys": [
+  "CMAKE_BUILD_TYPE:STRING=RelWithDebInfo",
+  "CMAKE_CUDA_COMPILER:STRING=/usr/local/cuda/bin/nvcc",
+  "CMAKE_CUDA_FLAGS:STRING=",
+  "CMAKE_CXX_COMPILER:FILEPATH=/usr/bin/g++-14",
+  "CMAKE_CXX_FLAGS:STRING=",
+  "FETCHCONTENT_BASE_DIR:PATH=/data/src/1cat-wt-p075-develop/.deps",
+  "VLLM_TARGET_DEVICE:STRING=cuda",
+  "CMAKE_GENERATOR:INTERNAL=Ninja",
+  "CMAKE_HOME_DIRECTORY:INTERNAL=/data/src/1cat-wt-p075-develop"
+ ],
+ "compilers": {
+  "cuda_toolkit": "12.9.2 / nvcc 12.9.86 (version.json at import time)",
+  "host_compiler": "g++-14 14.3.0",
+  "note": "queried at import time; build logs do not print versions"
+ },
+ "fetchcontent_deps_not_in_git": [
+  "cutlass-build",
+  "cutlass-src",
+  "cutlass-subbuild",
+  "triton_kernels-build",
+  "triton_kernels-src",
+  "triton_kernels-subbuild",
+  "vllm-flash-attn-src",
+  "vllm-flash-attn-subbuild"
+ ],
+ "group": "base-p075-develop-build",
+ "not_rebuilt": true,
+ "rulings": "none (base 1Cat build, p075 serving base)",
+ "so": [
+  {
+   "build_artifact": "/data/src/1cat-wt-p075-develop/flash-attention-v100/build/lib.linux-x86_64-cpython-312/flash_attn_v100_cuda.cpython-312-x86_64-linux-gnu.so",
+   "build_artifact_sha256": "c402681514dd360c8dbd98726b5f3f958d4d5bd5dae1641bfa5afc210812873b",
+   "kernels_file": "c4140/kernels/base-p075-develop-build/kernels/c4026815-flash_attn_v100_cuda.cpython-312-x86_64-linux-gnu.so.txt",
+   "matches_live": true,
+   "nm_defined_symbols": 567,
+   "path": "/data/bench/explore/stage-develop-cs-g20-pool-v3-pf-d2dense-tbl2-mpad/flash_attn_v100/flash_attn_v100_cuda.cpython-312-x86_64-linux-gnu.so",
+   "sass_kernel_count": 810,
+   "sha256": "c402681514dd360c8dbd98726b5f3f958d4d5bd5dae1641bfa5afc210812873b",
+   "size": 29519136,
+   "stage_rel": "flash_attn_v100/flash_attn_v100_cuda.cpython-312-x86_64-linux-gnu.so"
+  },
+  {
+   "build_artifact": "/data/src/1cat-wt-p075-develop/flash-attention-v100/build/lib.linux-x86_64-cpython-312/paged_kv_utils.cpython-312-x86_64-linux-gnu.so",
+   "build_artifact_sha256": "7c3355ffb0ecc1b958e8e72969e484a88903d76c721a4d23521e0f390852cb33",
+   "kernels_file": "c4140/kernels/base-p075-develop-build/kernels/7c3355ff-paged_kv_utils.cpython-312-x86_64-linux-gnu.so.txt",
+   "matches_live": true,
+   "nm_defined_symbols": 91,
+   "path": "/data/bench/explore/stage-develop-cs-g20-pool-v3-pf-d2dense-tbl2-mpad/flash_attn_v100/paged_kv_utils.cpython-312-x86_64-linux-gnu.so",
+   "sass_kernel_count": 2,
+   "sha256": "7c3355ffb0ecc1b958e8e72969e484a88903d76c721a4d23521e0f390852cb33",
+   "size": 246048,
+   "stage_rel": "flash_attn_v100/paged_kv_utils.cpython-312-x86_64-linux-gnu.so"
+  },
+  {
+   "build_artifact": "/data/src/1cat-wt-p075-develop/build/temp.linux-x86_64-cpython-312/flash_qla_sm70_gdn_strided/flash_qla_sm70_gdn_strided.so",
+   "build_artifact_sha256": "cdc4bf16616fbfe4e2524cf0f3a3c73da565a51c8076e55745a864499b15c6f3",
+   "kernels_file": "c4140/kernels/base-p075-develop-build/kernels/cdc4bf16-flash_qla_sm70_gdn_strided.so.txt",
+   "matches_live": true,
+   "nm_defined_symbols": 246,
+   "path": "/data/bench/explore/stage-develop-cs-g20-pool-v3-pf-d2dense-tbl2-mpad/flash_qla/ops/gated_delta_rule/chunk/sm70/flash_qla_sm70_gdn_strided.so",
+   "sass_kernel_count": 378,
+   "sha256": "cdc4bf16616fbfe4e2524cf0f3a3c73da565a51c8076e55745a864499b15c6f3",
+   "size": 6751904,
+   "stage_rel": "flash_qla/ops/gated_delta_rule/chunk/sm70/flash_qla_sm70_gdn_strided.so"
+  },
+  {
+   "build_artifact": "/data/src/1cat-wt-p075-develop/build/lib.linux-x86_64-cpython-312/vllm/_C_stable_libtorch.abi3.so",
+   "build_artifact_sha256": "bd5ca2ee1072de96f015ca71c4d36b6ed0f42e2789aa08a7948d753c775f5c2b",
+   "kernels_file": "c4140/kernels/base-p075-develop-build/kernels/bd5ca2ee-_C_stable_libtorch.abi3.so.txt",
+   "matches_live": true,
+   "nm_defined_symbols": 2164,
+   "path": "/data/bench/explore/stage-develop-cs-g20-pool-v3-pf-d2dense-tbl2-mpad/vllm/_C_stable_libtorch.abi3.so",
+   "sass_kernel_count": 2295,
+   "sha256": "bd5ca2ee1072de96f015ca71c4d36b6ed0f42e2789aa08a7948d753c775f5c2b",
+   "size": 69424384,
+   "stage_rel": "vllm/_C_stable_libtorch.abi3.so"
+  },
+  {
+   "build_artifact": "/data/src/1cat-wt-p075-develop/build/lib.linux-x86_64-cpython-312/vllm/_h3_flashattn_C.cpython-312-x86_64-linux-gnu.so",
+   "build_artifact_sha256": "f0e8e95756758b1be38696d5742158a86ea9336293ad716d78261235275049cd",
+   "kernels_file": "c4140/kernels/base-p075-develop-build/kernels/f0e8e957-_h3_flashattn_C.cpython-312-x86_64-linux-gnu.so.txt",
+   "matches_live": true,
+   "nm_defined_symbols": 148,
+   "path": "/data/bench/explore/stage-develop-cs-g20-pool-v3-pf-d2dense-tbl2-mpad/vllm/_h3_flashattn_C.cpython-312-x86_64-linux-gnu.so",
+   "sass_kernel_count": 6,
+   "sha256": "f0e8e95756758b1be38696d5742158a86ea9336293ad716d78261235275049cd",
+   "size": 11351776,
+   "stage_rel": "vllm/_h3_flashattn_C.cpython-312-x86_64-linux-gnu.so"
+  },
+  {
+   "build_artifact": "/data/src/1cat-wt-p075-develop/build/lib.linux-x86_64-cpython-312/vllm/_h3_flashinfer_C.cpython-312-x86_64-linux-gnu.so",
+   "build_artifact_sha256": "7e0440cb083d6fb9dd0e8311227e06c9a179cfed34a2da6423b44b8cc7611de2",
+   "kernels_file": "c4140/kernels/base-p075-develop-build/kernels/7e0440cb-_h3_flashinfer_C.cpython-312-x86_64-linux-gnu.so.txt",
+   "matches_live": true,
+   "nm_defined_symbols": 172,
+   "path": "/data/bench/explore/stage-develop-cs-g20-pool-v3-pf-d2dense-tbl2-mpad/vllm/_h3_flashinfer_C.cpython-312-x86_64-linux-gnu.so",
+   "sass_kernel_count": 1,
+   "sha256": "7e0440cb083d6fb9dd0e8311227e06c9a179cfed34a2da6423b44b8cc7611de2",
+   "size": 10678384,
+   "stage_rel": "vllm/_h3_flashinfer_C.cpython-312-x86_64-linux-gnu.so"
+  },
+  {
+   "build_artifact": "/data/src/1cat-wt-p075-develop/build/lib.linux-x86_64-cpython-312/vllm/_h3_w8a16_C.cpython-312-x86_64-linux-gnu.so",
+   "build_artifact_sha256": "063899359b519dd8e1d6ebbb1b7b558067853d3c78838e59bde9401f96ffdecb",
+   "kernels_file": "c4140/kernels/base-p075-develop-build/kernels/06389935-_h3_w8a16_C.cpython-312-x86_64-linux-gnu.so.txt",
+   "matches_live": true,
+   "nm_defined_symbols": 216,
+   "path": "/data/bench/explore/stage-develop-cs-g20-pool-v3-pf-d2dense-tbl2-mpad/vllm/_h3_w8a16_C.cpython-312-x86_64-linux-gnu.so",
+   "sass_kernel_count": 6,
+   "sha256": "063899359b519dd8e1d6ebbb1b7b558067853d3c78838e59bde9401f96ffdecb",
+   "size": 11729568,
+   "stage_rel": "vllm/_h3_w8a16_C.cpython-312-x86_64-linux-gnu.so"
+  },
+  {
+   "build_artifact": "/data/src/1cat-wt-p075-develop/build/lib.linux-x86_64-cpython-312/vllm/_moe_C.abi3.so",
+   "build_artifact_sha256": "12221024c53f5ddf1d5d8fdbc01f6fc4cfa1634f39d812fb8879b83edaffa27d",
+   "kernels_file": "c4140/kernels/base-p075-develop-build/kernels/12221024-_moe_C.abi3.so.txt",
+   "matches_live": true,
+   "nm_defined_symbols": 1314,
+   "path": "/data/bench/explore/stage-develop-cs-g20-pool-v3-pf-d2dense-tbl2-mpad/vllm/_moe_C.abi3.so",
+   "sass_kernel_count": 3130,
+   "sha256": "12221024c53f5ddf1d5d8fdbc01f6fc4cfa1634f39d812fb8879b83edaffa27d",
+   "size": 136652416,
+   "stage_rel": "vllm/_moe_C.abi3.so"
+  },
+  {
+   "build_artifact": "/data/src/1cat-wt-p075-develop/build/lib.linux-x86_64-cpython-312/vllm/_sm70_exact_reduce_C.cpython-312-x86_64-linux-gnu.so",
+   "build_artifact_sha256": "e4f64a3aa64e0a573bb16a9ce941733371393715b388e2415d9fae967634121e",
+   "kernels_file": "c4140/kernels/base-p075-develop-build/kernels/e4f64a3a-_sm70_exact_reduce_C.cpython-312-x86_64-linux-gnu.so.txt",
+   "matches_live": true,
+   "nm_defined_symbols": 161,
+   "path": "/data/bench/explore/stage-develop-cs-g20-pool-v3-pf-d2dense-tbl2-mpad/vllm/_sm70_exact_reduce_C.cpython-312-x86_64-linux-gnu.so",
+   "sass_kernel_count": 1,
+   "sha256": "e4f64a3aa64e0a573bb16a9ce941733371393715b388e2415d9fae967634121e",
+   "size": 10750128,
+   "stage_rel": "vllm/_sm70_exact_reduce_C.cpython-312-x86_64-linux-gnu.so"
+  },
+  {
+   "build_artifact": "/data/src/1cat-wt-p075-develop/build/lib.linux-x86_64-cpython-312/vllm/_sm70_sampler_C.abi3.so",
+   "build_artifact_sha256": "4e35474e7748bfd7109b7a57ce9608a9e7b3685e4a66ac2a5ba09e88db7b487e",
+   "kernels_file": "c4140/kernels/base-p075-develop-build/kernels/4e35474e-_sm70_sampler_C.abi3.so.txt",
+   "matches_live": true,
+   "nm_defined_symbols": 272,
+   "path": "/data/bench/explore/stage-develop-cs-g20-pool-v3-pf-d2dense-tbl2-mpad/vllm/_sm70_sampler_C.abi3.so",
+   "sass_kernel_count": 3,
+   "sha256": "4e35474e7748bfd7109b7a57ce9608a9e7b3685e4a66ac2a5ba09e88db7b487e",
+   "size": 11634776,
+   "stage_rel": "vllm/_sm70_sampler_C.abi3.so"
+  },
+  {
+   "build_artifact": "/data/src/1cat-wt-p075-develop/build/lib.linux-x86_64-cpython-312/vllm/_sm70_sparse_attention_C.cpython-312-x86_64-linux-gnu.so",
+   "build_artifact_sha256": "fbb04e5f9ad2a5ea582db13feddb8513ca36d1e8dcc2038d3fcf34106df57fb8",
+   "kernels_file": "c4140/kernels/base-p075-develop-build/kernels/fbb04e5f-_sm70_sparse_attention_C.cpython-312-x86_64-linux-gnu.so.txt",
+   "matches_live": true,
+   "nm_defined_symbols": 195,
+   "path": "/data/bench/explore/stage-develop-cs-g20-pool-v3-pf-d2dense-tbl2-mpad/vllm/_sm70_sparse_attention_C.cpython-312-x86_64-linux-gnu.so",
+   "sass_kernel_count": 4,
+   "sha256": "fbb04e5f9ad2a5ea582db13feddb8513ca36d1e8dcc2038d3fcf34106df57fb8",
+   "size": 11082496,
+   "stage_rel": "vllm/_sm70_sparse_attention_C.cpython-312-x86_64-linux-gnu.so"
+  },
+  {
+   "build_artifact": "/data/src/1cat-wt-p075-develop/build/lib.linux-x86_64-cpython-312/vllm/cumem_allocator.abi3.so",
+   "build_artifact_sha256": "30dedc38b8bbdba367c6d0e798aa08e31a4a2ebb696f42afb36dbf3608f33401",
+   "matches_live": true,
+   "nm_defined_symbols": 12,
+   "path": "/data/bench/explore/stage-develop-cs-g20-pool-v3-pf-d2dense-tbl2-mpad/vllm/cumem_allocator.abi3.so",
+   "sass_kernel_count": 0,
+   "sha256": "30dedc38b8bbdba367c6d0e798aa08e31a4a2ebb696f42afb36dbf3608f33401",
+   "size": 105032,
+   "stage_rel": "vllm/cumem_allocator.abi3.so"
+  },
+  {
+   "build_artifact": "/data/src/1cat-wt-p075-develop/build/lib.linux-x86_64-cpython-312/vllm/spinloop.abi3.so",
+   "build_artifact_sha256": "b0aceac8b0630513694e7de8f1131c96b6fbd3ca6eecb6eafa703b7028086da6",
+   "matches_live": true,
+   "nm_defined_symbols": 1,
+   "path": "/data/bench/explore/stage-develop-cs-g20-pool-v3-pf-d2dense-tbl2-mpad/vllm/spinloop.abi3.so",
+   "sass_kernel_count": 0,
+   "sha256": "b0aceac8b0630513694e7de8f1131c96b6fbd3ca6eecb6eafa703b7028086da6",
+   "size": 36592,
+   "stage_rel": "vllm/spinloop.abi3.so"
+  }
+ ],
+ "source_branch": "c4140-p075-develop (ancestor of the anchor)",
+ "source_commit": "367d2a5a3baf2c71b66511df0b1d7184fa8556a8",
+ "source_tree_clean_at_import": true
+}
