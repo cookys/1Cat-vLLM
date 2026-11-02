@@ -1,0 +1,135 @@
+{
+ "build_commands": {
+  "compile_argv": [
+   "/usr/local/cuda-12.9/bin/nvcc",
+   "-c",
+   "/data/bench/explore/l25-lut-fold-v1/build/src-l25/kernel/flash_decode_paged.cu",
+   "-o",
+   "/data/bench/explore/l25-lut-fold-v1/build/l26-r1/flash_decode_paged.o",
+   "-O3",
+   "-std=c++17",
+   "-gencode",
+   "arch=compute_70,code=sm_70",
+   "--use_fast_math",
+   "--ptxas-options=-v",
+   "--expt-relaxed-constexpr",
+   "--expt-extended-lambda",
+   "--compiler-options=-fPIC",
+   "-ccbin",
+   "/usr/bin/gcc-14",
+   "-DTORCH_API_INCLUDE_EXTENSION_H",
+   "-DTORCH_EXTENSION_NAME=flash_attn_v100_cuda",
+   "-U__CUDA_NO_HALF_OPERATORS__",
+   "-U__CUDA_NO_HALF_CONVERSIONS__",
+   "-U__CUDA_NO_HALF2_OPERATORS__",
+   "-DS1_DEQUANT_DIET=5",
+   "-I/data/bench/explore/l25-lut-fold-v1/build/src-l25/kernel",
+   "-I/data/bench/explore/l25-lut-fold-v1/build/src-l25/include",
+   "-I/data/venvs/1cat-main-integp7pr-p8-gvB-integ/lib/python3.12/site-packages/torch/include",
+   "-I/data/venvs/1cat-main-integp7pr-p8-gvB-integ/lib/python3.12/site-packages/torch/include/torch/csrc/api/include",
+   "-I/home/cookys/.local/share/uv/python/cpython-3.12.14-linux-x86_64-gnu/include/python3.12"
+  ],
+  "driver": "bash /data/bench/explore/l25-lut-fold-v1/build/build.sh l26 l26-r1  (-> fence.sh python3 build_arm.py l26 <dir>)",
+  "link_argv": [
+   "/usr/bin/g++-14",
+   "-shared",
+   "/data/bench/explore/l25-lut-fold-v1/build/l26-r1/flash_decode_paged.o",
+   "/data/bench/explore/pv-hmma/harness/native-build-base/temp/kernel/fused_mha_api.o",
+   "/data/bench/explore/pv-hmma/harness/native-build-base/temp/kernel/fused_mha_forward.o",
+   "/data/bench/explore/pv-hmma/harness/native-build-base/temp/kernel/fused_mha_forward_paged.o",
+   "/data/bench/explore/pv-hmma/harness/native-build-base/temp/kernel/fp8_kv_bridge.o",
+   "/data/bench/explore/pv-hmma/harness/native-build-base/temp/kernel/flash_decode_turboquant.o",
+   "/data/bench/explore/pv-hmma/harness/native-build-base/temp/kernel/fused_mha_backward.o",
+   "-L/data/venvs/1cat-main-integp7pr-p8-gvB-integ/lib/python3.12/site-packages/torch/lib",
+   "-L/usr/local/cuda-12.9/lib64",
+   "-lc10",
+   "-ltorch",
+   "-ltorch_cpu",
+   "-ltorch_python",
+   "-lcudart",
+   "-lc10_cuda",
+   "-ltorch_cuda",
+   "-o",
+   "/data/bench/explore/l25-lut-fold-v1/build/l26-r1/lib/flash_attn_v100_cuda.cpython-312-x86_64-linux-gnu.so"
+  ],
+  "macro": "-DS1_DEQUANT_DIET=5 (L26 = L25 x256 LUT fold + page-id carry; 3 = CSEP-NS; macro default in source = 0)",
+  "translation_unit_unchanged_in_fork": "flash-attention-v100/flash_attn_v100/_s1_native/source/kernel/flash_decode_paged.cu"
+ },
+ "build_dir": "/data/bench/explore/l25-lut-fold-v1/build/l26-r1",
+ "build_dir_artifact": {
+  "exists": true,
+  "matches_live": true,
+  "path": "/data/bench/explore/l25-lut-fold-v1/build/l26-r1/lib/flash_attn_v100_cuda.cpython-312-x86_64-linux-gnu.so",
+  "sha256": "45158fcb1ccdd1f247574ddc42c41e574d4ea9283bedd1dd83c01f9026e016e0"
+ },
+ "compilers": {
+  "cuda_toolkit": "12.9.2 (/usr/local/cuda-12.9/version.json), nvcc 12.9.86",
+  "host_compiler": "g++-14 (Ubuntu 14.3.0-14ubuntu1) 14.3.0",
+  "source": "versions queried at import time (2026-11-02) from the installed toolchain the build scripts reference (-ccbin /usr/bin/g++-14, /usr/local/cuda-12.9); the ptxas/build logs themselves do not print versions"
+ },
+ "live_so": {
+  "cuobjdump_note": null,
+  "nm_defined_symbols": 567,
+  "path": "/data/bench/explore/stage-develop-cs-g20-pool-v3-pf-d2dense-tbl2-mpad/flash_attn_v100/_s1_native/flash_attn_v100_cuda.cpython-312-x86_64-linux-gnu.so",
+  "sass_kernel_count": 817,
+  "sass_kernel_names_file": "c4140/kernels/l26-s1-native/kernels.txt",
+  "sha256": "45158fcb1ccdd1f247574ddc42c41e574d4ea9283bedd1dd83c01f9026e016e0",
+  "size": 29773064,
+  "stage_rel": "flash_attn_v100/_s1_native/flash_attn_v100_cuda.cpython-312-x86_64-linux-gnu.so"
+ },
+ "name": "l26-s1-native",
+ "not_rebuilt": true,
+ "notes": {
+  "base_translation_unit_sha256": "11f1c66656734c57d207ee43acf9d323bb1f7d6f7c9a29af490c4c30a04769f7",
+  "edited_headers_sha256_at_build": {
+   "a_on_loader.cuh": "d9ef2c3717ec14a6b54bf8a10cfa0790f7bcbf4f541b91a36b33f0823d89b06e",
+   "fp8_kv_utils.cuh": "4376d38b7e75d7b68a3f9cc44f3e0be5d4dc9b3496b463116b6b4f3c9e40e7bf",
+   "s1_verify.cuh": "8627b188a320df85fb315f7c930d16a8ff1d8262e01ddcfc041b2a56b21bf56a"
+  },
+  "note": "Only 3 headers differ from the fork source tree at the anchor (diff -rq src-l25 vs anchor source/); flash_decode_paged.cu is byte-identical. Six reused .o come from /data/bench/explore/pv-hmma/harness/native-build-base (unedited headers) and are listed above; a rebuild check is S2.",
+  "reused_unchanged_objects": [
+   {
+    "path": "/data/bench/explore/pv-hmma/harness/native-build-base/temp/kernel/fused_mha_api.o",
+    "sha256": "ffdecb420129e99bff0ef17b745236536f699278545bb0d3f2491f24f07ca6db"
+   },
+   {
+    "path": "/data/bench/explore/pv-hmma/harness/native-build-base/temp/kernel/fused_mha_forward.o",
+    "sha256": "079086924d7053a70e5fbaac046197f5d9c358166ff7f486ba7c7699017a3d49"
+   },
+   {
+    "path": "/data/bench/explore/pv-hmma/harness/native-build-base/temp/kernel/fused_mha_forward_paged.o",
+    "sha256": "c168c9af818282da293d2f3dfae728dbd5b7f90d70f5671a969dc465f61a2e82"
+   },
+   {
+    "path": "/data/bench/explore/pv-hmma/harness/native-build-base/temp/kernel/fp8_kv_bridge.o",
+    "sha256": "cc054dfc83f91c8efb03b080671eb8562bc1d3addcc25c9696320296dac962c1"
+   },
+   {
+    "path": "/data/bench/explore/pv-hmma/harness/native-build-base/temp/kernel/flash_decode_turboquant.o",
+    "sha256": "cb2921550f4bb75e53e5302ae38ace8ed08d2f2c04443f9304e8289272a653a7"
+   },
+   {
+    "path": "/data/bench/explore/pv-hmma/harness/native-build-base/temp/kernel/fused_mha_backward.o",
+    "sha256": "f392217ded08ee128ecc647910f1827f04a5dec62c18723e1249bc4f3a27067c"
+   }
+  ]
+ },
+ "rulings": "RULING-l25-lut-fold-v1 04d73f49; RULING-csep-h1v3-v1 cdcddd36",
+ "sources": [
+  {
+   "committed_as": "flash-attention-v100/flash_attn_v100/_s1_native/source/kernel/a_on_loader.cuh",
+   "origin": "/data/bench/explore/l25-lut-fold-v1/build/src-l25/kernel/a_on_loader.cuh",
+   "sha256": "d9ef2c3717ec14a6b54bf8a10cfa0790f7bcbf4f541b91a36b33f0823d89b06e"
+  },
+  {
+   "committed_as": "flash-attention-v100/flash_attn_v100/_s1_native/source/kernel/fp8_kv_utils.cuh",
+   "origin": "/data/bench/explore/l25-lut-fold-v1/build/src-l25/kernel/fp8_kv_utils.cuh",
+   "sha256": "4376d38b7e75d7b68a3f9cc44f3e0be5d4dc9b3496b463116b6b4f3c9e40e7bf"
+  },
+  {
+   "committed_as": "flash-attention-v100/flash_attn_v100/_s1_native/source/kernel/s1_verify.cuh",
+   "origin": "/data/bench/explore/l25-lut-fold-v1/build/src-l25/kernel/s1_verify.cuh",
+   "sha256": "8627b188a320df85fb315f7c930d16a8ff1d8262e01ddcfc041b2a56b21bf56a"
+  }
+ ]
+}

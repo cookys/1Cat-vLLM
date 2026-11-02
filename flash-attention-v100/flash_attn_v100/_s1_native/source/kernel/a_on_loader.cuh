@@ -8,6 +8,7 @@ __device__ __forceinline__ Raw raw_load(const uint8_t* page,int token,int r,int 
   }
   return x;
 }
+#if S1_DEQUANT_DIET == 0
 __device__ __forceinline__ void raw_store(__half* dst,const Raw& x,int r,int u) {
   const __half2 a=__half2half2(__float2half_rn(flash_v100::fp8_e4m3fn_to_float_bits(uint8_t(x.scales))));
   const __half2 b=__half2half2(__float2half_rn(flash_v100::fp8_e4m3fn_to_float_bits(uint8_t(x.scales>>8))));
@@ -17,6 +18,30 @@ __device__ __forceinline__ void raw_store(__half* dst,const Raw& x,int r,int u) 
   o[r*32+((u*4+2)^a1_mask(r))]=flash_v100::nvfp4_word_to_half8(x.data.z,b);
   o[r*32+((u*4+3)^a1_mask(r))]=flash_v100::nvfp4_word_to_half8(x.data.w,b);
 }
+#elif S1_DEQUANT_DIET == 1
+// CS: original scale decode, Diet C word decode.
+__device__ __forceinline__ void raw_store(__half* dst,const Raw& x,int r,int u) {
+  const __half2 a=__half2half2(__float2half_rn(flash_v100::fp8_e4m3fn_to_float_bits(uint8_t(x.scales))));
+  const __half2 b=__half2half2(__float2half_rn(flash_v100::fp8_e4m3fn_to_float_bits(uint8_t(x.scales>>8))));
+  auto* o=reinterpret_cast<uint4*>(dst);
+  o[r*32+((u*4+0)^a1_mask(r))]=flash_v100::nvfp4_word_to_half8_diet(x.data.x,a);
+  o[r*32+((u*4+1)^a1_mask(r))]=flash_v100::nvfp4_word_to_half8_diet(x.data.y,a);
+  o[r*32+((u*4+2)^a1_mask(r))]=flash_v100::nvfp4_word_to_half8_diet(x.data.z,b);
+  o[r*32+((u*4+3)^a1_mask(r))]=flash_v100::nvfp4_word_to_half8_diet(x.data.w,b);
+}
+#else
+// CSEP: Diet C word decode + each scale byte decoded separately (scale_u8_to_half2); the paired s_pair packing is NOT used
+// (it makes stack 16 B / hot LDL 3 on the live TU).
+__device__ __forceinline__ void raw_store(__half* dst,const Raw& x,int r,int u) {
+  auto* o=reinterpret_cast<uint4*>(dst);
+  const __half2 a=flash_v100::scale_u8_to_half2(x.scales & 0xffu);
+  o[r*32+((u*4+0)^a1_mask(r))]=flash_v100::nvfp4_word_to_half8_diet(x.data.x,a);
+  o[r*32+((u*4+1)^a1_mask(r))]=flash_v100::nvfp4_word_to_half8_diet(x.data.y,a);
+  const __half2 b=flash_v100::scale_u8_to_half2((x.scales >> 8) & 0xffu);
+  o[r*32+((u*4+2)^a1_mask(r))]=flash_v100::nvfp4_word_to_half8_diet(x.data.z,b);
+  o[r*32+((u*4+3)^a1_mask(r))]=flash_v100::nvfp4_word_to_half8_diet(x.data.w,b);
+}
+#endif
 __device__ __forceinline__ void pvb_load_vk_pair(__half* v,__half* k,
  const uint8_t* vp,const uint8_t* kp,int vt,int kt,int vv,int kv,int tid) {
  if(tid<256) {

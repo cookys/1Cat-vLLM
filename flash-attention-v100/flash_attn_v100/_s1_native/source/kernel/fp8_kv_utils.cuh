@@ -187,6 +187,89 @@ __device__ __forceinline__ uint4 nvfp4_word_to_half8(const uint32_t word,
                     nvfp4_half2_scale(c, scale2), nvfp4_half2_scale(d, scale2));
 }
 
+// S1_DEQUANT_DIET (opt-in compile-time switch; default 0 = unchanged code):
+//   0 = BASE, 1 = CS   (Diet C sign-bit pre-align word decode; scale function untouched),
+//   3 = CSEP-NS (CSEP + NaN-preserving select, csep-h1v3-v1).
+//   4 = L25 (NS + x256 folded into the e2m1 code table, no scale HMUL; l25-lut-fold-v1), 5 = L26 (L25 + page-id carry across KV tiles in s1_verify.cuh).
+//   2 = CSEP (CS + raw_store scale decoded per scale byte via scale_u8_to_half2 + HMUL2 by 256).
+// Source: agy wave2 live-TU arms (agy-sass-diet-wave2-livetu-20261024 live_s1_arms.cu / test_spill_fix.cu).
+#ifndef S1_DEQUANT_DIET
+#define S1_DEQUANT_DIET 0
+#endif
+#if S1_DEQUANT_DIET >= 4
+// L25 (lut-fold-v1): the x256 of the E4M3 scale decode is folded into the e2m1 code table. Every magnitude is multiplied by 256
+// (0.5..6 -> 128..1536, still zero low byte, still within the fp16 range) and the scale operand is the unscaled shifted-bits half
+// (scale/256). code*256 * scale/256 = code*scale exactly (<= 6 significant bits, result in [2^-10, 2688]) so the HMUL2 output is bit-identical.
+constexpr uint16_t kNvfp4E2m1HalfBitsX256[16] = {
+    0x0000, 0x5800, 0x5c00, 0x5e00, 0x6000, 0x6200, 0x6400, 0x6600,
+    0x8000, 0xd800, 0xdc00, 0xde00, 0xe000, 0xe200, 0xe400, 0xe600};
+constexpr uint32_t nvfp4_mag_hi_bytes_x256(const int first) {
+  return static_cast<uint32_t>(kNvfp4E2m1HalfBitsX256[first] >> 8) |
+         (static_cast<uint32_t>(kNvfp4E2m1HalfBitsX256[first + 1] >> 8) << 8) |
+         (static_cast<uint32_t>(kNvfp4E2m1HalfBitsX256[first + 2] >> 8) << 16) |
+         (static_cast<uint32_t>(kNvfp4E2m1HalfBitsX256[first + 3] >> 8) << 24);
+}
+constexpr uint32_t kNvfp4MagHiBytesLoX256 = nvfp4_mag_hi_bytes_x256(0);
+constexpr uint32_t kNvfp4MagHiBytesHiX256 = nvfp4_mag_hi_bytes_x256(4);
+constexpr bool nvfp4_table_x256_consistent() {
+  for (int m = 0; m < 8; ++m) {
+    if ((kNvfp4E2m1HalfBitsX256[m] & 0x80ffu) != 0u ||
+        kNvfp4E2m1HalfBitsX256[m + 8] != (kNvfp4E2m1HalfBitsX256[m] | 0x8000u)) return false;
+  }
+  // exponent field of every nonzero magnitude is the unscaled one + 8 (x256), mantissa unchanged
+  for (int m = 1; m < 8; ++m) {
+    if (kNvfp4E2m1HalfBitsX256[m] != kNvfp4E2m1HalfBits[m] + 0x2000u) return false;
+  }
+  return true;
+}
+static_assert(nvfp4_table_x256_consistent(), "x256 e2m1 table must be the base table with exponent +8");
+#define S1_DIET_TBL_LO kNvfp4MagHiBytesLoX256
+#define S1_DIET_TBL_HI kNvfp4MagHiBytesHiX256
+#else
+#define S1_DIET_TBL_LO kNvfp4MagHiBytesLo
+#define S1_DIET_TBL_HI kNvfp4MagHiBytesHi
+#endif
+#if S1_DEQUANT_DIET != 0
+// Diet C: sign bits pre-aligned with two PRMT (w<<4 merged with word), merged into the magnitude bytes with two lop3 (0x80808080).
+__device__ __forceinline__ uint4 nvfp4_word_to_half8_diet(const uint32_t word, const __half2 scale2) {
+  uint32_t hi_lo = __byte_perm(S1_DIET_TBL_LO, S1_DIET_TBL_HI, word & 0x7777u);
+  uint32_t hi_hi = __byte_perm(S1_DIET_TBL_LO, S1_DIET_TBL_HI, (word >> 16) & 0x7777u);
+  const uint32_t w_shl4 = word << 4;
+  const uint32_t s_lo = __byte_perm(w_shl4, word, 0x5140u);
+  const uint32_t s_hi = __byte_perm(w_shl4, word, 0x7362u);
+  asm("lop3.b32 %0, %0, %1, 0x80808080, 0xf8;" : "+r"(hi_lo) : "r"(s_lo));
+  asm("lop3.b32 %0, %0, %1, 0x80808080, 0xf8;" : "+r"(hi_hi) : "r"(s_hi));
+  const uint32_t h01 = __byte_perm(hi_lo, 0u, 0x1404u);
+  const uint32_t h23 = __byte_perm(hi_lo, 0u, 0x3424u);
+  const uint32_t h45 = __byte_perm(hi_hi, 0u, 0x1404u);
+  const uint32_t h67 = __byte_perm(hi_hi, 0u, 0x3424u);
+  return make_uint4(nvfp4_half2_scale(h01, scale2), nvfp4_half2_scale(h23, scale2),
+                    nvfp4_half2_scale(h45, scale2), nvfp4_half2_scale(h67, scale2));
+}
+#endif
+#if S1_DEQUANT_DIET >= 2
+// E4M3 scale byte -> fp16 pair: exponent/mantissa bits shifted into fp16 position, then x256 (HMUL by 0x5c00 = 256.0h).
+// Scale bytes 0x7f / 0xff (NaN in E4M3) become +-480 here instead of NaN (the CSEP-only scan gate in the microbench covers this).
+__device__ __forceinline__ __half2 scale_u8_to_half2(uint32_t raw) {
+  uint16_t half_bits = uint16_t(((raw << 7) & 0x3f80u) | ((raw << 8) & 0x8000u));
+#if S1_DEQUANT_DIET >= 4
+  // L25: no HMUL; the x256 lives in the code table (kNvfp4E2m1HalfBitsX256). NaN select unchanged: 0x7f / 0xff -> 0x7fff.
+  const uint16_t out_bits = ((raw & 0x7fu) == 0x7fu) ? uint16_t(0x7fffu) : half_bits;
+  return __half2half2(__ushort_as_half(out_bits));
+#else
+  __half h = __hmul(__ushort_as_half(half_bits), __ushort_as_half(0x5c00u));
+#if S1_DEQUANT_DIET == 3
+  // CSEP-NS: low 7 bits all ones (E4M3 NaN, 0x7f / 0xff) -> the same half NaN the CS path yields
+  // (CS: quiet_nan_f() = float 0x7fffffff -> __float2half_rn = 0x7fff, sign dropped).
+  const uint16_t out_bits = ((raw & 0x7fu) == 0x7fu) ? uint16_t(0x7fffu) : __half_as_ushort(h);
+  return __half2half2(__ushort_as_half(out_bits));
+#else
+  return __half2half2(h);
+#endif
+#endif
+}
+#endif
+
 // Decode 32 consecutive dims: 16 data bytes + two scale bytes (low byte covers
 // dims 0..15, high byte dims 16..31) -> 4 uint4 of fp16 (dims 8i..8i+7).
 __device__ __forceinline__ void nvfp4_data16_to_half32(const uint4 data,

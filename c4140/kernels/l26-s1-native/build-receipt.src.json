@@ -1,0 +1,41 @@
+{
+  "GPU_NOT_RUN": true,
+  "arm": "l26",
+  "S1_DEQUANT_DIET": 5,
+  "so": "/data/bench/explore/l25-lut-fold-v1/build/l26-r1/lib/flash_attn_v100_cuda.cpython-312-x86_64-linux-gnu.so",
+  "sha256": "45158fcb1ccdd1f247574ddc42c41e574d4ea9283bedd1dd83c01f9026e016e0",
+  "worktree_copy": "/data/bench/explore/d1/h1-rskh-v1",
+  "translation_unit": "/data/bench/explore/l25-lut-fold-v1/build/src-l25/kernel/flash_decode_paged.cu",
+  "translation_unit_sha256": "11f1c66656734c57d207ee43acf9d323bb1f7d6f7c9a29af490c4c30a04769f7",
+  "edited_headers": {
+    "fp8_kv_utils.cuh": "4376d38b7e75d7b68a3f9cc44f3e0be5d4dc9b3496b463116b6b4f3c9e40e7bf",
+    "a_on_loader.cuh": "d9ef2c3717ec14a6b54bf8a10cfa0790f7bcbf4f541b91a36b33f0823d89b06e",
+    "s1_verify.cuh": "8627b188a320df85fb315f7c930d16a8ff1d8262e01ddcfc041b2a56b21bf56a"
+  },
+  "reused_unchanged_objects": [
+    {
+      "path": "/data/bench/explore/pv-hmma/harness/native-build-base/temp/kernel/fused_mha_api.o",
+      "sha256": "ffdecb420129e99bff0ef17b745236536f699278545bb0d3f2491f24f07ca6db"
+    },
+    {
+      "path": "/data/bench/explore/pv-hmma/harness/native-build-base/temp/kernel/fused_mha_forward.o",
+      "sha256": "079086924d7053a70e5fbaac046197f5d9c358166ff7f486ba7c7699017a3d49"
+    },
+    {
+      "path": "/data/bench/explore/pv-hmma/harness/native-build-base/temp/kernel/fused_mha_forward_paged.o",
+      "sha256": "c168c9af818282da293d2f3dfae728dbd5b7f90d70f5671a969dc465f61a2e82"
+    },
+    {
+      "path": "/data/bench/explore/pv-hmma/harness/native-build-base/temp/kernel/fp8_kv_bridge.o",
+      "sha256": "cc054dfc83f91c8efb03b080671eb8562bc1d3addcc25c9696320296dac962c1"
+    },
+    {
+      "path": "/data/bench/explore/pv-hmma/harness/native-build-base/temp/kernel/flash_decode_turboquant.o",
+      "sha256": "cb2921550f4bb75e53e5302ae38ace8ed08d2f2c04443f9304e8289272a653a7"
+    },
+    {
+      "path": "/data/bench/explore/pv-hmma/harness/native-build-base/temp/kernel/fused_mha_backward.o",
+      "sha256": "f392217ded08ee128ecc647910f1827f04a5dec62c18723e1249bc4f3a27067c"
+    }
+  ]
+}
