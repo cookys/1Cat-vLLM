@@ -1,0 +1,27 @@
+{
+ "schema": "lmhead-lt-pins/1",
+ "vendored": {
+  "p0_plan.py": {
+   "origin": "/data/bench/explore/p0-lm-v1/pack/p0_plan.py",
+   "sha256": "223c48f8750396215ea19efc95c990bb021b8e0c8328926e34854e9e3a56969d"
+  },
+  "p0_ref.py": {
+   "origin": "/data/bench/explore/p0-lm-v1/pack/p0_ref.py",
+   "sha256": "58c5e9086b9bb1d4a900f922f316e671e5ee66442fcc1fda2a790253ab0082fb"
+  },
+  "p0_cublaslt.py": {
+   "origin": "/data/bench/explore/p0-lm-v1/pack/p0_cublaslt.py",
+   "sha256": "59777780cf17a7848dd166e0a5b393afa289d2a6206d4869984f43b1eee65e35"
+  },
+  "p0_env.py": {
+   "origin": "/data/bench/explore/p0-lm-v1/pack/p0_env.py",
+   "sha256": "afb190896d28c15c3ced24147e5d3ee38dd9cd70ab0ea1ac4e87ab507543990e"
+  }
+ },
+ "external": {
+  "/data/bench/explore/out-p0-lm-v1-20261027/RUN.json": "c81ea65e084d7816de77336fbc109fb2d64cb6dbac0ea6b59215dea9ca4bb7d7",
+  "/data/bench/explore/out-p0-lm-v1-20261027/RESULT.json": "b78125de23e186af23151bb873ec73c31bcc1f80b1927b9bebe287880ea547bc",
+  "/data/bench/explore/stage-develop-cs-g20-h1v3/vllm/model_executor/layers/vocab_parallel_embedding.py": "5c19fe094332324d3d4b765f9a51ecfdcfd8f13f8b6a69e2450cc48ef9489dfb"
+ },
+ "note": "external = P0-LM RUN/RESULT the check compares r against + the live stage-A vocab_parallel_embedding.py the patched file was built from"
+}

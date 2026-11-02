@@ -1,0 +1,40 @@
+{
+ "build_commands": {
+  "script": "/data/bench/explore/lmhead-lt-v1/pack/build.sh (fence.sh -> g++ -std=c++17 -O2 -shared -fPIC -I<nvidia wheels> sm70_lmhead_lt.cpp -l:libcublasLt.so.12 -Wl,-soname,sm70_lmhead_lt.so -Wl,--build-id=none); the stage copy is the same bytes renamed sm70_lmhead_lt_native.so"
+ },
+ "build_dir": "/data/bench/explore/lmhead-lt-v1/pack",
+ "build_dir_artifact": {
+  "exists": true,
+  "matches_live": true,
+  "path": "/data/bench/explore/lmhead-lt-v1/pack/sm70_lmhead_lt.so",
+  "sha256": "b01182e4cb25851be624bf8e11b44c2ca300da092680a6b27783feb06f71fe9c"
+ },
+ "compilers": {
+  "cuda_toolkit": "12.9.2 (/usr/local/cuda-12.9/version.json), nvcc 12.9.86",
+  "host_compiler": "g++-14 (Ubuntu 14.3.0-14ubuntu1) 14.3.0",
+  "source": "versions queried at import time (2026-11-02) from the installed toolchain the build scripts reference (-ccbin /usr/bin/g++-14, /usr/local/cuda-12.9); the ptxas/build logs themselves do not print versions"
+ },
+ "live_so": {
+  "cuobjdump_note": "cuobjdump info    : File '/data/bench/explore/stage-develop-cs-g20-pool-v3-pf-d2dense-tbl2-mpad/vllm/model_executor/layers/sm70_lmhead_lt_native.so' does not contain device code",
+  "nm_defined_symbols": 6,
+  "path": "/data/bench/explore/stage-develop-cs-g20-pool-v3-pf-d2dense-tbl2-mpad/vllm/model_executor/layers/sm70_lmhead_lt_native.so",
+  "sass_kernel_count": 0,
+  "sass_kernel_names_file": null,
+  "sha256": "b01182e4cb25851be624bf8e11b44c2ca300da092680a6b27783feb06f71fe9c",
+  "size": 17432,
+  "stage_rel": "vllm/model_executor/layers/sm70_lmhead_lt_native.so"
+ },
+ "name": "lmhead-lt",
+ "not_rebuilt": true,
+ "notes": {
+  "host_only": "no device code; g++ build against the serving venv nvidia wheels"
+ },
+ "rulings": "RULING-lmhead-lt-v1 (no RULING file found); pool-serve-v4 476a1633",
+ "sources": [
+  {
+   "committed_as": "c4140/kernels/lmhead-lt/sm70_lmhead_lt.cpp",
+   "origin": "/data/bench/explore/lmhead-lt-v1/pack/sm70_lmhead_lt.cpp",
+   "sha256": "77e406e38f9df68a04a781dce53b8ed5843e6e6e4a7789cd91e6f5da476db62f"
+  }
+ ]
+}
