@@ -1,0 +1,18 @@
+{
+ "function": "lmhead_gemmILi64ELi1E",
+ "identical": true,
+ "sass_lines": 4207,
+ "schema": "lmv4-sass-parity/1",
+ "v2_function_sass_sha256": "9b9906d54b544df81e3b781079644b3bad25c71d420a98ae19aa334f6177a913",
+ "v2_functions": 4,
+ "v2_so": "sm70_lmhead_custom_v3.so",
+ "v2_so_sha256": "fdd849208edc7d0a0c7171ee2f3e1c1742a4ee9ec6a0a0d4ef1824d3b700bc40",
+ "v3_function_sass_sha16": {
+  "_ZN_GLOBAL_N_Xlmhead_gemmILi64ELi1EEEvPK6__halfS3_Pfiii": "9b9906d54b544df8",
+  "_ZN_GLOBAL_N_Xlmhead_gemm_swapILi64ELi1EEEvPK6__halfS3_Pfiii": "340af6175134b3e0"
+ },
+ "v3_function_sass_sha256": "9b9906d54b544df81e3b781079644b3bad25c71d420a98ae19aa334f6177a913",
+ "v3_functions": 2,
+ "v3_so": "sm70_lmhead_custom_v4.so",
+ "v3_so_sha256": "f3dc07afca05e0b4566fcf8d26ee615f80fcb2d98cbb2126fbf3ee408515c51b"
+}

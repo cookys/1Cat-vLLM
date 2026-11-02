@@ -1,0 +1,45 @@
+{
+ "built": {
+  "ptxas-v.log": "3fa81f635ff61d206fd9c53a9c28ee017ef2f8972c1f72c4c4e4f99236d0843e",
+  "sass-parity.json": "6d02bd2f506c388c96b0122b3c2cbf88920f77587fa206d5955b80c0bd2b845e",
+  "sm70_lmhead_custom_v4.cu": "024eb5044bf299c77107781b047c4090ccbcc9f59043c51c9a0eacd6649c3c71",
+  "sm70_lmhead_custom_v4.so": "f3dc07afca05e0b4566fcf8d26ee615f80fcb2d98cbb2126fbf3ee408515c51b"
+ },
+ "external": {
+  "/data/bench/explore/lmhead-custom-v3/pack/sm70_lmhead_custom_v3.cu": "85d5c5ba411c104f422edc9f9e36e74d00b17d7a6e716f5f9476e2d900ddebf6",
+  "/data/bench/explore/lmhead-custom-v3/pack/sm70_lmhead_custom_v3.so": "fdd849208edc7d0a0c7171ee2f3e1c1742a4ee9ec6a0a0d4ef1824d3b700bc40",
+  "/data/bench/explore/out-lmhead-custom-v1-20261028/RESULT.json": "28d0fee052ed8d7e29eda38e83f99e3b352136d6b2b39192dc12e98063e776d6",
+  "/data/bench/explore/out-lmhead-custom-v3-20261028/RESULT.json": "27e7341c888a50b8ecd843ff297cacd10f09a0baeb2a95288e3f502882217c99",
+  "/data/bench/explore/out-lmhead-custom-v3-20261028/child-ncu-CUSTOM-B.json": "13624219447d96f31b1261d2ea1835fee70f7be1b4997982b4c7d89a0aca04cf",
+  "/data/bench/explore/out-lmhead-custom-v3-20261028/lmhead-custom-raw.json": "a34e5dad5572bb8b4ba8ee7e68607e8ddfb722598023550d01c4274ba8eb4fb2",
+  "/data/bench/explore/out-lmhead-custom-v3-20261028/ncu-CUSTOM-B-raw.csv": "1782e53e455cb5794a0f0b38fad6085cd02220936d65b7294855e913fc3eb5cd",
+  "/data/bench/explore/out-lmhead-frag-probe-v1-20261028/RESULT.json": "fc899a27e76f74f95f7687dc82671fa5f8132415d4f3df37df35e102fd9d0b92",
+  "/data/bench/explore/out-lmhead-ncu-v1-20261028/RESULT.json": "c9625ecb68cfda6225597b78c97ec91a4ef9c6e6b245a3ea2ad8514fb3d218fe",
+  "/data/bench/explore/out-lmhead-ncu-v1-20261028/ncu-CUSTOM-B-M112-raw.csv": "a49eadf90ed28bbfd7d655349ffa32cdd821c267ee7f7ba47e168ac0cfcdae79",
+  "/data/bench/explore/out-p0-lm-v1-20261027/RESULT.json": "b78125de23e186af23151bb873ec73c31bcc1f80b1927b9bebe287880ea547bc",
+  "/data/bench/explore/out-p0-lm-v1-20261027/RUN.json": "c81ea65e084d7816de77336fbc109fb2d64cb6dbac0ea6b59215dea9ca4bb7d7",
+  "/data/bench/explore/research-frontier/RULING-lmhead-custom-v3-fable-20261028.md": "f3cf075ca21783fe165f5ee880d5d1608afc24421f1231eafbb6a60ef0c83453",
+  "/data/bench/explore/research-frontier/RULING-lmhead-frag-probe-v1-fable-20261028.md": "8c0f167141b3e09fc70faaea01c5b2cc48e451ce933fc135d5b0da92b20b549f",
+  "/data/bench/explore/stage-develop-cs-g20-h1v3/vllm/model_executor/layers/vocab_parallel_embedding.py": "5c19fe094332324d3d4b765f9a51ecfdcfd8f13f8b6a69e2450cc48ef9489dfb"
+ },
+ "note": "external = P0-LM RUN (W/X digests) and RESULT, the lmhead-custom-v1 RESULT (CUSTOM-B 1553.6 us at M112 baseline), the lmhead-ncu-v1 RESULT and CUSTOM-B raw csv (conflict share 0.40), the SEALED lmhead-custom-v3 .so (fdd84920, the CUSTOM-B SASS reference of sass_parity.py) and .cu (lines 1-114 reference), RULING-lmhead-frag-probe-v1 (8c0f1671, sections 3-4 = the pre-registered criteria) and RULING-lmhead-custom-v3 (f3cf075c), the lmhead-custom-v3 out dir files the selftest fixtures are cut from (raw rows, CUSTOM-B ncu csv, child json), the frag-probe RESULT and the live stage call-site file (torch.mm at line 443). Every /pack/ path above is a SEALED pack (SEALED marker present).",
+ "schema": "lmhead-custom-pins/4",
+ "vendored": {
+  "lmhead_qualify.py": {
+   "origin": "/data/bench/explore/lmhead-lt-v1/pack/lmhead_qualify.py",
+   "sha256": "97c8df23b3021ccaba415ba99f5e5457a3b9ce2e96f9752a53510100101ede1d"
+  },
+  "p0_env.py": {
+   "origin": "/data/bench/explore/p0-lm-v1/pack/p0_env.py",
+   "sha256": "afb190896d28c15c3ced24147e5d3ee38dd9cd70ab0ea1ac4e87ab507543990e"
+  },
+  "p0_plan.py": {
+   "origin": "/data/bench/explore/p0-lm-v1/pack/p0_plan.py",
+   "sha256": "223c48f8750396215ea19efc95c990bb021b8e0c8328926e34854e9e3a56969d"
+  },
+  "p0_ref.py": {
+   "origin": "/data/bench/explore/p0-lm-v1/pack/p0_ref.py",
+   "sha256": "58c5e9086b9bb1d4a900f922f316e671e5ee66442fcc1fda2a790253ab0082fb"
+  }
+ }
+}

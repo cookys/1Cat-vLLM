@@ -1,0 +1,13 @@
+fence.sh: MemoryMax=24.0G MemoryHigh=20.4G CPU=8/14 threads jobs=4 (avail 101.4G) :: /usr/local/cuda-12.9/bin/nvcc -ccbin /usr/bin/g++-14 -std=c++17 -O3 -arch=sm_70 -lineinfo -Xptxas -v --shared -Xcompiler -fPIC -Xlinker --build-id=none -o /data/bench/explore/lmhead-custom-v4/pack/sm70_lmhead_custom_v4.so /data/bench/explore/lmhead-custom-v4/pack/sm70_lmhead_custom_v4.cu
+nvcc warning : Support for offline compilation for architectures prior to '<compute/sm/lto>_75' will be removed in a future release (Use -Wno-deprecated-gpu-targets to suppress warning).
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_ZN57_GLOBAL__N__078925d9_24_sm70_lmhead_custom_v4_cu_e35fe8e716lmhead_gemm_swapILi64ELi1EEEvPK6__halfS3_Pfiii' for 'sm_70'
+ptxas info    : Function properties for _ZN57_GLOBAL__N__078925d9_24_sm70_lmhead_custom_v4_cu_e35fe8e716lmhead_gemm_swapILi64ELi1EEEvPK6__halfS3_Pfiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 173 registers, used 1 barriers, 388 bytes cmem[0]
+ptxas info    : Compile time = 150.102 ms
+ptxas info    : Compiling entry function '_ZN57_GLOBAL__N__078925d9_24_sm70_lmhead_custom_v4_cu_e35fe8e711lmhead_gemmILi64ELi1EEEvPK6__halfS3_Pfiii' for 'sm_70'
+ptxas info    : Function properties for _ZN57_GLOBAL__N__078925d9_24_sm70_lmhead_custom_v4_cu_e35fe8e711lmhead_gemmILi64ELi1EEEvPK6__halfS3_Pfiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 175 registers, used 1 barriers, 388 bytes cmem[0]
+ptxas info    : Compile time = 142.067 ms
