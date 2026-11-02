@@ -73,7 +73,10 @@ LT_TABLE = {   # M -> max_abs_LIVE (RESULT.json /max_abs_live_by_m[M]); keys == 
     128: 3.5848686820827425e-05,   # out-lmhead-lt-v1-20261028/RESULT.json accepted_ms[32] = 128; max_abs_live_by_m["128"]
 }
 
-ROUTES = ("custom", "lt", "mm", "capture_fallback", "compiling_fallback", "contract_fallback")
+PAD_LO = 81               # LMHEAD-MPAD (DESIGN-lmhead-mpad-v1 sec 2): off-table M in [PAD_LO, 127] is zero-padded up to the next certified custom M
+PAD_TO = {m: min(c for c in CUSTOM_TABLE if c >= m) for m in range(PAD_LO, 128) if m not in CUSTOM_TABLE}
+
+ROUTES = ("custom", "pad", "lt", "mm", "capture_fallback", "compiling_fallback", "contract_fallback")
 
 capture_mode = False      # set by mark_capture_begin() / cleared by mark_capture_end(); torch.cuda.is_current_stream_capturing() is checked as well
 _lib = None
@@ -116,9 +119,11 @@ def _capturing():
 
 
 def lookup(m):
-    """pure function of M: 'custom' | 'lt' | 'mm'"""
+    """pure function of M: 'custom' | 'pad' | 'lt' | 'mm'"""
     if m in CUSTOM_TABLE:
         return "custom"
+    if m in PAD_TO:
+        return "pad"
     if m in LT_TABLE:
         return "lt"
     return "mm"
@@ -216,6 +221,21 @@ def route(layer, x_2d):
         out = _run_custom(x_2d, w, m)
         _count("custom", m)
         return out
+    if kind == "pad":
+        m_pad = PAD_TO[m]
+        if not _contract_ok(x_2d, w):
+            _count("contract_fallback", m)
+            return None
+        if _capturing() and (_lib is None or m_pad not in _prepared_m):
+            _count("capture_fallback", m)
+            return None
+        _load_lib()                      # eager only: reached with _lib set when capturing
+        _prepared_m.add(m_pad)
+        x_pad = torch.zeros((m_pad, int(x_2d.shape[1])), dtype=torch.float16, device=x_2d.device)
+        x_pad[:m] = x_2d
+        out = _run_custom(x_pad, w, m_pad)[:m]
+        _count("pad", f"{m}->{m_pad}")
+        return out
     if kind == "lt":
         lt = getattr(layer, "_sm70_lmhead_lt", None)
         if lt is None:
@@ -246,7 +266,7 @@ def dump_receipt(path=None):
             return None
         path = Path(d) / f"lmhead-hits-{os.getpid()}.json"
     path = Path(path)
-    rec = dict(schema="sm70-lmhead-pool-hits/1", pid=os.getpid(), env={ENV_FLAG: os.environ.get(ENV_FLAG)}, counters=snapshot(), total_calls=_total, custom_table=sorted(CUSTOM_TABLE), lt_table=sorted(LT_TABLE),
+    rec = dict(schema="sm70-lmhead-pool-hits/2", pid=os.getpid(), env={ENV_FLAG: os.environ.get(ENV_FLAG)}, counters=snapshot(), total_calls=_total, custom_table=sorted(CUSTOM_TABLE), pad_table={str(k): v for k, v in sorted(PAD_TO.items())}, lt_table=sorted(LT_TABLE),
                custom_so=str(CUSTOM_SO), custom_so_sha8=_lib_sha8, swap_kernel_name=getattr(_lib, "swap_name", None), prepared_m=sorted(_prepared_m), capture_mode=capture_mode,
                note="under CUDA-graph capture a count is a capture, not a replay")
     try:
