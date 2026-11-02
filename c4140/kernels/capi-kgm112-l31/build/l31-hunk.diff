@@ -1,0 +1,54 @@
+68a69,96
+> // L31 vec8 path: one thread = 8 consecutive columns of one row, flat grid over rows * d/8, 16-byte LDG/STG.
+> // Per-element expression identical to the scalar kernel above.
+> __global__ void sm70_silu_and_mul_fp16_vec8_kernel(uint4* __restrict__ out,
+>                                                    const uint4* __restrict__ input,
+>                                                    int total_vec, int d8,
+>                                                    int input_stride8,
+>                                                    int out_stride8) {
+>   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+>   if (idx >= total_vec) {
+>     return;
+>   }
+>   const int row = idx / d8;
+>   const int c = idx - row * d8;
+>   const uint4 g = input[(size_t)row * input_stride8 + c];
+>   const uint4 u = input[(size_t)row * input_stride8 + d8 + c];
+>   const __half* gh = reinterpret_cast<const __half*>(&g);
+>   const __half* uh = reinterpret_cast<const __half*>(&u);
+>   uint4 r;
+>   __half* rh = reinterpret_cast<__half*>(&r);
+> #pragma unroll
+>   for (int i = 0; i < 8; ++i) {
+>     const float gate_f = __half2float(gh[i]);
+>     const __half silu = __float2half(gate_f / (1.0f + expf(-gate_f)));
+>     rh[i] = __hmul(silu, uh[i]);
+>   }
+>   out[(size_t)row * out_stride8 + c] = r;
+> }
+> 
+73a102,119
+>   auto* out_p = reinterpret_cast<__half*>(out.data_ptr<at::Half>());
+>   const auto* in_p = reinterpret_cast<const __half*>(input.data_ptr<at::Half>());
+>   const bool vec_ok = rows > 0 && d > 0 && (d % 8 == 0) &&
+>                       (input_stride % 8 == 0) && (out_stride % 8 == 0) &&
+>                       (reinterpret_cast<uintptr_t>(out_p) % 16 == 0) &&
+>                       (reinterpret_cast<uintptr_t>(in_p) % 16 == 0) &&
+>                       (static_cast<int64_t>(rows) * (d / 8) < (1LL << 31) - 256);
+>   if (vec_ok) {
+>     constexpr int kVecThreads = 128;
+>     const int d8 = d / 8;
+>     const int total = rows * d8;
+>     const int blocks = (total + kVecThreads - 1) / kVecThreads;
+>     sm70_silu_and_mul_fp16_vec8_kernel<<<blocks, kVecThreads, 0,
+>                                          at::cuda::getCurrentCUDAStream()>>>(
+>         reinterpret_cast<uint4*>(out_p), reinterpret_cast<const uint4*>(in_p),
+>         total, d8, input_stride / 8, out_stride / 8);
+>     return;
+>   }
+77,79c123
+<       reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+<       reinterpret_cast<const __half*>(input.data_ptr<at::Half>()), rows, d,
+<       input_stride, out_stride);
+---
+>       out_p, in_p, rows, d, input_stride, out_stride);

@@ -44,6 +44,14 @@ using D = cache_policy::Default;
   X(96, 128, 32, 2, 4, 4, -1, -1)               \
   X(96, 128, 64, 2, 2, 2, -1, -1)
 
+// KG-M112 v13: the five new whole-M tiles, registered ONLY for M in [97, 112] (MRangeKernelImpl below); every other M sees LIVE's candidate set.
+#define SM70_NVF4_WHOLE_M_TILES_V13(X)          \
+  X(112, 256, 32, 2, 4, 4, 56, 256)             \
+  X(112, 256, 32, 1, 8, 4, 112, 128)            \
+  X(112, 128, 32, 2, 4, 4, -1, -1)              \
+  X(112, 128, 64, 7, 1, 2, -1, -1)              \
+  X(120, 128, 64, 3, 2, 2, -1, -1)
+
 #define SM70_NVF4_WHOLE_M_TYPE(Cfg, M, N, K, TM, TN, ST, CM, CN) \
   Cfg::Type<M, N, K, TM, TN, 1, D, S, ST, true, 1, 16, CM, CN>
 
@@ -70,6 +78,17 @@ class ExactMnkKernelImpl final : public KernelImpl<Gemm> {
   bool is_feasible(const GemmDesc& desc) const noexcept override {
     return desc.m == ExactM && desc.n == ExactN && desc.k == ExactK &&
            KernelImpl<Gemm>::is_feasible(desc);
+  }
+};
+
+// KG-M112 v13: offer a tile only for Lo <= M <= Hi. m is the batch-dimension size exactly as Context::Filter computes it
+// (transpose() swaps m/n and flips batch_dim, so this expression is the same in either kernel view).
+template <class Gemm, int Lo, int Hi>
+class MRangeKernelImpl final : public KernelImpl<Gemm> {
+ public:
+  bool is_feasible(const GemmDesc& desc) const noexcept override {
+    const int m = desc.batch_dim ? desc.n : desc.m;
+    return Lo <= m && m <= Hi && KernelImpl<Gemm>::is_feasible(desc);
   }
 };
 
@@ -218,6 +237,10 @@ void Registry::sm70_884_4() {
           Add<SM70_NVF4_WHOLE_M_TYPE(C, M, N, K, TM, TN, ST, CM, CN)>();
           SM70_NVF4_WHOLE_M_TILES(SM70_NVF4_ADD_WHOLE_M)
 #undef SM70_NVF4_ADD_WHOLE_M
+#define SM70_NVF4_ADD_WHOLE_M_V13(M, N, K, TM, TN, ST, CM, CN) \
+          Add(std::make_unique<MRangeKernelImpl<typename SM70_NVF4_WHOLE_M_TYPE(C, M, N, K, TM, TN, ST, CM, CN)::Kernel, 97, 112>>());
+          SM70_NVF4_WHOLE_M_TILES_V13(SM70_NVF4_ADD_WHOLE_M_V13)
+#undef SM70_NVF4_ADD_WHOLE_M_V13
         }
         using Qwen38CacheB = C::Type<32, 128, 32, 1, 4, 1, D, D, 2, true, 1, 16>;
         Add(std::make_unique<Qwen38Nvfp4W2CacheBKernelImpl<typename Qwen38CacheB::Kernel>>());
@@ -285,6 +308,7 @@ Kernel* Sm70Nvfp4PrescaledCounterpart(const Kernel& control) {
           SM70_NVF4_WHOLE_M_TYPE(P, M, N, K, TM, TN, ST, CM, CN)>(control)) \
     return k;
   SM70_NVF4_WHOLE_M_TILES(SM70_NVF4_MATCH_WHOLE_M)
+  SM70_NVF4_WHOLE_M_TILES_V13(SM70_NVF4_MATCH_WHOLE_M)
 #undef SM70_NVF4_MATCH_WHOLE_M
   if (auto* k = MatchPrescaled<
           C::Type<128, 128, 16, 2, 2, 1, D, D, 2, true, 1, 16, 64, 128>,

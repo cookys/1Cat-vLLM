@@ -1,0 +1,61 @@
+{
+ "build_commands": {
+  "awq_compile": "/data/bench/explore/pool-serve-v1/build/compile-awq.sh noD2E /data/src/kgm112-v13 (nvcc /usr/local/cuda/bin/nvcc, SRC = l31-fuse-v2 awq_sm70_gemm.cu, -O2 -g -std=c++20 -gencode arch=compute_70,code=sm_70)",
+  "link_script": "/data/bench/explore/pool-serve-v1/build/link-noD2E.sh (cd /data/src/1cat-wt-p075-develop/build/temp.linux-x86_64-cpython-312; g++-14 -shared ...)",
+  "note": "_C.abi3.so is a RELINK, not a full CMake build: 3 objects replaced in the p075-develop build tree link line, the rest reused",
+  "replaced_objects": {
+   "awq_sm70_gemm.cu.o": "/data/bench/explore/pool-serve-v1/build/out/noD2E/awq_sm70_gemm.cu.o",
+   "custom_all_reduce.cu.o": "/data/src/1cat-wt-subthreshold-g20/build-g20/new/custom_all_reduce.cu.o (anchor branch c4140-subthreshold-g20 source)",
+   "gemm.cu.o": "/data/src/kgm112-v13/build/ogemm/gemm.cu.o",
+   "sm70_884_4.cu.o": "/data/src/kgm112-v13/build/o884/sm70_884_4.cu.o"
+  },
+  "reused_objects_from": "/data/src/1cat-wt-p075-develop/build/temp.linux-x86_64-cpython-312 (branch c4140-p075-develop 367d2a5a3b)",
+  "tu_compile": "/data/src/kgm112-v13/build/compile-tu.sh (W=/data/src/kgm112-v13) for gemm.cu and sm70_884_4.cu"
+ },
+ "build_dir": "/data/bench/explore/pool-serve-v1/build/noD2E",
+ "build_dir_artifact": {
+  "exists": true,
+  "matches_live": true,
+  "path": "/data/bench/explore/pool-serve-v1/build/noD2E/_C.abi3.so",
+  "sha256": "72a56e4e17f9ae43b589a7b101fc853ba5741cc4b726a26564f6a9584f0f855e"
+ },
+ "compilers": {
+  "cuda_toolkit": "12.9.2 (/usr/local/cuda-12.9/version.json), nvcc 12.9.86",
+  "host_compiler": "g++-14 (Ubuntu 14.3.0-14ubuntu1) 14.3.0",
+  "source": "versions queried at import time (2026-11-02) from the installed toolchain the build scripts reference (-ccbin /usr/bin/g++-14, /usr/local/cuda-12.9); the ptxas/build logs themselves do not print versions"
+ },
+ "live_so": {
+  "cuobjdump_note": null,
+  "nm_defined_symbols": 6786,
+  "path": "/data/bench/explore/stage-develop-cs-g20-pool-v3-pf-d2dense-tbl2-mpad/vllm/_C.abi3.so",
+  "sass_kernel_count": 4163,
+  "sass_kernel_names_file": "c4140/kernels/capi-kgm112-l31/kernels.txt",
+  "sha256": "72a56e4e17f9ae43b589a7b101fc853ba5741cc4b726a26564f6a9584f0f855e",
+  "size": 244244552,
+  "stage_rel": "vllm/_C.abi3.so"
+ },
+ "name": "capi-kgm112-l31",
+ "not_rebuilt": true,
+ "notes": {
+  "csrc_awq_diff_vs_anchor": "54-line L31 vec8 hunk (build/l31-hunk.diff)",
+  "excluded": "/data/src/kgm112-v13 also holds sm70_884_4_v5.cu: NOT linked into the live _C (no v5 symbol on the link line), so not committed. D2E variant f8c32e78 is not live. csrc/custom_all_reduce.cuh route-log source is already in the anchor."
+ },
+ "rulings": "RULING-kgm-serve-v2 8aed6e46; RULING-l31-fuse-v2 be11625f; RULING-pool-serve-v4 476a1633",
+ "sources": [
+  {
+   "committed_as": "csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/gemm.cu",
+   "origin": "/data/src/kgm112-v13/csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/gemm.cu",
+   "sha256": "5be956fdfa5bbac6f8e8923ec713de23c0e714b8d3bc2aba67572c7172807bd4"
+  },
+  {
+   "committed_as": "csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/kernel/sm70_884_4.cu",
+   "origin": "/data/src/kgm112-v13/csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/kernel/sm70_884_4.cu",
+   "sha256": "2d765848dc6b46251a59ba918cb5115bd14ddc58a1e4c09ce5bed6479d0f029a"
+  },
+  {
+   "committed_as": "csrc/sm70_turbomind/ops/awq_sm70_gemm.cu",
+   "origin": "/data/bench/explore/l31-fuse-v2/pack/build-receipt/awq_sm70_gemm.cu",
+   "sha256": "0901b789e21bb94fd8fe35c760ee9c9ff776d2ae8ee70bd1e14d081a6db5c6f3"
+  }
+ ]
+}

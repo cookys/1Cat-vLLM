@@ -20,6 +20,8 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <set>
+#include <cstdio>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -510,6 +512,47 @@ const char* ToString(DispatchPolicy policy) {
   }
 }
 
+// KG-M112 v13: candidate fingerprint. Under TM_GEMM_TRACE, once per (desc, include flags), print the candidate set Find() hands to the tuner (after Filter + the prescaled filter).
+void MaybeTraceGemmCandidates(const GemmDesc& desc, const std::vector<Kernel*>& feasible,
+                              bool include_prescaled, bool include_batch_supply) {
+  if (!GemmTraceEnabled()) {
+    return;
+  }
+  const std::string desc_str = to_string(desc);
+  if (!GemmTraceFilterAllows(desc_str)) {
+    return;
+  }
+  std::vector<std::string> names;
+  names.reserve(feasible.size());
+  for (const auto* k : feasible) {
+    names.push_back(k->name());
+  }
+  std::sort(names.begin(), names.end());
+  std::string joined;
+  uint64_t h = 1469598103934665603ull;  // FNV-1a 64 over the sorted names, each followed by '\n'
+  for (const auto& n : names) {
+    joined += (joined.empty() ? "" : ",") + n;
+    for (unsigned char ch : n) {
+      h = (h ^ ch) * 1099511628211ull;
+    }
+    h = (h ^ (unsigned char)'\n') * 1099511628211ull;
+  }
+  static std::mutex mu;
+  static std::set<std::string> seen;
+  const std::string key = desc_str + "|" + (include_prescaled ? "p1" : "p0") + (include_batch_supply ? "b1" : "b0");
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    if (!seen.insert(key).second) {
+      return;
+    }
+  }
+  char hex[17];
+  std::snprintf(hex, sizeof(hex), "%016llx", (unsigned long long)h);
+  std::cerr << "[TM_GEMM_CAND] desc=" << desc_str << " prescaled=" << (include_prescaled ? 1 : 0)
+            << " batch_supply=" << (include_batch_supply ? 1 : 0) << " n=" << names.size() << " sha=" << hex
+            << " names=" << joined << "\n";
+}
+
 void MaybeTraceGemmDispatch(const GemmDesc& desc, DispatchPolicy policy,
                             const LaunchSpec& spec, bool measured) {
   if (!GemmTraceEnabled()) {
@@ -806,6 +849,7 @@ struct Gemm::Impl {
                          }),
           feasible.end());
     }
+    MaybeTraceGemmCandidates(ctx.desc(), feasible, include_prescaled, include_batch_supply);
 
     std::vector<std::vector<LaunchSpec>> clusters;
     {
