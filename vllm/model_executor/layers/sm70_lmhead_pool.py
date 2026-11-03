@@ -73,7 +73,7 @@ LT_TABLE = {   # M -> max_abs_LIVE (RESULT.json /max_abs_live_by_m[M]); keys == 
     128: 3.5848686820827425e-05,   # out-lmhead-lt-v1-20261028/RESULT.json accepted_ms[32] = 128; max_abs_live_by_m["128"]
 }
 
-PAD_LO = 81               # LMHEAD-MPAD (DESIGN-lmhead-mpad-v1 sec 2): off-table M in [PAD_LO, 127] is zero-padded up to the next certified custom M
+PAD_LO = 65               # LMHEAD-MPAD (DESIGN-lmhead-mpad-v1 sec 2) widened by seat-route-v1 (DESIGN-seat-route-v1 sec 2): off-table M in [PAD_LO, 127] is zero-padded up to the next certified custom M (72,70,77,80 -> custom@96)
 PAD_TO = {m: min(c for c in CUSTOM_TABLE if c >= m) for m in range(PAD_LO, 128) if m not in CUSTOM_TABLE}
 
 ROUTES = ("custom", "pad", "lt", "mm", "capture_fallback", "compiling_fallback", "contract_fallback")
