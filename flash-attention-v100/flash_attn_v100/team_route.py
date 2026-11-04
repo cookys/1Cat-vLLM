@@ -8,7 +8,7 @@ _active = None
 _graphs = {}
 _last = {}
 NATIVES = {'S1': 'fe35ca278fa28dec4d82fc1878801dd23fddffed9bd531446dc3bf311d79b58b', 'A1B': 'c3cf94613d8a9d0ec27fb46d88534c70ac04f13108e2ad7ad023fa9ba0069e31'}
-BATCHES = (8, 10, 12, 20)
+BATCHES = tuple(int(x) for x in os.getenv('TEAM_ROUTE_BATCHES', '8,10,12,20').split(',') if x.strip())   # seat-sweep-v5-mixed: the logged decode batch sizes come from the launcher env; default = the pre-v5 literal
 
 def expected():
     return 'A1B' if os.getenv('FLASH_V100_VERIFY_ARM') == 'A1' else 'S1'
