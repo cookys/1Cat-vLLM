@@ -45,6 +45,10 @@ class NewRequestData:
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
 
+    # renew-tail-eos-v2: G-LOG updates the worker replays in place for a
+    # request that hit a registered tail (0 = no replay).
+    renew_tail_bias: int = 0
+
     @classmethod
     def from_request(
         cls,
@@ -52,6 +56,8 @@ class NewRequestData:
         block_ids: tuple[list[int], ...],
         prefill_token_ids: list[int] | None = None,
     ) -> "NewRequestData":
+        bias = getattr(request, "renew_tail_bias", 0)
+        request.renew_tail_bias = 0
         return cls(
             req_id=request.request_id,
             prompt_token_ids=request.prompt_token_ids,
@@ -64,6 +70,7 @@ class NewRequestData:
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
+            renew_tail_bias=bias,
         )
 
     def __repr__(self) -> str:

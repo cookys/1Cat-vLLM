@@ -1119,6 +1119,32 @@ def _reference_rows_chunked(logits, k, p, result, rows, *, reasons, mask_value=-
     return result
 
 
+# renew-tail-eos-v1 (DESIGN section 6): the compact path used to allocate a
+# fresh [rows, vocab] -inf tensor every step (full_like). Keep one grow-only
+# buffer per (vocab, dtype, device) and hand out a row view of it instead.
+# The returned view is only valid until the next call with the same key; the
+# sampler consumes it within the same step (same stream), so no aliasing.
+_NEG_INF_BUFFERS: dict[tuple[int, torch.dtype, str, int | None], torch.Tensor] = {}
+
+
+def _persistent_neg_inf_buffer(logits: torch.Tensor) -> torch.Tensor:
+    rows, vocab = logits.shape
+    device = logits.device
+    if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+        # A graph-captured allocation would pin the persistent buffer to the
+        # graph pool; keep the original per-call allocation while capturing.
+        return torch.full_like(logits, -float("inf"))
+    key = (vocab, logits.dtype, device.type, device.index)
+    buf = _NEG_INF_BUFFERS.get(key)
+    if buf is None or buf.shape[0] < rows:
+        # Grow only; never shrink, so steady state allocates nothing.
+        buf = torch.empty((rows, vocab), dtype=logits.dtype, device=device)
+        _NEG_INF_BUFFERS[key] = buf
+    view = buf[:rows]
+    view.fill_(-float("inf"))
+    return view
+
+
 def _apply_top_k_top_p_compact(
     logits: torch.Tensor,
     k: torch.Tensor,
@@ -1158,7 +1184,7 @@ def _apply_top_k_top_p_compact(
     remove = cumulative <= boundary
     remove[:, -1] = False
     values.masked_fill_(remove, -float("inf"))
-    result = torch.full_like(logits, -float("inf"))
+    result = _persistent_neg_inf_buffer(logits)
     result.scatter_(1, indices, values)
 
     if reference_rows.any():

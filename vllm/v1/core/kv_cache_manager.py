@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
@@ -12,6 +13,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.renew_tail import RenewTail
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -164,6 +166,13 @@ class KVCacheManager:
             self.coordinator.mark_draft_sliding_window_groups()
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
+        # renew-tail-eos-v1: read once; default off = unchanged behaviour.
+        self.renew_tail: RenewTail | None = None
+        if enable_caching and os.environ.get("C4140_RENEW_TAIL_EOS") == "1":
+            rt = RenewTail(self.coordinator, use_eagle)
+            if rt.enabled:
+                self.renew_tail = rt
+                logger.info("RENEW_TAIL enabled (C4140_RENEW_TAIL_EOS=1)")
         self.kv_cache_config = kv_cache_config
         self.kv_cache_event_metadata = tuple(
             (
@@ -181,6 +190,11 @@ class KVCacheManager:
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
+
+    @property
+    def tail_stats(self) -> dict[str, int]:
+        """renew-tail-eos-v1 counters ({} when the lever is off)."""
+        return self.renew_tail.stats if self.renew_tail is not None else {}
 
     @property
     def usage(self) -> float:
@@ -259,6 +273,15 @@ class KVCacheManager:
                 )
             )
             boundary = self.coordinator.shared_prefix_boundary
+            computed_blocks, num_new_computed_tokens, tail0 = self._extend_with_tail(
+                request,
+                computed_blocks,
+                num_new_computed_tokens,
+                max_cache_hit_length,
+                False,
+            )
+            if self.renew_tail is not None and tail0 is not None:
+                self.renew_tail.pending[request.request_id] = tail0
         else:
             # plan 075 S2 C1 fix: a K>0 request reads draft KV.
             # (i) draft group takes part: only blocks whose draft KV was
@@ -272,19 +295,33 @@ class KVCacheManager:
                 skip_group_ids=frozenset(),
             )
             boundary_i = self.coordinator.shared_prefix_boundary
+            # renew-tail-eos-v1: branch (i) has the draft group taking part, so
+            # the tail hit must carry draft pages too (with_draft=True).
+            blocks_i, hit_i, tail_i = self._extend_with_tail(
+                request, blocks_i, hit_i, max_cache_hit_length, True
+            )
             cap = min(max_cache_hit_length, request.num_tokens - self._draft_window())
-            blocks_ii, hit_ii, boundary_ii = blocks_i, 0, 0
+            blocks_ii, hit_ii, boundary_ii, tail_ii = blocks_i, 0, 0, None
             if cap > 0:
                 blocks_ii, hit_ii = self.coordinator.find_longest_cache_hit(
                     request.block_hashes, cap, skip_group_ids=skip_draft
                 )
                 boundary_ii = self.coordinator.shared_prefix_boundary
+                # draft group is skipped here: a tail hit capped like the
+                # aligned hit (N - W) is legal without draft pages.
+                blocks_ii, hit_ii, tail_ii = self._extend_with_tail(
+                    request, blocks_ii, hit_ii, cap, False, count=False
+                )
             if hit_i >= hit_ii:
                 computed_blocks, num_new_computed_tokens = blocks_i, hit_i
                 boundary = boundary_i
+                tail_win = tail_i
             else:
                 computed_blocks, num_new_computed_tokens = blocks_ii, hit_ii
                 boundary = boundary_ii
+                tail_win = tail_ii
+            if self.renew_tail is not None and tail_win is not None:
+                self.renew_tail.pending[request.request_id] = tail_win
             self.coordinator.shared_prefix_boundary = boundary
 
         # Keep the existing two-value lookup API used by 1Cat connectors. The
@@ -300,6 +337,34 @@ class KVCacheManager:
             )
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
+
+    def _extend_with_tail(
+        self,
+        request: Request,
+        blocks: tuple[list[KVCacheBlock], ...],
+        hit: int,
+        max_length: int,
+        with_draft: bool,
+        count: bool = True,
+    ):
+        """renew-tail-eos-v1: replace an aligned hit by a longer tail hit.
+
+        Returns (blocks, hit, tail_or_None); the caller records the winner in
+        ``renew_tail.pending`` so allocate_slots() can consume it.
+        """
+        rt = self.renew_tail
+        if rt is None:
+            return blocks, hit, None
+        rt.pending.pop(request.request_id, None)
+        try:
+            tail = rt.lookup(request, max_length, with_draft, count)
+        except Exception:  # never let the lever break scheduling
+            logger.exception("RENEW_TAIL lookup failed")
+            rt.stats["tail_error"] += 1
+            return blocks, hit, None
+        if tail is None or tail.length <= hit:
+            return blocks, hit, None
+        return tail.blocks, tail.length, tail
 
     def allocate_slots(
         self,
@@ -475,6 +540,8 @@ class KVCacheManager:
                 num_local_computed_tokens=num_local_computed_tokens,
                 num_external_computed_tokens=num_external_computed_tokens,
             )
+            if self.renew_tail is not None:
+                self.renew_tail.consume(request)
 
         new_blocks = self.coordinator.allocate_new_blocks(
             request.request_id,
@@ -509,6 +576,13 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        if self.renew_tail is not None:
+            try:
+                self.renew_tail.on_free(request)
+            except Exception:  # never let the lever break freeing
+                logger.exception("RENEW_TAIL register failed")
+                self.renew_tail.stats["tail_error"] += 1
+            self.renew_tail.on_request_free(request.request_id)
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(

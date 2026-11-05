@@ -185,6 +185,11 @@ class BlockPool:
         # block with id > max_block_id (the elastic tail is being given back).
         self.max_block_id: int | None = None
 
+        # renew-tail-eos-v1: optional hook called with the BlockHashWithGroupId
+        # of every block that leaves the prefix cache by eviction/reuse. Lets
+        # the tail-hash index drop entries whose block was recycled.
+        self.evict_callback: Any = None
+
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
     ) -> list[KVCacheBlock] | None:
@@ -394,6 +399,9 @@ class BlockPool:
             return False
 
         block.reset_hash()
+
+        if self.evict_callback is not None:
+            self.evict_callback(block_hash)
 
         if self.enable_kv_cache_events:
             self.kv_event_queue.append(

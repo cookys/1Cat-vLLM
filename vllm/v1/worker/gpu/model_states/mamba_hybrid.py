@@ -191,6 +191,7 @@ class MambaHybridModelState(DefaultModelState):
         )
         self._dflash2_grouped_smallq_metadata_logged = False
         self._align_mode = self.cache_config.mamba_cache_mode == "align"
+        self._renew_replay: dict[int, tuple[int, int]] = {}
         if self._align_mode:
             self._mamba_state_idx_gpu = torch.full(
                 (self.max_num_reqs,), -2, dtype=torch.int32, device=self.device
@@ -215,6 +216,14 @@ class MambaHybridModelState(DefaultModelState):
             # resolved MambaSpec block size. -2 is distinct from -1 (fresh
             # request with no computed state).
             self._mamba_state_idx_gpu[req_index].fill_(-2)
+            if new_req_data.renew_tail_bias > 0:
+                # renew-tail-eos-v2: the scheduler resumed this request on a
+                # registered tail whose page is H1 + logged updates; replay
+                # `bias` of them in place before the first forward.
+                self._renew_replay[req_index] = (
+                    new_req_data.renew_tail_bias,
+                    new_req_data.num_computed_tokens,
+                )
 
     def _get_mamba_group_info(
         self, kv_cache_config: KVCacheConfig
@@ -284,6 +293,8 @@ class MambaHybridModelState(DefaultModelState):
             return
         mamba_group_ids, mamba_spec = self._get_mamba_group_info(kv_cache_config)
         ctx = self._ensure_align_ctx(kv_cache_config, mamba_group_ids, block_tables)
+        if self._renew_replay:
+            self._replay_renew_tail(input_batch, ctx, mamba_spec.block_size)
 
         block = 256
         preprocess_mamba_align_fused_kernel[
@@ -309,6 +320,44 @@ class MambaHybridModelState(DefaultModelState):
             input_batch.idx_mapping,
             input_batch.query_start_loc,
         )
+
+    def _replay_renew_tail(
+        self, input_batch: InputBatch, ctx: MambaSpecDecodeGPUContext, block_size: int
+    ) -> None:
+        """Materialize the accepted state of tail-hit requests in place.
+
+        Same kernel path as a continuing request that stays in its Mamba block
+        after a speculative step: src column == dst column, token_bias > 0 and
+        a one-token query make _precopy_mamba_align_kernel replay the logged
+        updates (and shift the conv state) inside the page. Runs on scratch
+        tables so the live state_idx / src_col / token_bias stay untouched.
+        """
+        pending, self._renew_replay = self._renew_replay, {}
+        batch_reqs = set(input_batch.idx_mapping_np[: input_batch.num_reqs].tolist())
+        assert pending.keys() <= batch_reqs, (pending.keys(), batch_reqs)
+        reqs = sorted(pending)
+        dev = self._mamba_state_idx_gpu.device
+        cols = torch.tensor(
+            [(pending[r][1] + block_size - 1) // block_size - 1 for r in reqs],
+            dtype=self._mamba_state_idx_gpu.dtype,
+            device=dev,
+        )
+        bias = torch.tensor(
+            [pending[r][0] for r in reqs],
+            dtype=self._mamba_token_bias_gpu.dtype,
+            device=dev,
+        )
+        ridx = torch.tensor(reqs, dtype=input_batch.idx_mapping.dtype, device=dev)
+        dst = torch.zeros_like(self._mamba_state_idx_gpu)
+        src = torch.zeros_like(self._mamba_src_col_gpu)
+        tb = torch.zeros_like(self._mamba_token_bias_gpu)
+        dst[ridx] = cols
+        src[ridx] = cols
+        tb[ridx] = bias
+        qsl = torch.arange(
+            len(reqs) + 1, dtype=input_batch.query_start_loc.dtype, device=dev
+        )
+        run_mamba_align_precopy(ctx, len(reqs), dst, src, tb, ridx, qsl)
 
     def _get_dflash2_gdn_builders(
         self,

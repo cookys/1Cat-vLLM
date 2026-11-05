@@ -1840,6 +1840,7 @@ class Scheduler(SchedulerInterface):
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
 
+            num_generated_this_step = len(generated_token_ids)
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
@@ -1960,6 +1961,16 @@ class Scheduler(SchedulerInterface):
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
                 if finished:
+                    if self.kv_cache_manager.renew_tail is not None:
+                        # renew-tail-eos-v1: normal stop only (aborts and
+                        # preemptions never carry the hint). Second field is
+                        # the number of tokens of a still in-flight step; third is the
+                        # tokens kept after stop truncation (<= first).
+                        request.renew_tail_hint = (
+                            num_generated_this_step,
+                            request.num_in_flight_tokens,
+                            len(new_token_ids),
+                        )
                     kv_transfer_params = self._free_request(request)
 
                 if status_before_stop == RequestStatus.RUNNING:
