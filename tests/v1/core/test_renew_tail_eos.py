@@ -255,8 +255,11 @@ def _async_finish(m, rid, prompt, in_flight, nspec_gen=1, kept=None):
     # step k+1 already scheduled: feeds EOS (+ drafts), optimistic count
     m.allocate_slots(req, in_flight, num_lookahead_tokens=0)
     req.num_computed_tokens += in_flight
+    m_kept = nspec_gen if kept is None else kept
+    # the scheduler rolled num_computed back by the raw g only: g - m stays on the count
+    req.num_computed_tokens += nspec_gen - m_kept
     req.status = RequestStatus.FINISHED_STOPPED
-    req.renew_tail_hint = (nspec_gen, in_flight, nspec_gen if kept is None else kept)
+    req.renew_tail_hint = (nspec_gen, in_flight, m_kept)
     m.free(req)
     return req
 
@@ -327,12 +330,42 @@ def test_sync_accounting_mismatch_is_skip_acct_with_a_full_log_line(monkeypatch,
     assert "n=" in line and "nc=" in line and "in_flight=0" in line and "g=1" in line and "m=1" in line
 
 
-def test_async_stop_inside_the_accepted_run_is_not_recoverable(monkeypatch):
+def test_async_stop_inside_the_accepted_run_registers(monkeypatch):
+    # option C (v3): the worker clamps the run on device, step k+1 feeds the stop token first
     m = _manager(monkeypatch)
-    _async_finish(m, "0", PROMPT, 4, nspec_gen=4, kept=2)
-    assert m.tail_stats["tail_skip_async_trunc"] == 1 and m.tail_stats["tail_reg"] == 0
-    _async_finish(m, "1", PROMPT2, 4, nspec_gen=4, kept=4)  # nothing truncated: registers as before
-    assert m.tail_stats["tail_reg_async"] == 1
+    old = _async_finish(m, "0", PROMPT, 4, nspec_gen=4, kept=2)  # m < g, mid-run stop
+    assert m.tail_stats["tail_reg_async"] == 1 and m.tail_stats["tail_skip_async_trunc"] == 0
+    ent = next(iter(m.renew_tail.index.values()))
+    assert ent.length == old.num_tokens and ent.bias == 0
+    _async_finish(m, "1", PROMPT2, 4, nspec_gen=4, kept=4)  # nothing truncated: as before
+    assert m.tail_stats["tail_reg_async"] == 2
+
+
+def test_async_stop_kept_1_and_kept_g_minus_1_register(monkeypatch):
+    m = _manager(monkeypatch)
+    old1 = _async_finish(m, "0", PROMPT, 4, nspec_gen=4, kept=1)  # EOS was the first accepted token
+    old2 = _async_finish(m, "1", PROMPT2, 4, nspec_gen=4, kept=3)  # EOS was the last-but-one
+    assert m.tail_stats["tail_reg_async"] == 2 and m.tail_stats["tail_skip_async_trunc"] == 0
+    assert sorted(e.length for e in m.renew_tail.index.values()) == sorted([old1.num_tokens, old2.num_tokens])
+    new = _request("2", list(old1.all_token_ids) + [5, 5, 5])
+    _, n = m.get_computed_blocks(new)
+    assert n == old1.num_tokens and m.tail_stats["tail_hit"] == 1
+
+
+def test_async_accounting_mismatch_with_truncation_is_skip_acct(monkeypatch):
+    # a count that forgot the (g - m) term must not register
+    m2 = _manager(monkeypatch)
+    r = _request("0", PROMPT)
+    computed, _ = m2.get_computed_blocks(r)
+    m2.allocate_slots(r, len(PROMPT), 0, computed)
+    r.num_computed_tokens = len(PROMPT)
+    r.append_output_token_ids(1)
+    m2.allocate_slots(r, 4, num_lookahead_tokens=0)
+    r.num_computed_tokens += 4  # missing + (g - m) = 2
+    r.status = RequestStatus.FINISHED_STOPPED
+    r.renew_tail_hint = (4, 4, 2)
+    m2.free(r)
+    assert m2.tail_stats["tail_skip_acct"] == 1 and m2.tail_stats["tail_reg"] == 0
 
 
 def test_aborted_request_registers_nothing(monkeypatch):

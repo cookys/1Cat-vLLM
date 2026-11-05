@@ -50,9 +50,11 @@ sampled EOS, which has not been fed to the model yet).
   worker corrects it on the GPU, gpu_model_runner.py:2523-2531 / :2690-2706);
   the two differ only when a block boundary lies inside the rejected-draft
   window, in which case we skip (``tail_skip_r_ambiguous``). If the stop
-  truncated the accepted run (m < g) step k+1's first input token is not the
-  last kept one, its H1 is a different state and nothing is recoverable
-  (``tail_skip_async_trunc``). Attention KV of
+  truncated the accepted run (m < g), v3 option C (worker/gpu/sample/eos_clamp.py)
+  has clamped num_sampled / last_sampled / num_computed on device to m, so step
+  k+1 still feeds the stop token first and the same page is registered; the CPU
+  count then carries g - m extra. (``tail_skip_async_trunc`` is no longer
+  produced; the counter key stays.) Attention KV of
   the EOS token at position N-1 is written by the same step, so the tail
   block holds positions aligned..N-1.
 
@@ -335,13 +337,12 @@ class RenewTail:
         # bias = m-1 of them, replayed by the worker when a request hits it.
         if is_async:
             # step k+1 (in flight) re-wrote the same page with H1 of its first
-            # input token. That token is the last kept one only if nothing was
-            # truncated (m == g); otherwise the state is gone.
-            if m != g:
-                return self._bump("tail_skip_async_trunc", request, L0, extra=acct)
+            # input token. Option C (renew-tail-eos-v3) clamps the accepted run on
+            # device at the stop position, so that token is the last kept one for
+            # every m <= g. The CPU count still carries the raw g: (g - m) extra.
             length = n  # state after EOS, written by the in-flight step k+1
             bias = 0
-            ok = nc == n - 1 + in_flight
+            ok = nc == n - 1 + in_flight + (g - m)
         else:
             length = n - 1
             bias = m - 1 if self.glog else 0

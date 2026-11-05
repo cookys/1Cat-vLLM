@@ -113,6 +113,7 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states import init_model_state
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
 from vllm.v1.worker.gpu.pp_utils import PPHandler, scatter_draft_tokens
+from vllm.v1.worker.gpu.sample.eos_clamp import EosClampState
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
@@ -496,6 +497,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         self.sampler: Sampler | None = None
+        # renew-tail-eos-v3 option C: device-side clamp of the accepted run at a stop position
+        self.eos_clamp: EosClampState | None = None
         self.rejection_sampler: RejectionSampler | None = None
         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
         self.structured_outputs_worker: StructuredOutputsWorker | None = None
@@ -512,6 +515,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_speculative_tokens=self.num_speculative_steps + 1,
                 use_fp64_gumbel=self.model_config.use_fp64_gumbel,
             )
+            if (
+                self.speculative_config is not None
+                and os.environ.get("C4140_RENEW_TAIL_EOS") == "1"
+            ):
+                self.eos_clamp = EosClampState(self.max_num_reqs, self.device)
             if self.speculative_config is not None:
                 self.rejection_sampler = RejectionSampler(
                     self.sampler,
@@ -1395,6 +1403,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.sampler.add_request(
                     req_index, prompt_len, new_req_data.sampling_params
                 )
+                if self.eos_clamp is not None:
+                    self.eos_clamp.add_request(
+                        req_index,
+                        prompt_len,
+                        new_req_data.sampling_params,
+                        self.max_model_len,
+                    )
                 assert self.prompt_logprobs_worker is not None
                 self.prompt_logprobs_worker.add_request(
                     req_id, req_index, new_req_data.sampling_params
@@ -1407,6 +1422,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             _p8_sub("add_apply_staged", _p8_t)
         if self.sampler is not None:
             self.sampler.apply_staged_writes()
+        if self.eos_clamp is not None:
+            self.eos_clamp.apply_staged_writes()
 
     def update_requests(self, scheduler_output: SchedulerOutput) -> None:
         # Add new blocks and update num_computed_tokens for the existing requests.
@@ -2239,11 +2256,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # This sequencing may slightly reduce latency as async D2H copy does not
         # need to wait for the postprocess to finish.
         mtp_state_update_start = self._sm70_v2_mtp_profile_start(mtp_profile_ctx)
+        # renew-tail-eos-v3: clamped copies feed ONLY postprocess_sampled; AsyncOutput
+        # (above) and the drafter keep the raw g, so the CPU accounting is unchanged.
+        post_num_sampled, post_num_rejected = num_sampled, num_rejected
+        if self.eos_clamp is not None:
+            post_num_sampled, post_num_rejected = self.eos_clamp.clamp(
+                input_batch.idx_mapping,
+                sampler_output.sampled_token_ids,
+                num_sampled,
+                num_rejected,
+                self.req_states.total_len.gpu,
+            )
         self.postprocess_sampled(
             input_batch.idx_mapping,
             sampler_output.sampled_token_ids,
-            num_sampled,
-            num_rejected,
+            post_num_sampled,
+            post_num_rejected,
             input_batch.query_start_loc,
         )
         self._sm70_v2_mtp_profile_finish(
