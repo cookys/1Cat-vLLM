@@ -549,6 +549,12 @@ class OpenAIServingChat(OpenAIServing):
                                 completion_tokens=0,
                                 total_tokens=num_prompt_tokens,
                             )
+                            if self.enable_prompt_tokens_details and num_cached_tokens:
+                                chunk.usage.prompt_tokens_details = (
+                                    PromptTokenUsageInfo(
+                                        cached_tokens=num_cached_tokens
+                                    )
+                                )
 
                         data = chunk.model_dump_json(exclude_unset=True)
                         yield f"data: {data}\n\n"

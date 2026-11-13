@@ -43,6 +43,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     JsonSchemaResponseFormat,
     ResponseFormat,
     StreamOptions,
+    UsageInfo,
 )
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 
@@ -54,6 +55,28 @@ logger = logging.getLogger(__name__)
 
 def wrap_data_with_event(data: str, event: str):
     return f"event: {event}\ndata: {data}\n\n"
+
+
+def _make_anthropic_usage(
+    input_tokens: int,
+    output_tokens: int,
+    usage: UsageInfo | None,
+) -> AnthropicUsage:
+    cached_tokens = (
+        usage.prompt_tokens_details.cached_tokens
+        if usage is not None and usage.prompt_tokens_details is not None
+        else None
+    )
+    if cached_tokens is not None:
+        return AnthropicUsage(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_input_tokens=cached_tokens,
+        )
+    return AnthropicUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
 
 
 class AnthropicServingMessages(OpenAIServingChat):
@@ -505,9 +528,10 @@ class AnthropicServingMessages(OpenAIServingChat):
             id=generator.id,
             content=[],
             model=generator.model,
-            usage=AnthropicUsage(
+            usage=_make_anthropic_usage(
                 input_tokens=generator.usage.prompt_tokens,
                 output_tokens=generator.usage.completion_tokens,
+                usage=generator.usage,
             ),
             kv_transfer_params=generator.kv_transfer_params,
         )
@@ -659,11 +683,12 @@ class AnthropicServingMessages(OpenAIServingChat):
                                     model=origin_chunk.model,
                                     stop_reason=None,
                                     stop_sequence=None,
-                                    usage=AnthropicUsage(
+                                    usage=_make_anthropic_usage(
                                         input_tokens=origin_chunk.usage.prompt_tokens
                                         if origin_chunk.usage
                                         else 0,
                                         output_tokens=0,
+                                        usage=origin_chunk.usage,
                                     ),
                                 ),
                             )
@@ -682,13 +707,14 @@ class AnthropicServingMessages(OpenAIServingChat):
                             chunk = AnthropicStreamEvent(
                                 type="message_delta",
                                 delta=AnthropicDelta(stop_reason=stop_reason),
-                                usage=AnthropicUsage(
+                                usage=_make_anthropic_usage(
                                     input_tokens=origin_chunk.usage.prompt_tokens
                                     if origin_chunk.usage
                                     else 0,
                                     output_tokens=origin_chunk.usage.completion_tokens
                                     if origin_chunk.usage
                                     else 0,
+                                    usage=origin_chunk.usage,
                                 ),
                             )
                             data = chunk.model_dump_json(exclude_unset=True)
